@@ -1,0 +1,207 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <string>
+#include <zvec/ailego/internal/platform.h>
+#include <zvec/export.h>
+
+namespace zvec {
+namespace ailego {
+
+/*! Monotime
+ */
+struct ZVEC_AILEGO_API Monotime {
+  //! Retrieve monotonic time in nanoseconds
+  static uint64_t NanoSeconds();
+
+  //! Retrieve monotonic time in microseconds
+  static uint64_t MicroSeconds();
+
+  //! Retrieve monotonic time in milliseconds
+  static uint64_t MilliSeconds();
+
+  //! Retrieve monotonic time in seconds
+  static uint64_t Seconds();
+};
+
+/*! Realtime
+ */
+struct ZVEC_AILEGO_API Realtime {
+  //! Retrieve system time in nanoseconds
+  static uint64_t NanoSeconds();
+
+  //! Retrieve system time in microseconds
+  static uint64_t MicroSeconds();
+
+  //! Retrieve system time in milliseconds
+  static uint64_t MilliSeconds();
+
+  //! Retrieve system time in seconds
+  static uint64_t Seconds();
+
+  //! Retrieve a timestamp as a specific local time format
+  static size_t Localtime(uint64_t stamp, const char *format, char *buf,
+                          size_t len);
+
+  //! Retrieve a timestamp as a specific GMT time format
+  static size_t Gmtime(uint64_t stamp, const char *format, char *buf,
+                       size_t len);
+
+  //! Retrieve local time in string
+  static size_t Localtime(const char *format, char *buf, size_t len);
+
+  //! Retrieve GMT time in string
+  static size_t Gmtime(const char *format, char *buf, size_t len);
+
+  //! Retrieve local time in string
+  static size_t Localtime(char *buf, size_t len) {
+    return Localtime("%Y-%m-%d %H:%M:%S", buf, len);
+  }
+
+  //! Retrieve GMT time in string
+  static size_t Gmtime(char *buf, size_t len) {
+    return Gmtime("%Y-%m-%d %H:%M:%S", buf, len);
+  }
+
+  //! Retrieve local time in string
+  static std::string Localtime() {
+    char str[32];
+    Localtime(str, sizeof(str));
+    return std::string(str);
+  }
+
+  //! Retrieve GMT time in string
+  static std::string Gmtime() {
+    char str[32];
+    Gmtime(str, sizeof(str));
+    return std::string(str);
+  }
+
+  //! Retrieve a timestamp as a specific local time format
+  static size_t Localtime(uint64_t stamp, char *buf, size_t len) {
+    return Localtime(stamp, "%Y-%m-%d %H:%M:%S", buf, len);
+  }
+
+  //! Retrieve a timestamp as a specific GMT time format
+  static size_t Gmtime(uint64_t stamp, char *buf, size_t len) {
+    return Gmtime(stamp, "%Y-%m-%d %H:%M:%S", buf, len);
+  }
+
+  //! Retrieve a timestamp as a specific local time format
+  static std::string Localtime(uint64_t stamp) {
+    char str[32];
+    Localtime(stamp, str, sizeof(str));
+    return std::string(str);
+  }
+
+  //! Retrieve a timestamp as a specific GMT time format
+  static std::string Gmtime(uint64_t stamp) {
+    char str[32];
+    Gmtime(stamp, str, sizeof(str));
+    return std::string(str);
+  }
+};
+
+/*! Thread-specific CPU time
+ */
+struct ZVEC_AILEGO_API CPUtime {
+  //! Retrieve CPU time in nanoseconds
+  static uint64_t NanoSeconds();
+
+  //! Retrieve CPU time in microseconds
+  static uint64_t MicroSeconds();
+
+  //! Retrieve CPU time in milliseconds
+  static uint64_t MilliSeconds();
+
+  //! Retrieve CPU time in seconds
+  static uint64_t Seconds();
+};
+
+/*! Elapsed Time
+ */
+class ZVEC_AILEGO_API ElapsedTime {
+ public:
+  //! Constructor
+  ElapsedTime() : stamp_(Monotime::NanoSeconds()) {}
+
+  //! Retrieve the elapsed time in nanoseconds
+  uint64_t nano_seconds() const {
+    return (Monotime::NanoSeconds() - stamp_);
+  }
+
+  //! Retrieve the elapsed time in milliseconds
+  uint64_t micro_seconds() const {
+    return (this->nano_seconds() / 1000u);
+  }
+
+  //! Retrieve the elapsed time in milliseconds
+  uint64_t milli_seconds() const {
+    return (this->nano_seconds() / 1000000u);
+  }
+
+  //! Retrieve the elapsed time in seconds
+  uint64_t seconds() const {
+    return (this->nano_seconds() / 1000000000u);
+  }
+
+  //! Update time stamp
+  void reset() {
+    stamp_ = Monotime::NanoSeconds();
+  }
+
+ private:
+  uint64_t stamp_;
+};
+
+/*! Elapsed CPU Time
+ */
+class ZVEC_AILEGO_API ElapsedCPUTime {
+ public:
+  //! Constructor
+  ElapsedCPUTime() : stamp_(CPUtime::NanoSeconds()) {}
+
+  //! Retrieve the elapsed time in nanoseconds
+  uint64_t nano_seconds() const {
+    return (CPUtime::NanoSeconds() - stamp_);
+  }
+
+  //! Retrieve the elapsed time in milliseconds
+  uint64_t micro_seconds() const {
+    return (this->nano_seconds() / 1000u);
+  }
+
+  //! Retrieve the elapsed time in milliseconds
+  uint64_t milli_seconds() const {
+    return (this->nano_seconds() / 1000000u);
+  }
+
+  //! Retrieve the elapsed time in seconds
+  uint64_t seconds() const {
+    return (this->nano_seconds() / 1000000000u);
+  }
+
+  //! Update time stamp
+  void reset() {
+    stamp_ = CPUtime::NanoSeconds();
+  }
+
+ private:
+  uint64_t stamp_;
+};
+
+}  // namespace ailego
+}  // namespace zvec

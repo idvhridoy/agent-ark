@@ -1,0 +1,255 @@
+set(ARROW_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/apache-arrow-21.0.0)
+
+if(ANDROID)
+        set(ARROW_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.android.patch)
+        apply_patch_once("arrow_android_fix" "${ARROW_SRC_DIR}" "${ARROW_PATCH}")
+elseif(IOS)
+        set(ARROW_IOS_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.ios.patch)
+        apply_patch_once("arrow_ios_fix" "${ARROW_SRC_DIR}" "${ARROW_IOS_PATCH}")
+elseif(ZVEC_ON_MUSL)
+        set(ARROW_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.patch)
+        apply_patch_once("arrow_fix" "${ARROW_SRC_DIR}" "${ARROW_PATCH}")
+        set(ARROW_ALPINE_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.alpinelinux.patch)
+        apply_patch_once("arrow_alpine_fix" "${ARROW_SRC_DIR}" "${ARROW_ALPINE_PATCH}")
+else()
+        set(ARROW_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.patch)
+        apply_patch_once("arrow_fix" "${ARROW_SRC_DIR}" "${ARROW_PATCH}")
+endif()
+if(MSVC)
+        set(ARROW_WIN_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.windows.patch)
+        apply_patch_once("arrow_windows_crt_fix" "${ARROW_SRC_DIR}" "${ARROW_WIN_PATCH}")
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+                set(ARROW_WIN_ARM64_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.windows-arm64.patch)
+                apply_patch_once("arrow_windows_arm64_fix" "${ARROW_SRC_DIR}" "${ARROW_WIN_ARM64_PATCH}")
+        endif()
+endif()
+# Trim unused compute kernels to reduce binary size (~14MB savings)
+set(ARROW_SLIM_COMPUTE_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/arrow.slim_compute.patch)
+apply_patch_once("arrow_slim_compute" "${ARROW_SRC_DIR}" "${ARROW_SLIM_COMPUTE_PATCH}")
+
+include(ExternalProject)
+include(ProcessorCount)
+
+ProcessorCount(NPROC)
+
+set(ARROW_CMAKE_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
+if(NOT ARROW_CMAKE_BUILD_TYPE)
+    set(ARROW_CMAKE_BUILD_TYPE Release)
+endif()
+# Keep Arrow on the Release configuration: benchmarks showed that building
+# its compute kernels with -Os slows filter evaluation by ~8-10% while the
+# size saving is kept by the slim compute kernel set and gc-sections.
+
+# Pass -ffunction-sections -fdata-sections to Arrow so the linker can
+# perform fine-grained dead code elimination on Arrow objects.
+if(NOT MSVC)
+    set(_ARROW_SIZE_FLAGS "-DCMAKE_C_FLAGS=-ffunction-sections -fdata-sections" "-DCMAKE_CXX_FLAGS=-ffunction-sections -fdata-sections")
+endif()
+
+if(MSVC)
+    set(LIB_PARQUET ${EXTERNAL_LIB_DIR}/parquet_static.lib)
+    set(LIB_ARROW ${EXTERNAL_LIB_DIR}/arrow_static.lib)
+    set(LIB_COMPUTE ${EXTERNAL_LIB_DIR}/arrow_compute_static.lib)
+    set(LIB_ACERO ${EXTERNAL_LIB_DIR}/arrow_acero_static.lib)
+    set(LIB_ARROW_DEPENDS ${EXTERNAL_LIB_DIR}/arrow_bundled_dependencies.lib)
+else()
+    set(LIB_PARQUET ${EXTERNAL_LIB_DIR}/libparquet.a)
+    set(LIB_ARROW ${EXTERNAL_LIB_DIR}/libarrow.a)
+    set(LIB_COMPUTE ${EXTERNAL_LIB_DIR}/libarrow_compute.a)
+    set(LIB_ACERO ${EXTERNAL_LIB_DIR}/libarrow_acero.a)
+    set(LIB_ARROW_DEPENDS ${EXTERNAL_LIB_DIR}/libarrow_bundled_dependencies.a)
+endif()
+
+set(CONFIGURE_ENV_LIST "")
+if(USE_OSS_MIRROR)
+        list(APPEND CONFIGURE_ENV_LIST
+                "ARROW_BOOST_URL=https://zvec-bj.oss-cn-beijing.aliyuncs.com/thirdparty/boost-1.88.0-cmake.tar.gz"
+                "ARROW_RAPIDJSON_URL=https://zvec-bj.oss-cn-beijing.aliyuncs.com/thirdparty/rapidjson-232389d4f1012dddec4ef84861face2d2ba85709.tar.gz"
+                "ARROW_RE2_URL=https://zvec-bj.oss-cn-beijing.aliyuncs.com/thirdparty/re2-2022-06-01.tar.gz"
+                "ARROW_THRIFT_URL=https://zvec-bj.oss-cn-beijing.aliyuncs.com/thirdparty/thrift-0.22.0.tar.gz"
+                "ARROW_UTF8PROC_URL=https://zvec-bj.oss-cn-beijing.aliyuncs.com/thirdparty/utf8proc-2.10.0.tar.gz"
+                "ARROW_XSIMD_URL=https://zvec-bj.oss-cn-beijing.aliyuncs.com/thirdparty/xsimd-13.0.0.tar.gz"
+                "ARROW_ZLIB_URL=https://zvec-bj.oss-cn-beijing.aliyuncs.com/thirdparty/zlib-1.3.1.tar.gz"
+        )
+        message(STATUS "Using OSS mirror for third-party downloads")
+endif()
+
+# Propagate compiler launcher (ccache/sccache) to Arrow's ExternalProject
+set(_ARROW_COMPILER_LAUNCHER_ARGS "")
+if(CMAKE_C_COMPILER_LAUNCHER)
+    set(_ARROW_COMPILER_LAUNCHER_ARGS
+        -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
+        -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+    )
+endif()
+
+# Propagate compiler settings to Arrow's ExternalProject to ensure consistent
+# compiler and headers are used throughout the build. This prevents linker
+# errors like "multiple definition of std::placeholders::_1" when the system
+# has multiple GCC versions installed.
+# See: https://github.com/alibaba/zvec/issues/346
+set(_ARROW_COMPILER_ARGS
+    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+)
+
+if(ANDROID)
+        ExternalProject_Add(
+                ARROW.BUILD PREFIX arrow
+                SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/apache-arrow-21.0.0
+                DOWNLOAD_COMMAND ""
+                BUILD_IN_SOURCE false
+                CONFIGURE_COMMAND env ${CONFIGURE_ENV_LIST} "${CMAKE_COMMAND}" ${CMAKE_CACHE_ARGS} ${_ARROW_COMPILER_LAUNCHER_ARGS} ${_ARROW_COMPILER_ARGS} -DCMAKE_BUILD_TYPE=${ARROW_CMAKE_BUILD_TYPE} -DCMAKE_DEBUG_POSTFIX= -DARROW_BUILD_SHARED=OFF -DARROW_ACERO=ON -DARROW_FILESYSTEM=ON -DARROW_DATASET=OFF -DARROW_PARQUET=ON -DARROW_COMPUTE=ON -DARROW_WITH_ZLIB=OFF -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_MIMALLOC=OFF -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DANDROID_ABI=${ANDROID_ABI} -DANDROID_NATIVE_API_LEVEL=${ANDROID_NATIVE_API_LEVEL} -DARROW_WITH_MUSL=OFF "<SOURCE_DIR>/cpp"
+                BUILD_COMMAND "${CMAKE_COMMAND}" --build . --target all -- -j ${NPROC}
+                INSTALL_COMMAND "${CMAKE_COMMAND}" --install "<BINARY_DIR>" --prefix=${EXTERNAL_BINARY_DIR}/usr/local
+                BYPRODUCTS ${LIB_PARQUET} ${LIB_ARROW} ${LIB_COMPUTE} ${LIB_ACERO} ${LIB_ARROW_DEPENDS}
+                LOG_DOWNLOAD ON
+                LOG_CONFIGURE ON
+                LOG_BUILD ON
+                LOG_INSTALL ON
+        )
+elseif(IOS)
+        # Determine ARROW_CPU_FLAG based on architecture
+        if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+                set(IOS_ARROW_CPU_FLAG "aarch64")
+        elseif(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+                set(IOS_ARROW_CPU_FLAG "x86")
+        else()
+                set(IOS_ARROW_CPU_FLAG "aarch64")
+        endif()
+        # Propagate deployment target to Arrow's bundled dependencies via env var.
+        # Without this, sub-ExternalProjects (re2, utf8proc, etc.) pick up the SDK
+        # version instead of the intended deployment target, causing linker warnings.
+        set(_arrow_ios_env ${CONFIGURE_ENV_LIST} "IPHONEOS_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        ExternalProject_Add(
+                ARROW.BUILD PREFIX arrow
+                SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/apache-arrow-21.0.0
+                DOWNLOAD_COMMAND ""
+                BUILD_IN_SOURCE false
+                CONFIGURE_COMMAND env ${_arrow_ios_env} "${CMAKE_COMMAND}" ${CMAKE_CACHE_ARGS} ${_ARROW_COMPILER_LAUNCHER_ARGS} ${_ARROW_COMPILER_ARGS} -DCMAKE_BUILD_TYPE=${ARROW_CMAKE_BUILD_TYPE} -DCMAKE_DEBUG_POSTFIX= -DARROW_BUILD_SHARED=OFF -DARROW_ACERO=ON -DARROW_FILESYSTEM=ON -DARROW_DATASET=OFF -DARROW_PARQUET=ON -DARROW_COMPUTE=ON -DARROW_WITH_ZLIB=OFF -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_MIMALLOC=OFF -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET} -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES} -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT} -DARROW_CPU_FLAG=${IOS_ARROW_CPU_FLAG} "<SOURCE_DIR>/cpp"
+                BUILD_COMMAND env "IPHONEOS_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}" "${CMAKE_COMMAND}" --build . --target all -- -j ${NPROC}
+                INSTALL_COMMAND "${CMAKE_COMMAND}" --install "<BINARY_DIR>" --prefix=${EXTERNAL_BINARY_DIR}/usr/local
+                BYPRODUCTS ${LIB_PARQUET} ${LIB_ARROW} ${LIB_COMPUTE} ${LIB_ACERO} ${LIB_ARROW_DEPENDS}
+                LOG_DOWNLOAD ON
+                LOG_CONFIGURE ON
+                LOG_BUILD ON
+                LOG_INSTALL ON
+        )
+elseif (MSVC)
+    if(ZVEC_USE_STATIC_CRT)
+        set(_ARROW_CRT_FLAG "/MT")
+        set(_ARROW_MSVC_RUNTIME "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    else()
+        set(_ARROW_CRT_FLAG "/MD")
+        set(_ARROW_MSVC_RUNTIME "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
+    endif()
+    set(ARROW_EXTRA_CMAKE_ARGS
+        "-DCMAKE_C_FLAGS=${_ARROW_CRT_FLAG}"
+        "-DCMAKE_CXX_FLAGS=${_ARROW_CRT_FLAG}"
+        -DARROW_USE_STATIC_CRT=${ZVEC_USE_STATIC_CRT}
+        "-DCMAKE_MSVC_RUNTIME_LIBRARY=${_ARROW_MSVC_RUNTIME}"
+    )
+    # Arrow 21.0's xsimd-13 does not provide make_sized_batch_t for MSVC ARM64,
+    # so disable SIMD on that target. x86/x64 MSVC keeps the default SSE4.2 path.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+        list(APPEND ARROW_EXTRA_CMAKE_ARGS
+            -DARROW_SIMD_LEVEL=NONE
+            -DARROW_RUNTIME_SIMD_LEVEL=NONE
+        )
+    endif()
+        ExternalProject_Add(
+                ARROW.BUILD PREFIX arrow
+                SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/apache-arrow-21.0.0
+                DOWNLOAD_COMMAND ""
+                BUILD_IN_SOURCE false
+                CONFIGURE_COMMAND "${CMAKE_COMMAND}" -E env ${CONFIGURE_ENV_LIST} "${CMAKE_COMMAND}" ${CMAKE_CACHE_ARGS} ${ARROW_EXTRA_CMAKE_ARGS} ${_ARROW_COMPILER_LAUNCHER_ARGS} ${_ARROW_COMPILER_ARGS} -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_DEBUG_POSTFIX= -DARROW_BUILD_SHARED=OFF -DARROW_ACERO=ON -DARROW_FILESYSTEM=ON -DARROW_DATASET=OFF -DARROW_PARQUET=ON -DARROW_COMPUTE=ON -DARROW_WITH_ZLIB=OFF -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_MIMALLOC=OFF -DCMAKE_INSTALL_LIBDIR=lib "<SOURCE_DIR>/cpp"
+                BUILD_COMMAND "${CMAKE_COMMAND}" --build . -j ${NPROC} --config $<CONFIG>
+                INSTALL_COMMAND "${CMAKE_COMMAND}" --install "<BINARY_DIR>" --prefix=${EXTERNAL_BINARY_DIR}/usr/local --config $<CONFIG>
+                BYPRODUCTS ${LIB_PARQUET} ${LIB_ARROW} ${LIB_COMPUTE} ${LIB_ACERO} ${LIB_ARROW_DEPENDS}
+                LOG_DOWNLOAD ON
+                LOG_CONFIGURE ON
+                LOG_BUILD ON
+                LOG_INSTALL ON
+        )
+else ()
+    ExternalProject_Add(
+            ARROW.BUILD PREFIX arrow
+            SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/apache-arrow-21.0.0
+            DOWNLOAD_COMMAND ""
+            BUILD_IN_SOURCE false
+            CONFIGURE_COMMAND env ${CONFIGURE_ENV_LIST} "${CMAKE_COMMAND}" ${CMAKE_CACHE_ARGS} ${_ARROW_COMPILER_LAUNCHER_ARGS} ${_ARROW_COMPILER_ARGS} ${_ARROW_SIZE_FLAGS} -DCMAKE_BUILD_TYPE=${ARROW_CMAKE_BUILD_TYPE} -DCMAKE_DEBUG_POSTFIX= -DARROW_BUILD_SHARED=OFF -DARROW_ACERO=ON -DARROW_FILESYSTEM=ON -DARROW_DATASET=OFF -DARROW_PARQUET=ON -DARROW_COMPUTE=ON -DARROW_WITH_ZLIB=OFF -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_MIMALLOC=OFF -DCMAKE_INSTALL_LIBDIR=lib "<SOURCE_DIR>/cpp"
+            BUILD_COMMAND "${CMAKE_COMMAND}" --build . --target all -- -j ${NPROC}
+            INSTALL_COMMAND "${CMAKE_COMMAND}" --install "<BINARY_DIR>" --prefix=${EXTERNAL_BINARY_DIR}/usr/local
+            BYPRODUCTS ${LIB_PARQUET} ${LIB_ARROW} ${LIB_COMPUTE} ${LIB_ACERO} ${LIB_ARROW_DEPENDS}
+            LOG_DOWNLOAD ON
+            LOG_CONFIGURE ON
+            LOG_BUILD ON
+            LOG_INSTALL ON
+            # Surface nested configure/build errors in CI instead of only
+            # pointing to log files on the temporary runner.
+            LOG_OUTPUT_ON_FAILURE ON
+    )
+endif()
+
+add_library(arrow UNKNOWN IMPORTED GLOBAL)
+add_dependencies(arrow ARROW.BUILD)
+
+set(Arrow_FOUND TRUE PARENT_SCOPE)
+set(Arrow_INCLUDE_DIR ${EXTERNAL_INC_DIR} PARENT_SCOPE)
+set(Arrow_LIBRARIES ${LIB_ARROW} PARENT_SCOPE)
+set(Arrow_DIR ${EXTERNAL_BINARY_DIR} PARENT_SCOPE)
+set(Arrow_LIBRARY_DIR ${EXTERNAL_BINARY_DIR} PARENT_SCOPE)
+
+add_library(Arrow::arrow_depends UNKNOWN IMPORTED GLOBAL)
+set_target_properties(
+        Arrow::arrow_depends PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        IMPORTED_LOCATION "${LIB_ARROW_DEPENDS}"
+)
+add_dependencies(Arrow::arrow_depends ARROW.BUILD)
+
+
+add_library(Arrow::arrow_static UNKNOWN IMPORTED GLOBAL)
+set_target_properties(
+        Arrow::arrow_static PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        IMPORTED_LOCATION "${LIB_ARROW}"
+        INTERFACE_LINK_LIBRARIES "Arrow::arrow_depends"
+        INTERFACE_COMPILE_DEFINITIONS "ARROW_STATIC" #TODO(windows): see if this can be removed
+)
+add_dependencies(Arrow::arrow_static ARROW.BUILD)
+
+add_library(Arrow::parquet_static UNKNOWN IMPORTED GLOBAL)
+set_target_properties(
+        Arrow::parquet_static PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        IMPORTED_LOCATION "${LIB_PARQUET}"
+        INTERFACE_LINK_LIBRARIES "Arrow::arrow_depends;Arrow::arrow_static"
+        INTERFACE_COMPILE_DEFINITIONS "PARQUET_STATIC"
+)
+add_dependencies(Arrow::parquet_static ARROW.BUILD)
+
+add_library(Arrow::arrow_compute UNKNOWN IMPORTED GLOBAL)
+set_target_properties(
+        Arrow::arrow_compute PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        IMPORTED_LOCATION "${LIB_COMPUTE}"
+        INTERFACE_LINK_LIBRARIES "Arrow::arrow_depends;Arrow::arrow_static"
+        INTERFACE_COMPILE_DEFINITIONS "ARROW_COMPUTE_STATIC"
+)
+add_dependencies(Arrow::arrow_compute ARROW.BUILD)
+
+add_library(Arrow::arrow_acero UNKNOWN IMPORTED GLOBAL)
+set_target_properties(
+        Arrow::arrow_acero PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${EXTERNAL_INC_DIR}
+        IMPORTED_LOCATION "${LIB_ACERO}"
+        INTERFACE_LINK_LIBRARIES "Arrow::arrow_depends;Arrow::arrow_static;Arrow::arrow_compute"
+        INTERFACE_COMPILE_DEFINITIONS "ARROW_ACERO_STATIC"
+)
+add_dependencies(Arrow::arrow_acero ARROW.BUILD)

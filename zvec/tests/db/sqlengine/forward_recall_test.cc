@@ -1,0 +1,976 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License
+
+#include <cstdint>
+#include <memory>
+#include <gtest/gtest.h>
+#include "db/sqlengine/sqlengine.h"
+#include "zvec/db/schema.h"
+#include "recall_base.h"
+
+namespace zvec::sqlengine {
+
+class ForwardRecallTest : public RecallTest {};
+
+TEST_F(ForwardRecallTest, Basic) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  if (!ret) {
+    LOG_ERROR("execute failed: [%s]", ret.error().c_str());
+  }
+  ASSERT_TRUE(ret.has_value());
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int i = 0; i < query.topk_; i++) {
+    auto &doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, BasicWithDocId) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.include_doc_id_ = true;
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  if (!ret) {
+    LOG_ERROR("execute failed: [%s]", ret.error().c_str());
+  }
+  ASSERT_TRUE(ret.has_value());
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int i = 0; i < query.topk_; i++) {
+    auto &doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(doc->doc_id(), i);
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, OutputNoFields) {
+  SearchQuery query;
+  query.output_fields_ = std::vector<std::string>{};
+  query.topk_ = 200;
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  if (!ret) {
+    LOG_ERROR("execute failed: [%s]", ret.error().c_str());
+  }
+  ASSERT_TRUE(ret.has_value());
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int i = 0; i < query.topk_; i++) {
+    auto &doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(doc->field_names().size(), 0);
+  }
+}
+
+TEST_F(ForwardRecallTest, DenseVector) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "dense"};
+  query.topk_ = 200;
+  query.include_vector_ = true;
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  if (!ret) {
+    LOG_ERROR("execute failed: [%s]", ret.error().c_str());
+  }
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int i = 0; i < query.topk_; i++) {
+    auto &doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto dense = doc->get<std::vector<float>>("dense");
+    ASSERT_TRUE(dense.has_value());
+    EXPECT_EQ(dense.value().size(), 4);
+    for (auto v : dense.value()) {
+      EXPECT_FLOAT_EQ(v, (float)i);
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, SparseVector) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "sparse"};
+  query.topk_ = 200;
+  query.include_vector_ = true;
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  if (!ret) {
+    LOG_ERROR("execute failed: [%s]", ret.error().c_str());
+  }
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int i = 0; i < query.topk_; i++) {
+    auto &doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    // EXPECT_EQ(doc->field_names().size(), 2);
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto sparse =
+        doc->get<std::pair<std::vector<uint32_t>, std::vector<float>>>(
+            "sparse");
+    if (i % 100 == 0) {
+      // set with empty vector
+      ASSERT_FALSE(sparse.has_value());
+      continue;
+    }
+
+    ASSERT_TRUE(sparse.has_value());
+    const auto &[indices, values] = sparse.value();
+    EXPECT_EQ(indices.size(), i % 100);
+    EXPECT_EQ(values.size(), i % 100);
+    for (int j = 0; j < i % 100; j++) {
+      EXPECT_EQ(indices[j], j);
+      EXPECT_FLOAT_EQ(values[j], (float)i);
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, MultiSegment) {
+  SearchQuery query;
+  query.output_fields_ = std::vector<std::string>();
+  query.topk_ = 200;
+  query.include_vector_ = true;
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  std::vector<Segment::Ptr> segments = segments_;
+  segments.push_back(segments_[0]);
+  auto ret = engine->execute(collection_schema_, query, segments);
+  if (!ret) {
+    LOG_ERROR("execute failed: [%s]", ret.error().c_str());
+  }
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int i = 0; i < query.topk_; i++) {
+    auto &doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto dense = doc->get<std::vector<float>>("dense");
+    ASSERT_TRUE(dense.has_value());
+    EXPECT_EQ(dense.value().size(), 4);
+    for (auto v : dense.value()) {
+      EXPECT_FLOAT_EQ(v, (float)i);
+    }
+
+    auto sparse =
+        doc->get<std::pair<std::vector<uint32_t>, std::vector<float>>>(
+            "sparse");
+    if (i % 100 == 0) {
+      // set with empty vector
+      ASSERT_FALSE(sparse.has_value());
+      continue;
+    }
+
+    ASSERT_TRUE(sparse.has_value());
+    const auto &[indices, values] = sparse.value();
+    EXPECT_EQ(indices.size(), i % 100);
+    EXPECT_EQ(values.size(), i % 100);
+    for (int j = 0; j < i % 100; j++) {
+      EXPECT_EQ(indices[j], j);
+      EXPECT_FLOAT_EQ(values[j], (float)i);
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, Eq) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "age = 1";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 100);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++, i += 100) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, Gt) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "id > 1000";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int j = 0; j < query.topk_; j++) {
+    auto &doc = docs[j];
+    auto i = j + 1001;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, Ge) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "id >= 1000";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), query.topk_);
+  for (int j = 0; j < query.topk_; j++) {
+    auto &doc = docs[j];
+    auto i = j + 1000;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, Lt) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "id < 100";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  ASSERT_EQ(docs.size(), 100);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++, i += 1) {
+    auto &doc = docs[j];
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, Le) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "id <= 100";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  ASSERT_EQ(docs.size(), 101);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++, i += 1) {
+    auto &doc = docs[j];
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, And) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "id <= 100 and id > 50";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  ASSERT_EQ(docs.size(), 50);
+  for (int j = 0, i = 51; j < (int)docs.size(); j++, i += 1) {
+    auto &doc = docs[j];
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, Or) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "id < 100 or id > 200";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  ASSERT_EQ(docs.size(), 200);
+  for (int j = 0; j < (int)docs.size(); j++) {
+    int i = j < 100 ? j : j + 101;
+    auto &doc = docs[j];
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, StrEq) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "name = 'user_1'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 100);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++, i += 100) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, StrGe) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "name >= 'user_1'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++, i += 1) {
+    if (i % 100 == 0) {
+      i += 1;
+    }
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, StrIn) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "name IN ('user_1', 'user_2')";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    if (i % 100 == 1) {
+      i += 1;
+    } else if (i % 100 == 2) {
+      i += 99;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, StrNotIn) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "name NOT IN ('user_1', 'user_2')";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    if (i % 100 == 0) {
+      i += 3;
+    } else {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, NullableNotEqualConjunctionExcludesNull) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "optional_age"};
+  query.topk_ = 200;
+  query.filter_ = "optional_age != 1 and optional_age != 2";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  ASSERT_EQ(docs.size(), query.topk_);
+  for (const auto &doc : docs) {
+    auto age = doc->get<uint32_t>("optional_age");
+    ASSERT_TRUE(age.has_value()) << doc->pk();
+    EXPECT_NE(age.value(), 1u);
+    EXPECT_NE(age.value(), 2u);
+  }
+}
+
+TEST_F(ForwardRecallTest, NullableNotInExcludesNull) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "optional_age"};
+  query.topk_ = 200;
+  query.filter_ = "optional_age not in (1, 2)";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  ASSERT_EQ(docs.size(), query.topk_);
+  for (const auto &doc : docs) {
+    auto age = doc->get<uint32_t>("optional_age");
+    ASSERT_TRUE(age.has_value()) << doc->pk();
+    EXPECT_NE(age.value(), 1u);
+    EXPECT_NE(age.value(), 2u);
+  }
+}
+
+TEST_F(ForwardRecallTest, StrLike) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "name like 'user_9%'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 9; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    if (i % 100 == 9) {
+      i += 81;
+    } else if (i % 100 == 99) {
+      i += 10;
+    } else {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, IsNull) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "optional_age is null";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 100);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++, i += 100) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, IsNotNull) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "optional_age is not null";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++, i += 1) {
+    if (i % 100 == 0) {
+      i += 1;
+    }
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, IsNullNoResult) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "age is null";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  ASSERT_EQ(docs.size(), 0);
+}
+
+TEST_F(ForwardRecallTest, ContainAll) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set contain_all (";
+  for (int i = 1; i <= 32; i++) {
+    query.filter_ += std::to_string(i);
+    if (i < 32) {
+      query.filter_ += ", ";
+    }
+  }
+  query.filter_ += ")";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 32; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    while (i % 100 < 32) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, NotContainAll) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set not contain_all (";
+  for (int i = 1; i <= 32; i++) {
+    query.filter_ += std::to_string(i);
+    if (i < 32) {
+      query.filter_ += ", ";
+    }
+  }
+  query.filter_ += ")";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    // i % 100 == 0 has null category
+    while (i % 100 >= 32 || i % 100 == 0) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, ContainAny) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set contain_any (98,99,100)";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 98; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    while (i % 100 < 98) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, NotContainAny) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set not contain_any (98,99,100)";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    // i % 100 == 0 has null category
+    while (i % 100 >= 98 || i % 100 == 0) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, BoolContainAll) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "bool_array contain_all (true, false)";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 3;
+  }
+}
+
+TEST_F(ForwardRecallTest, BoolContainAny) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "bool_array contain_any (true)";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    if (i % 3 == 2) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, ContainAllEmptySet) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set contain_all ()";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    while (i % 100 == 0) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, NotContainAllEmptySet) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set not contain_all ()";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 0);
+}
+
+TEST_F(ForwardRecallTest, ContainAnyEmptySet) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set contain_any ()";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 0);
+}
+
+TEST_F(ForwardRecallTest, NotContainAnyEmptySet) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "category_set not contain_any ()";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    while (i % 100 == 0) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, BoolEqTrue) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "bool = TRuE";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 100);
+  for (int j = 0, i = 0; j < (int)docs.size(); j++, i += 100) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+  }
+}
+
+TEST_F(ForwardRecallTest, BoolEqFalse) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "bool = false";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 1; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    if (i % 100 == 0) {
+      i += 1;
+    }
+  }
+}
+
+TEST_F(ForwardRecallTest, ArrayLengthEq) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "array_length(category_set) = 32";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 100);
+  for (int j = 0, i = 32; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 100;
+  }
+}
+
+TEST_F(ForwardRecallTest, ArrayLengthGe) {
+  SearchQuery query;
+  query.output_fields_ = {"id", "name", "age"};
+  query.topk_ = 200;
+  query.filter_ = "array_length(category_set) >= 32";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error().c_str();
+  auto docs = ret.value();
+  EXPECT_EQ(docs.size(), 200);
+  for (int j = 0, i = 32; j < (int)docs.size(); j++) {
+    auto &doc = docs[j];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+    EXPECT_EQ(i, doc->get<uint64_t>("id"));
+    auto age = doc->get<int32_t>("age");
+    EXPECT_EQ(age.value(), i % 100);
+    auto name = doc->get<std::string>("name");
+    ASSERT_TRUE(name);
+    EXPECT_EQ(name.value(), "user_" + std::to_string(i % 100));
+
+    i += 1;
+    while (i % 100 < 32) {
+      i += 1;
+    }
+  }
+}
+
+
+}  // namespace zvec::sqlengine

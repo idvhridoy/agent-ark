@@ -1,0 +1,946 @@
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from typing import Any
+from uuid import UUID
+
+from cognee.infrastructure.databases.exceptions import UnsupportedProvenanceCapability
+from cognee.infrastructure.databases.graph.bounded_neighborhood import (
+    DEFAULT_NEIGHBORHOOD_CHUNK_SIZE,
+    chunk_members,
+    order_members,
+    unique_node_ids,
+    validate_bounded_neighborhood_args,
+)
+from cognee.infrastructure.databases.provenance import (
+    EdgeDeleteData,
+    EdgeIdentity,
+    NodeDeleteData,
+)
+from cognee.infrastructure.engine import DataPoint
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
+
+# Type aliases for better readability
+NodeData = dict[str, Any]
+EdgeData = tuple[
+    str, str, str, dict[str, Any]
+]  # (source_id, target_id, relationship_name, properties)
+Node = tuple[str, NodeData]  # (node_id, properties)
+
+
+_warned_degree_fallbacks: set[type] = set()
+_warned_neighborhood_fallbacks: set[type] = set()
+
+
+class GraphDBInterface(ABC):
+    """
+    Interface every graph backend implements (Ladybug/Kuzu, Neo4j, Neptune, Turso, Postgres demo).
+
+    Get an instance with ``get_graph_engine()``; never construct adapters directly.
+
+    Contract shared by all adapters:
+
+    * **Ids are strings.** Node ids are ``str(DataPoint.id)``; an edge is identified by
+      ``(source_id, target_id, relationship_name)``.
+    * **Writes are idempotent upserts.** ``add_node``/``add_nodes`` merge on node id and
+      overwrite the stored properties on match; ``add_edge``/``add_edges`` merge on the
+      edge identity and overwrite properties. Re-running a pipeline over the same data
+      therefore never duplicates nodes or edges -- this is what ``DataPoint``'s
+      ``identity_fields`` relies on. Edges whose endpoints do not exist are skipped.
+    * **Deletes are tolerant.** Deleting an id that is not present is a no-op; deleting a
+      node removes its edges (detach delete).
+    * **Writes return ``None``.** Reads return plain tuples/dicts (``Node = (id,
+      properties)``, ``EdgeData = (source_id, target_id, relationship_name,
+      properties)``), never adapter-native objects.
+    * Optional provenance: ``source_ref_key``/``pipeline_run_id`` on the bulk writers stamp
+      graph source-refs in the same statement so ``forget()`` can delete or roll back by
+      document; see ``cognee.infrastructure.databases.provenance``.
+
+    Capability flags (class attributes, checked by callers on the engine instance):
+    ``supports_cypher_queries``, ``supports_per_row_source_refs``,
+    ``supports_incremental_chunk_updates``. A new backend also needs a
+    ``DatasetDatabaseHandlerInterface`` registration to work with
+    ``ENABLE_BACKEND_ACCESS_CONTROL`` (see ``dataset_database_handler/``).
+    """
+
+    # Whether this backend executes raw Cypher through ``query()``. Declared on
+    # the adapter class so callers (CYPHER / NATURAL_LANGUAGE retrievers) can
+    # check the capability on the engine instance they already hold, without
+    # importing optional backend packages that slim images do not ship.
+    supports_cypher_queries: bool = True
+
+    # Whether ``add_nodes`` / ``add_edges`` accept a per-row source-ref mapping
+    # (node id / edge identity -> ref key) instead of one scalar key per call.
+    # Backends that support it stamp chunk-scoped ownership in a single batch
+    # statement; others get one grouped call per owner key from the caller.
+    supports_per_row_source_refs: bool = False
+
+    # Whether chunk-level incremental updates can run against this backend.
+    # The adapter must provide compatible connection shapes, graph provenance,
+    # and a narrow ``update_chunk_index`` implementation. Declared on the
+    # adapter so a runtime-registered backend can participate by satisfying the
+    # full contract.
+    supports_incremental_chunk_updates: bool = False
+
+    @abstractmethod
+    async def is_empty(self) -> bool:
+        """Return True when the graph contains no nodes."""
+        logger.warning("is_empty() is not implemented")
+        return True
+
+    @abstractmethod
+    async def query(self, query: str, params: dict) -> list[Any]:
+        """
+        Execute a raw database query and return the results.
+
+        Parameters:
+        -----------
+
+            - query (str): The query string to execute against the database.
+            - params (dict): A dictionary of parameters to be used in the query.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def add_node(
+        self, node: DataPoint | str, properties: dict[str, Any] | None = None
+    ) -> None:
+        """
+        Add a single node with specified properties to the graph.
+
+        Idempotent upsert keyed on the node id: an existing node's properties are
+        overwritten, a missing one is created. Returns ``None``.
+
+        Parameters:
+        -----------
+
+            - node (Union[DataPoint, str]): Either a DataPoint object or a string identifier for the node being added.
+            - properties (Optional[Dict[str, Any]]): A dictionary of properties associated with the node.
+              Required when node is a string, ignored when node is a DataPoint.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def add_nodes(
+        self,
+        nodes: list[Node] | list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
+        """
+        Add multiple nodes to the graph in a single operation.
+
+        Idempotent upsert keyed on each node id (see ``add_node``); duplicates within
+        ``nodes`` collapse to one row. Returns ``None``.
+
+        Parameters:
+        -----------
+
+            - nodes (Union[List[Node], List[DataPoint]]): A list of Node objects or DataPoint objects to be added to the graph.
+            - source_ref_key (Optional[str]): Graph provenance source ref to stamp
+              atomically as part of this write. Backends that support graph-provenance
+              provenance fold it into the same statement; others may ignore it. (default None)
+            - pipeline_run_id (Optional[str]): Run id recorded with the provenance stamp so
+              the write is rollbackable by run. Ignored when source_ref_key is None. (default None)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_node(self, node_id: str) -> None:
+        """
+        Delete a specified node from the graph by its ID.
+
+        Removes the node and every edge attached to it. A missing id is a no-op, not an
+        error. Returns ``None``.
+
+        Parameters:
+        -----------
+
+            - node_id (str): Unique identifier for the node to delete.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_nodes(self, node_ids: list[str]) -> None:
+        """
+        Delete multiple nodes from the graph by their identifiers.
+
+        Same semantics as ``delete_node`` for each id, in one statement. Returns ``None``.
+
+        Parameters:
+        -----------
+
+            - node_ids (List[str]): A list of unique identifiers for the nodes to delete.
+        """
+        raise NotImplementedError
+
+    async def remove_belongs_to_set_tags(
+        self,
+        tags: list[str],
+        node_ids: list[str] | None = None,
+    ) -> None:
+        """
+        Remove the given tag names from every node's `belongs_to_set` property
+        array. Keeps the property consistent with the additive
+        `belongs_to_set` edges after a NodeSet or its containing dataset is
+        deleted.
+
+        When `node_ids` is provided, the detag only applies to nodes whose
+        id appears in the list — used to reconcile shared nodes that lose
+        membership in one dataset without disturbing unrelated nodes that
+        legitimately still carry the tag.
+
+        Default no-op; only Neo4j overrides this today. Other
+        list-property-storing adapters are free to implement it later.
+        """
+        return
+
+    async def update_chunk_index(self, chunk_indexes: "dict[str, int]") -> None:
+        """
+        Update ONLY the ``chunk_index`` property of the given chunk nodes.
+
+        A narrow positional move: a retained chunk shifts after text is
+        inserted or removed before it. Implementations must change nothing
+        but ``chunk_index`` (and bookkeeping timestamps) — full node rewrites
+        rebuilt from models erase any property the model forgets to carry.
+
+        Parameters:
+        -----------
+
+            - chunk_indexes (dict[str, int]): node id -> new chunk_index.
+
+        Default implementation raises UnsupportedGraphOperation. Adapters that
+        do not override it must not declare incremental chunk-update support.
+        """
+        from cognee.infrastructure.databases.exceptions import UnsupportedGraphOperation
+
+        raise UnsupportedGraphOperation("update_chunk_index is not implemented by this adapter")
+
+    async def attach_node_source_refs(
+        self,
+        node_ids: list[str],
+        source_ref_keys: list[str],
+        pipeline_run_id: str | None = None,
+    ) -> None:
+        """
+        Attach source refs to existing graph nodes.
+
+        Implementations append the supplied source_ref_keys, derive and append
+        source_dataset_ids from those refs, and when pipeline_run_id is
+        provided, append source_run_ids and source_run_refs as rollback indexes.
+
+        Parameters:
+        -----------
+
+            - node_ids (list[str]): Unique identifiers of the nodes to update.
+            - source_ref_keys (list[str]): Source refs to append to each node.
+            - pipeline_run_id (str | None): Pipeline run that attached the refs.
+
+        Default implementation raises UnsupportedProvenanceCapability.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def attach_edge_source_refs(
+        self,
+        edges: list[EdgeIdentity],
+        source_ref_keys: list[str],
+        pipeline_run_id: str | None = None,
+    ) -> None:
+        """
+        Attach source refs to existing graph edges.
+
+        Implementations append the supplied source_ref_keys, derive and append
+        source_dataset_ids from those refs, and when pipeline_run_id is
+        provided, append source_run_ids and source_run_refs as rollback indexes.
+
+        Parameters:
+        -----------
+
+            - edges (list[EdgeIdentity]): Edge identities to update.
+            - source_ref_keys (list[str]): Source refs to append to each edge.
+            - pipeline_run_id (str | None): Pipeline run that attached the refs.
+
+        Default implementation raises UnsupportedProvenanceCapability.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def remove_node_source_refs(
+        self,
+        node_ids: list[str],
+        source_ref_keys: list[str],
+    ) -> None:
+        """
+        Remove source refs from graph nodes.
+
+        Implementations also keep source_dataset_ids, source_run_ids, and
+        source_run_refs consistent with the remaining source_ref_keys.
+
+        Parameters:
+        -----------
+
+            - node_ids (list[str]): Unique identifiers of the nodes to update.
+            - source_ref_keys (list[str]): Source refs to remove from each node.
+
+        Default implementation raises UnsupportedProvenanceCapability.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def remove_edge_source_refs(
+        self,
+        edges: list[EdgeIdentity],
+        source_ref_keys: list[str],
+    ) -> None:
+        """
+        Remove source refs from graph edges.
+
+        Implementations also keep source_dataset_ids, source_run_ids, and
+        source_run_refs consistent with the remaining source_ref_keys.
+
+        Parameters:
+        -----------
+
+            - edges (list[EdgeIdentity]): Edge identities to update.
+            - source_ref_keys (list[str]): Source refs to remove from each edge.
+
+        Default implementation raises UnsupportedProvenanceCapability.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def delete_edge_triples(
+        self,
+        edges: list[EdgeIdentity],
+    ) -> None:
+        """
+        Delete graph edges by source id, target id, and relationship name.
+
+        Parameters:
+        -----------
+
+            - edges (list[EdgeIdentity]): Edge identities to delete.
+
+        Default implementation raises UnsupportedProvenanceCapability.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def get_node_delete_data(
+        self,
+        node_ids: list[str],
+    ) -> dict[str, NodeDeleteData]:
+        """
+        Return node properties needed by graph-provenance delete and vector cleanup.
+
+        Returned data includes node identity, indexed fields, node properties,
+        and all four provenance fields.
+
+        Parameters:
+        -----------
+
+            - node_ids (list[str]): Unique identifiers of the nodes to inspect.
+
+        Returns:
+        --------
+
+            - dict[str, NodeDeleteData]: Delete data keyed by node id.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def get_edge_delete_data(
+        self,
+        edges: list[EdgeIdentity],
+    ) -> dict[EdgeIdentity, EdgeDeleteData]:
+        """
+        Return edge properties needed by graph-provenance delete and rollback.
+
+        Returned data includes edge identity, edge text, edge properties, and
+        all four provenance fields.
+
+        Parameters:
+        -----------
+
+            - edges (list[EdgeIdentity]): Edge identities to inspect.
+
+        Returns:
+        --------
+
+            - dict[EdgeIdentity, EdgeDeleteData]: Delete data keyed by edge identity.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def find_nodes_by_source_ref(
+        self,
+        source_ref_key: str,
+    ) -> list[str]:
+        """
+        Find graph node ids that currently contain a source ref.
+
+        Parameters:
+        -----------
+
+            - source_ref_key (str): Source ref key to match.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def find_edges_by_source_ref(
+        self,
+        source_ref_key: str,
+    ) -> list[EdgeIdentity]:
+        """
+        Find graph edges that currently contain a source ref.
+
+        Parameters:
+        -----------
+
+            - source_ref_key (str): Source ref key to match.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def find_node_source_refs_by_dataset(
+        self,
+        dataset_id: str,
+    ) -> dict[str, list[str]]:
+        """
+        Find node source refs owned by a dataset.
+
+        Parameters:
+        -----------
+
+            - dataset_id (str): Dataset id to match.
+
+        Returns:
+        --------
+
+            - dict[str, list[str]]: Matching source refs keyed by node id.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def find_edge_source_refs_by_dataset(
+        self,
+        dataset_id: str,
+    ) -> dict[EdgeIdentity, list[str]]:
+        """
+        Find edge source refs owned by a dataset.
+
+        Parameters:
+        -----------
+
+            - dataset_id (str): Dataset id to match.
+
+        Returns:
+        --------
+
+            - dict[EdgeIdentity, list[str]]: Matching source refs keyed by edge identity.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def find_node_source_refs_by_pipeline_run(
+        self,
+        pipeline_run_id: str,
+    ) -> dict[str, list[str]]:
+        """
+        Find node source refs attached by a pipeline run.
+
+        Parameters:
+        -----------
+
+            - pipeline_run_id (str): Pipeline run id to match.
+
+        Returns:
+        --------
+
+            - dict[str, list[str]]: Matching source refs keyed by node id.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def find_edge_source_refs_by_pipeline_run(
+        self,
+        pipeline_run_id: str,
+    ) -> dict[EdgeIdentity, list[str]]:
+        """
+        Find edge source refs attached by a pipeline run.
+
+        Parameters:
+        -----------
+
+            - pipeline_run_id (str): Pipeline run id to match.
+
+        Returns:
+        --------
+
+            - dict[EdgeIdentity, list[str]]: Matching source refs keyed by edge identity.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def set_graph_metadata(
+        self,
+        metadata: dict[str, str],
+    ) -> None:
+        """
+        Store graph-level metadata used to identify provenance schema support.
+
+        Parameters:
+        -----------
+
+            - metadata (dict[str, str]): Metadata keys and values to persist.
+        """
+        raise UnsupportedProvenanceCapability()
+
+    async def get_graph_metadata(self) -> dict[str, str]:
+        """Return graph-level metadata used to identify provenance schema support."""
+        raise UnsupportedProvenanceCapability()
+
+    @abstractmethod
+    async def get_node(self, node_id: str) -> NodeData | None:
+        """
+        Retrieve a single node from the graph using its ID.
+
+        Parameters:
+        -----------
+
+            - node_id (str): Unique identifier of the node to retrieve.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_nodes(self, node_ids: list[str]) -> list[NodeData]:
+        """
+        Retrieve multiple nodes from the graph using their IDs.
+
+        Parameters:
+        -----------
+
+            - node_ids (List[str]): A list of unique identifiers for the nodes to retrieve.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def add_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        relationship_name: str,
+        properties: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Create a new edge between two nodes in the graph.
+
+        Idempotent upsert keyed on ``(source_id, target_id, relationship_name)``: an
+        existing edge has its properties overwritten. If either endpoint node does not
+        exist the edge is silently not created. Returns ``None``.
+
+        Parameters:
+        -----------
+
+            - source_id (str): The unique identifier of the source node.
+            - target_id (str): The unique identifier of the target node.
+            - relationship_name (str): The name of the relationship to be established by the
+              edge.
+            - properties (Optional[Dict[str, Any]]): Optional dictionary of properties
+              associated with the edge. (default None)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def add_edges(
+        self,
+        edges: list[EdgeData] | list[tuple[str, str, str, dict[str, Any] | None]],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
+        """
+        Add multiple edges to the graph in a single operation.
+
+        Same upsert semantics as ``add_edge`` for each tuple; edges whose endpoints are
+        missing are skipped. Returns ``None``.
+
+        Parameters:
+        -----------
+
+            - edges (Union[List[EdgeData], List[Tuple[str, str, str, Optional[Dict[str, Any]]]]]): A list of EdgeData objects or tuples representing edges to be added.
+            - source_ref_key (Optional[str]): Graph provenance source ref to stamp
+              atomically as part of this write. Backends that support graph-provenance
+              provenance fold it into the same statement; others may ignore it. (default None)
+            - pipeline_run_id (Optional[str]): Run id recorded with the provenance stamp so
+              the write is rollbackable by run. Ignored when source_ref_key is None. (default None)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_graph(self) -> None:
+        """
+        Remove the entire graph, including all nodes and edges.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_graph_data(self) -> tuple[list[Node], list[EdgeData]]:
+        """
+        Retrieve all nodes and edges within the graph.
+        """
+        raise NotImplementedError
+
+    async def get_top_degree_node_ids(self, top_k: int) -> list[str]:
+        """Ids of up to ``top_k`` well-connected nodes, to seed a graph view.
+
+        **Approximate by contract.** An adapter may sample rather than count
+        exactly, and the order of near-equal nodes may differ between calls, so
+        callers must not treat the result as a ranking — only as "some nodes
+        worth starting from". Ranking exactly is what made this unusable: see
+        below.
+
+        ``top_k`` must be positive. Isolated nodes are valid seeds; a graph
+        without edges should still produce a nonempty view if it has nodes.
+
+        Deliberately NOT abstract: every adapter inherits this working
+        implementation, so a community adapter keeps loading. But the default
+        is the expensive one — it reads the whole graph and counts degree in
+        Python, which on a 5.59M-node / 35.6M-edge graph means tens of
+        gigabytes of Python objects to produce ten ids, and got the worker
+        OOM-killed at ~20.8 GB RSS instead of answering.
+
+        This is the seed source for the default (no query, no explicit seed)
+        graph visualization, so it is a hot path, not a corner — which is why
+        the exactness is what gives, not the feature. Note that an exact SQL
+        aggregate is not the answer either: measured on that graph it took 57 s
+        and spilled ~8.5 GB to temp, because it must group 71M endpoint rows
+        into 5.59M distinct ids. Overriding adapters should bound the work,
+        not just move it into the database.
+        """
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+
+        adapter_type = type(self)
+        if adapter_type not in _warned_degree_fallbacks:
+            _warned_degree_fallbacks.add(adapter_type)
+            logger.warning(
+                "%s has no native get_top_degree_node_ids; falling back to a full "
+                "graph read to rank %d seeds. This is O(graph) in memory.",
+                adapter_type.__name__,
+                top_k,
+            )
+        nodes, edges = await self.get_graph_data()
+        if not nodes:
+            return []
+
+        degree: dict[str, int] = {str(node_id): 0 for node_id, _ in nodes}
+        for edge in edges:
+            for endpoint in (str(edge[0]), str(edge[1])):
+                if endpoint in degree:
+                    degree[endpoint] += 1
+
+        ranked = sorted(degree.items(), key=lambda item: item[1], reverse=True)
+        return [node_id for node_id, _ in ranked[:top_k]]
+
+    async def iter_bounded_neighborhood(
+        self,
+        node_ids: list[str],
+        depth: int,
+        max_nodes: int,
+        chunk_size: int = DEFAULT_NEIGHBORHOOD_CHUNK_SIZE,
+        property_keys: list[str] | None = None,
+    ) -> AsyncIterator[tuple[list[Node], list[EdgeData]]]:
+        """The neighbourhood of ``node_ids``, capped at ``max_nodes``, in chunks.
+
+        This is what a graph view reads. ``get_neighborhood`` returns everything
+        within ``depth`` hops, and the default view seeds from the
+        highest-degree nodes: two hops from a hub reach almost the whole graph.
+        On a 13959-node / 33488-edge dataset that meant reading every node with
+        its full properties to draw 1000, and at 20k nodes a single response is
+        over 100 MB.
+
+        **Membership.** At most ``max_nodes`` nodes: the seeds in the given
+        order, then nodes by hop distance. Which nodes of the last admitted hop
+        are kept is the adapter's choice. Native adapters share the budget
+        round robin over the frontier, so one hub cannot take all of it. A seed
+        that is not in the graph takes no slot.
+
+        **Chunks.** Nodes arrive in membership order, at most ``chunk_size`` per
+        chunk. Every edge between two members is yielded exactly once, in the
+        chunk holding its later endpoint, so no chunk refers to a node the
+        caller has not received yet.
+
+        **Consistency.** Membership is decided once, before the first chunk.
+        Content is read per chunk: a node deleted in between is skipped along
+        with its edges, and a node created in between is not included.
+
+        **Properties.** ``property_keys=None`` returns every property. A list
+        returns only those keys, plus ``name`` and ``type``.
+
+        ``depth``, ``max_nodes`` and ``chunk_size`` must be positive and are
+        checked before anything is read.
+
+        Deliberately NOT abstract, for the same reason as
+        ``get_top_degree_node_ids``: a community adapter keeps working. The
+        default honours the whole contract except the bound on the read. It
+        calls ``get_neighborhood``, so the store still returns the full
+        ``depth``-hop neighbourhood, and the cap is applied in Python.
+        Overriding adapters should stop the traversal once they hold
+        ``max_nodes`` ids and read node content one chunk at a time.
+        """
+        validate_bounded_neighborhood_args(depth, max_nodes, chunk_size)
+        seed_ids = unique_node_ids(node_ids)
+        if not seed_ids:
+            return
+
+        adapter_type = type(self)
+        if adapter_type not in _warned_neighborhood_fallbacks:
+            _warned_neighborhood_fallbacks.add(adapter_type)
+            logger.warning(
+                "%s has no native iter_bounded_neighborhood; reading the whole %d-hop "
+                "neighbourhood to keep %d nodes. This is O(neighbourhood) in memory.",
+                adapter_type.__name__,
+                depth,
+                max_nodes,
+            )
+        nodes, edges = await self.get_neighborhood(node_ids=seed_ids, depth=depth)
+        members = order_members(nodes, edges, seed_ids, max_nodes)
+        for chunk in chunk_members(members, edges, chunk_size, property_keys):
+            yield chunk
+
+    async def get_entity_type_names(self, entity_ids: list[str]) -> dict[str, str]:
+        """The EntityType name each of ``entity_ids`` points to through ``is_a``.
+
+        Keyed by entity id; an entity with no ``is_a`` edge is left out. A graph
+        view uses this to label entities whose EntityType node is outside a
+        bounded read, so it reads one hop, never from a type node outward.
+
+        Deliberately NOT abstract, like ``get_top_degree_node_ids``. The default
+        goes through ``get_neighborhood``, which hydrates the entities with all
+        their properties and returns every edge among the returned nodes;
+        overriding adapters should read just the ``is_a`` edges and the target
+        names.
+        """
+        if not entity_ids:
+            return {}
+        nodes, edges = await self.get_neighborhood(
+            node_ids=entity_ids, depth=1, edge_types=["is_a"]
+        )
+        type_names = {
+            str(node_id): properties.get("name")
+            for node_id, properties in nodes
+            if properties.get("type") == "EntityType"
+        }
+        members = {str(entity_id) for entity_id in entity_ids}
+        # get_neighborhood returns every edge among the returned nodes, not only
+        # the traversed ones, so relation and direction are checked here.
+        return {
+            str(edge[0]): type_names[str(edge[1])]
+            for edge in edges
+            if edge[2] == "is_a" and str(edge[0]) in members and type_names.get(str(edge[1]))
+        }
+
+    @abstractmethod
+    async def get_graph_metrics(self, include_optional: bool = False) -> dict[str, Any]:
+        """
+        Fetch metrics and statistics of the graph, possibly including optional details.
+
+        Parameters:
+        -----------
+
+            - include_optional (bool): Flag indicating whether to include optional metrics or
+              not. (default False)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def has_edge(self, source_id: str, target_id: str, relationship_name: str) -> bool:
+        """
+        Verify if an edge exists between two specified nodes.
+
+        Parameters:
+        -----------
+
+            - source_id (str): Unique identifier of the source node.
+            - target_id (str): Unique identifier of the target node.
+            - relationship_name (str): Name of the relationship to verify.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def has_edges(self, edges: list[EdgeData]) -> list[EdgeData]:
+        """
+        Determine the existence of multiple edges in the graph.
+
+        Parameters:
+        -----------
+
+            - edges (List[EdgeData]): A list of EdgeData objects to check for existence in the
+              graph.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_edges(self, node_id: str) -> list[EdgeData]:
+        """
+        Retrieve all edges that are connected to the specified node.
+
+        Parameters:
+        -----------
+
+            - node_id (str): Unique identifier of the node whose edges are to be retrieved.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_neighbors(self, node_id: str) -> list[NodeData]:
+        """
+        Get all neighboring nodes connected to the specified node.
+
+        Parameters:
+        -----------
+
+            - node_id (str): Unique identifier of the node for which to retrieve neighbors.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_nodeset_subgraph(
+        self, node_type: type[Any], node_name: list[str], node_name_filter_operator: str = "OR"
+    ) -> tuple[list[tuple[int, dict]], list[tuple[int, int, str, dict]]]:
+        """
+        Fetch a subgraph consisting of a specific set of nodes and their relationships.
+
+        Parameters:
+        -----------
+
+            - node_type (Type[Any]): The type of nodes to include in the subgraph.
+            - node_name (List[str]): A list of names of the nodes to include in the subgraph.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_connections(
+        self, node_id: str | UUID
+    ) -> list[tuple[NodeData, dict[str, Any], NodeData]]:
+        """
+        Get all nodes connected to a specified node and their relationship details.
+
+        Parameters:
+        -----------
+
+            - node_id (Union[str, UUID]): Unique identifier of the node for which to retrieve connections.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_neighborhood(
+        self,
+        node_ids: list[str],
+        depth: int = 1,
+        edge_types: list[str] | None = None,
+    ) -> tuple[list[Node], list[EdgeData]]:
+        """
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
+
+        Returns all nodes and edges within `depth` hops of any seed node,
+        in the same format as get_graph_data().
+        Optional edge_type filtering to constrain traversal paths.
+
+        Parameters:
+        -----------
+
+            - node_ids (List[str]): Seed node identifiers to start traversal from.
+            - depth (int): Number of hops to traverse from each seed node. (default 1)
+            - edge_types (Optional[List[str]]): If provided, only traverse edges of these
+              relationship types. (default None)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_filtered_graph_data(
+        self, attribute_filters: list[dict[str, list[str | int]]]
+    ) -> tuple[list[Node], list[EdgeData]]:
+        """
+        Retrieve nodes and edges filtered by the provided attribute criteria.
+
+        Parameters:
+        -----------
+
+            - attribute_filters: A list of dictionaries where keys are attribute names and values
+              are lists of attribute values to filter by.
+        """
+        raise NotImplementedError
+
+    async def get_node_feedback_weights(self, node_ids: list[str]) -> dict[str, float]:
+        """
+        Retrieve node feedback weights for multiple node ids.
+        Returns only found node ids.
+        """
+        raise NotImplementedError("get_node_feedback_weights is not implemented for this adapter")
+
+    async def set_node_feedback_weights(
+        self, node_feedback_weights: dict[str, float]
+    ) -> dict[str, bool]:
+        """
+        Persist node feedback weights for multiple node ids.
+        Returns per-id update success.
+        """
+        raise NotImplementedError("set_node_feedback_weights is not implemented for this adapter")
+
+    async def get_node_truth_state(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """
+        Retrieve node truth alignment state for multiple node ids.
+        Returns only found node ids.
+        """
+        raise NotImplementedError("get_node_truth_state is not implemented for this adapter")
+
+    async def set_node_truth_state(
+        self, node_truth_state: dict[str, dict[str, Any]]
+    ) -> dict[str, bool]:
+        """
+        Persist node truth alignment state for multiple node ids.
+        Returns per-id update success.
+        """
+        raise NotImplementedError("set_node_truth_state is not implemented for this adapter")
+
+    async def update_node(self, node_id: str, values: dict[str, Any]) -> bool:
+        """
+        Merge *values* into an existing node's properties, leaving every field not
+        named in *values* untouched. Used to patch a single scalar (e.g. stamping
+        ``valid_to`` when a fact is superseded) without rewriting the whole node.
+
+        Optional extension — implemented by LadybugAdapter (the default backend).
+        Other adapters may not support partial node updates yet and raise here.
+
+        Parameters:
+        -----------
+
+            - node_id (str): Id of the node to patch.
+            - values (Dict[str, Any]): Property name -> new value to merge in.
+
+        Returns:
+        --------
+
+            - bool: True if the node existed and was updated, False if not found.
+        """
+        raise NotImplementedError("update_node is not implemented for this adapter")
+
+    async def get_edge_feedback_weights(self, edge_object_ids: list[str]) -> dict[str, float]:
+        """
+        Retrieve edge feedback weights for multiple edge_object_ids.
+        Returns only found edge ids.
+        """
+        raise NotImplementedError("get_edge_feedback_weights is not implemented for this adapter")
+
+    async def set_edge_feedback_weights(
+        self, edge_feedback_weights: dict[str, float]
+    ) -> dict[str, bool]:
+        """
+        Persist edge feedback weights for multiple edge_object_ids.
+        Returns per-id update success.
+        """
+        raise NotImplementedError("set_edge_feedback_weights is not implemented for this adapter")
+
+    async def get_triplets_batch(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """Retrieve a batch of triplets (source, edge, target).
+
+        Optional extension — implemented by PostgresDemoAdapter, Neo4jAdapter,
+        and LadybugAdapter but not NeptuneGraphDB.
+
+        Parameters
+        ----------
+
+            - offset: Number of triplets to skip.
+            - limit: Maximum number of triplets to return.
+        """
+        raise NotImplementedError("get_triplets_batch is not implemented for this adapter")

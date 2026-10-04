@@ -1,0 +1,464 @@
+import { describe, expect, test } from 'bun:test'
+import { BlockNode } from '@pascal-app/core'
+import { createSurfaceRoleMaterial } from '@pascal-app/viewer'
+import { Mesh, Ray, Vector3, type Vector3Tuple } from 'three'
+import { applyBlockCommand } from './commands'
+import { buildBlockGeometry } from './geometry'
+import { blockPaint } from './paint'
+
+type BlockFaceRange = { faceId: string; start: number; count: number }
+
+describe('buildBlockGeometry', () => {
+  test('uses the shared wall-role material for an unpainted body', () => {
+    const node = BlockNode.parse({ name: 'Default mesh' })
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    expect(mesh.material).toBe(createSurfaceRoleMaterial('wall', 'clay'))
+  })
+
+  test('uses the active theme role when the body material cannot resolve', () => {
+    const node = BlockNode.parse({
+      name: 'Themed mesh',
+      slots: { body: 'scene:missing' },
+    })
+    const group = buildBlockGeometry(node, undefined, 'rendered', true, 'blueprint', 'studio')
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    expect(mesh.material).toBe(createSurfaceRoleMaterial('wall', 'blueprint', undefined, 'studio'))
+  })
+
+  test('derives a render mesh from persistent topology', () => {
+    const node = BlockNode.parse({ name: 'Box' })
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    expect(mesh.geometry.getAttribute('position').count).toBe(36)
+    expect(mesh.geometry.getAttribute('normal').count).toBe(36)
+    expect(mesh.geometry.getAttribute('uv').count).toBe(36)
+    expect(mesh.geometry.userData.blockFaces).toHaveLength(6)
+  })
+
+  test('maps topology face slots to geometry groups and material-array entries', () => {
+    const base = BlockNode.parse({
+      name: 'Painted mesh',
+      slots: {
+        body: 'library:metal-steel',
+        accent: 'library:preset-softwhite',
+      },
+    })
+    const node = {
+      ...base,
+      topology: {
+        ...base.topology,
+        faces: base.topology.faces.map((face, index) => ({
+          ...face,
+          materialSlot: index % 2 === 0 ? 'body' : 'accent',
+        })),
+      },
+    }
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    expect(Array.isArray(mesh.material)).toBe(true)
+    expect(mesh.material).toHaveLength(2)
+    expect(mesh.userData.slotIds).toEqual(['body', 'accent'])
+    // One draw group per slot, not per face.
+    expect(mesh.geometry.groups.map((group) => group.materialIndex)).toEqual([0, 1])
+    const slotOf = new Map(node.topology.faces.map((face) => [face.id, face.materialSlot]))
+    for (const range of mesh.geometry.userData.blockFaces as BlockFaceRange[]) {
+      const group = mesh.geometry.groups.find(
+        (candidate) =>
+          range.start >= candidate.start &&
+          range.start + range.count <= candidate.start + candidate.count,
+      )
+      expect(mesh.userData.slotIds[group!.materialIndex!]).toBe(slotOf.get(range.faceId))
+    }
+  })
+
+  test('draws a single-slot block with one material and one group', () => {
+    const node = BlockNode.parse({ name: 'Plain mesh' })
+    const mesh = buildBlockGeometry(node).getObjectByName('block-body') as Mesh
+
+    expect(mesh.material).toBe(createSurfaceRoleMaterial('wall', 'clay'))
+    expect(mesh.geometry.groups).toEqual([{ start: 0, count: 36, materialIndex: 0 }])
+    expect(mesh.geometry.userData.blockFaces).toHaveLength(6)
+  })
+
+  test('rebuilds a 2,050-face block in linear time', () => {
+    const sides = 2048
+    const vertices = Array.from({ length: sides * 2 }, (_, index) => {
+      const angle = ((index % sides) / sides) * Math.PI * 2
+      return {
+        id: `v${index}`,
+        position: [Math.cos(angle), index < sides ? 0 : 3, Math.sin(angle)] as Vector3Tuple,
+      }
+    })
+    const ring = (offset: number) => Array.from({ length: sides }, (_, i) => `v${i + offset}`)
+    const faces = [
+      ...Array.from({ length: sides }, (_, i) => ({
+        id: `f${i}`,
+        vertexIds: [
+          `v${i}`,
+          `v${(i + 1) % sides}`,
+          `v${((i + 1) % sides) + sides}`,
+          `v${i + sides}`,
+        ],
+        materialSlot: 'body',
+      })),
+      { id: 'f-bottom', vertexIds: ring(0).reverse(), materialSlot: 'body' },
+      { id: 'f-top', vertexIds: ring(sides), materialSlot: 'body' },
+    ]
+    const edges = faces.flatMap((face) =>
+      face.vertexIds.map((id, index) => ({
+        id: `${face.id}-e${index}`,
+        vertexIds: [id, face.vertexIds[(index + 1) % face.vertexIds.length]!],
+      })),
+    )
+    const node = { ...BlockNode.parse({ name: 'Prism' }), topology: { vertices, edges, faces } }
+
+    buildBlockGeometry(node)
+    const start = performance.now()
+    const mesh = buildBlockGeometry(node).getObjectByName('block-body') as Mesh
+    // A per-face vertex map took 1.7–3 s here; the linear build takes tens of ms.
+    expect(performance.now() - start).toBeLessThan(500)
+    expect(mesh.geometry.userData.blockFaces).toHaveLength(sides + 2)
+    expect(mesh.geometry.groups).toHaveLength(1)
+  })
+
+  test('face UVs follow each face frame: metres along the face, U level, V up-slope, unmirrored', () => {
+    const base = BlockNode.parse({ name: 'Ramp' })
+    // Raise the back of the top so it becomes a 45° slope facing +Y/-Z.
+    const topology = structuredClone(base.topology)
+    for (const vertex of topology.vertices) {
+      if (vertex.position[1] > 1 && vertex.position[2] > 0) vertex.position[1] += 2
+    }
+    const mesh = buildBlockGeometry({ ...base, topology }).getObjectByName('block-body') as Mesh
+    const position = mesh.geometry.getAttribute('position')
+    const uv = mesh.geometry.getAttribute('uv')
+    const normal = mesh.geometry.getAttribute('normal')
+    const point = (i: number) => new Vector3().fromBufferAttribute(position, i)
+    for (const range of mesh.geometry.userData.blockFaces as BlockFaceRange[]) {
+      for (let a = range.start; a < range.start + range.count; a += 1) {
+        for (let b = a + 1; b < range.start + range.count; b += 1) {
+          const metres = point(a).distanceTo(point(b))
+          const uvDistance = Math.hypot(uv.getX(b) - uv.getX(a), uv.getY(b) - uv.getY(a))
+          // 1 UV unit = 1 m on every face, the 45° slope included.
+          expect(Math.abs(metres - uvDistance)).toBeLessThan(1e-5)
+          // U is level: two points at one height differ only in U on walls.
+          const faceNormalY = normal.getY(a)
+          if (Math.abs(faceNormalY) < 1e-6 && Math.abs(point(a).y - point(b).y) < 1e-6) {
+            expect(Math.abs(uv.getY(b) - uv.getY(a))).toBeLessThan(1e-6)
+          }
+        }
+      }
+      // The texture reads unmirrored from outside: (dP/dU × dP/dV) points out of the face.
+      const [p0, p1, p2] = [0, 1, 2].map((k) => point(range.start + k))
+      const [u0, u1, u2] = [0, 1, 2].map((k) => [
+        uv.getX(range.start + k),
+        uv.getY(range.start + k),
+      ])
+      const e1 = p1!.clone().sub(p0!)
+      const e2 = p2!.clone().sub(p0!)
+      const [du1, dv1, du2, dv2] = [
+        u1![0]! - u0![0]!,
+        u1![1]! - u0![1]!,
+        u2![0]! - u0![0]!,
+        u2![1]! - u0![1]!,
+      ]
+      const tangent = e1.clone().multiplyScalar(dv2).sub(e2.clone().multiplyScalar(dv1))
+      const bitangent = e2.clone().multiplyScalar(du1).sub(e1.clone().multiplyScalar(du2))
+      const outward = e1.clone().cross(e2)
+      expect(tangent.cross(bitangent).dot(outward)).toBeGreaterThan(0)
+    }
+  })
+
+  test('side faces keep V vertical, so siding and brick courses stay level on every side', () => {
+    const mesh = buildBlockGeometry(BlockNode.parse({ name: 'Box' })).getObjectByName(
+      'block-body',
+    ) as Mesh
+    const position = mesh.geometry.getAttribute('position')
+    const uv = mesh.geometry.getAttribute('uv')
+    for (const range of mesh.geometry.userData.blockFaces as BlockFaceRange[]) {
+      if (range.faceId === 'f-top' || range.faceId === 'f-bottom') continue
+      for (let i = range.start; i < range.start + range.count; i += 1) {
+        // V is the height above the block origin on every wall face (X- and Z-facing alike).
+        expect(uv.getY(i)).toBeCloseTo(position.getY(i), 6)
+      }
+    }
+  })
+
+  test('resolves every default-box surface to its assigned material slot', () => {
+    const base = BlockNode.parse({ name: 'Raycast mesh' })
+    const node = {
+      ...base,
+      topology: {
+        ...base.topology,
+        faces: base.topology.faces.map((face) => ({ ...face, materialSlot: face.id })),
+      },
+      slotNames: Object.fromEntries(base.topology.faces.map((face) => [face.id, face.id])),
+    }
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    const rays: Array<[string, Vector3Tuple, Vector3Tuple]> = [
+      ['f-bottom', [0, -10, 0], [0, 1, 0]],
+      ['f-top', [0, 10, 0], [0, -1, 0]],
+      ['f-front', [0, 1.2, -10], [0, 0, 1]],
+      ['f-right', [10, 1.2, 0], [-1, 0, 0]],
+      ['f-back', [0, 1.2, 10], [0, 0, -1]],
+      ['f-left', [-10, 1.2, 0], [1, 0, 0]],
+    ]
+
+    for (const [faceId, origin, direction] of rays) {
+      expect(
+        blockPaint.resolveRole({
+          node,
+          hitObject: mesh,
+          materialIndex: 0,
+          ray: new Ray(new Vector3(...origin), new Vector3(...direction)),
+        }),
+      ).toBe(faceId)
+    }
+  })
+
+  test('resolves a face through the rendered mesh world transform', () => {
+    const base = BlockNode.parse({ name: 'Transformed raycast mesh' })
+    const node = {
+      ...base,
+      topology: {
+        ...base.topology,
+        faces: base.topology.faces.map((face) =>
+          face.id === 'f-front' ? { ...face, materialSlot: 'front' } : face,
+        ),
+      },
+      slotNames: { ...base.slotNames, front: 'Front' },
+    }
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    group.position.set(3, 2, -4)
+    group.rotation.y = Math.PI / 2
+    group.updateMatrixWorld(true)
+    const origin = new Vector3(0, 1.2, -10).applyMatrix4(group.matrixWorld)
+    const direction = new Vector3(0, 0, 1).transformDirection(group.matrixWorld)
+
+    expect(
+      blockPaint.resolveRole({
+        node,
+        hitObject: mesh,
+        materialIndex: 0,
+        ray: new Ray(origin, direction),
+      }),
+    ).toBe('front')
+  })
+
+  test('omits malformed faces from geometry and paint hit metadata', () => {
+    const base = BlockNode.parse({ name: 'Malformed topology mesh' })
+    const node = {
+      ...base,
+      topology: {
+        ...base.topology,
+        faces: [
+          ...base.topology.faces,
+          { id: 'f-malformed', vertexIds: ['v0', 'v1', 'missing'], materialSlot: 'body' },
+        ],
+      },
+    }
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    expect(mesh.geometry.getAttribute('position').count).toBe(36)
+    expect(mesh.geometry.userData.blockFaces).toHaveLength(6)
+    expect(
+      mesh.geometry.userData.blockFaces.some(
+        (range: { faceId: string }) => range.faceId === 'f-malformed',
+      ),
+    ).toBe(false)
+  })
+
+  test('resolves and previews every face assigned to the hit slot', () => {
+    const base = BlockNode.parse({
+      name: 'Preview mesh',
+      slots: { accent: 'library:preset-softwhite' },
+    })
+    const node = {
+      ...base,
+      topology: {
+        ...base.topology,
+        faces: base.topology.faces.map((face, index) => ({
+          ...face,
+          materialSlot: index === 1 || index === 2 ? 'accent' : 'body',
+        })),
+      },
+    }
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    mesh.userData.__fromGeometry = true
+    const role = blockPaint.resolveRole({
+      node,
+      hitObject: mesh,
+      materialIndex: 1,
+      ray: new Ray(new Vector3(0, 10, 0), new Vector3(0, -1, 0)),
+    })
+    expect(role).toBe('accent')
+    expect(Array.isArray(mesh.material)).toBe(true)
+    if (!Array.isArray(mesh.material)) return
+    const previous = mesh.material
+    const previousGroupIndices = mesh.geometry.groups.map((group) => group.materialIndex)
+    const restore = blockPaint.applyPreview({
+      node,
+      role: role!,
+      material: {
+        preset: 'custom',
+        properties: { color: '#c2410c' },
+      },
+      materialPreset: undefined,
+      root: group,
+    })
+
+    expect(restore).toBeFunction()
+    expect(Array.isArray(mesh.material)).toBe(true)
+    if (!Array.isArray(mesh.material)) return
+    expect(mesh.material.slice(0, previous.length)).toEqual(previous)
+    expect(mesh.material).toHaveLength(previous.length + 1)
+    expect(mesh.geometry.groups).toHaveLength(2)
+    expect(mesh.geometry.groups[0]?.materialIndex).toBe(previousGroupIndices[0])
+    expect(mesh.geometry.groups[1]?.materialIndex).toBe(previous.length)
+    restore?.()
+    expect(mesh.material).toBe(previous)
+    expect(mesh.geometry.groups.map((group) => group.materialIndex)).toEqual(previousGroupIndices)
+  })
+
+  test('previews a face slot when textures-off rendering supplies one material', () => {
+    const base = BlockNode.parse({
+      name: 'Textures-off preview mesh',
+      slots: { accent: 'library:preset-softwhite' },
+    })
+    const node = {
+      ...base,
+      topology: {
+        ...base.topology,
+        faces: base.topology.faces.map((face, index) => ({
+          ...face,
+          materialSlot: index === 1 ? 'accent' : 'body',
+        })),
+      },
+    }
+    const group = buildBlockGeometry(node)
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh) || !Array.isArray(mesh.material)) return
+    mesh.userData.__fromGeometry = true
+    const previous = mesh.material[0]!
+    mesh.material = previous
+    const previousGroupIndices = mesh.geometry.groups.map((group) => group.materialIndex)
+
+    const restore = blockPaint.applyPreview({
+      node,
+      role: 'accent',
+      material: {
+        preset: 'custom',
+        properties: { color: '#c2410c' },
+      },
+      materialPreset: undefined,
+      root: group,
+    })
+
+    expect(restore).toBeFunction()
+    expect(Array.isArray(mesh.material)).toBe(true)
+    if (!Array.isArray(mesh.material)) return
+    expect(mesh.material).toHaveLength(3)
+    expect(mesh.material[0]).toBe(previous)
+    expect(mesh.material[1]).toBe(previous)
+    expect(mesh.material[2]).not.toBe(previous)
+    expect(mesh.geometry.groups[1]?.materialIndex).toBe(2)
+    restore?.()
+    expect(mesh.material).toBe(previous)
+    expect(mesh.geometry.groups.map((group) => group.materialIndex)).toEqual(previousGroupIndices)
+  })
+
+  test('rebuilds the extruded topology into additional face triangles', () => {
+    const node = BlockNode.parse({ name: 'Box' })
+    const result = applyBlockCommand(node.topology, {
+      type: 'extrude-faces',
+      faceIds: ['f-top'],
+      distance: 0.25,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const group = buildBlockGeometry({ ...node, topology: result.topology })
+    const mesh = group.getObjectByName('block-body')
+
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+    expect(mesh.geometry.getAttribute('position').count).toBe(60)
+    expect(mesh.geometry.userData.blockFaces).toHaveLength(10)
+  })
+
+  test('smooths rounded bevel bands without softening the original box corners', () => {
+    const node = BlockNode.parse({ name: 'Box' })
+    const result = applyBlockCommand(node.topology, {
+      type: 'bevel-edges',
+      edgeIds: ['e0'],
+      width: 0.2,
+      segments: 6,
+      profile: 0.5,
+      clampOverlap: true,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const group = buildBlockGeometry({ ...node, topology: result.topology })
+    const mesh = group.getObjectByName('block-body')
+    expect(mesh).toBeInstanceOf(Mesh)
+    if (!(mesh instanceof Mesh)) return
+
+    const railPosition = result.topology.vertices.find((vertex) => vertex.id === 'v10')!.position
+    const position = mesh.geometry.getAttribute('position')
+    const normal = mesh.geometry.getAttribute('normal')
+    const normalsAt = (target: Vector3Tuple) => {
+      const matches: Vector3Tuple[] = []
+      for (let index = 0; index < position.count; index += 1) {
+        if (
+          Math.hypot(
+            position.getX(index) - target[0],
+            position.getY(index) - target[1],
+            position.getZ(index) - target[2],
+          ) < 1e-6
+        ) {
+          matches.push([normal.getX(index), normal.getY(index), normal.getZ(index)])
+        }
+      }
+      return matches
+    }
+    const roundedNormals = normalsAt(railPosition).filter(([x]) => Math.abs(x) < 0.5)
+    const roundedNormalKeys = new Set(
+      roundedNormals.map((values) => values.map((value) => value.toFixed(5)).join(',')),
+    )
+    expect(roundedNormals.length).toBeGreaterThan(1)
+    expect(roundedNormalKeys.size).toBe(1)
+
+    const hardCornerNormalKeys = new Set(
+      normalsAt([1, 0, 1]).map((values) => values.map((value) => value.toFixed(5)).join(',')),
+    )
+    expect(hardCornerNormalKeys.size).toBe(3)
+  })
+})

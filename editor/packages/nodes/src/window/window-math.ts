@@ -1,0 +1,68 @@
+import {
+  type AnyNode,
+  type AnyNodeId,
+  getCurtainWallConfig,
+  getWallCurveFrameAt,
+  getWallCurveLength,
+  type WallNode,
+} from '@pascal-app/core'
+import { resolveWallOpeningCeiling } from '../shared/wall-opening-ceiling'
+
+/**
+ * Default sill height (metres from the floor to the BOTTOM of a window) for a
+ * fresh window that has no wall-face height yet — the off-wall ghost and the
+ * floor-cursor placement use it so a new window floats slightly above the
+ * ground rather than sitting on it. The committed Y is the window's CENTRE, so
+ * callers add `height / 2`. An existing window keeps its own sill.
+ */
+export const DEFAULT_WINDOW_SILL_M = 0.5
+
+/**
+ * Converts wall-local (X along wall, Y = height above wall base) to world XYZ.
+ * Wall XZ uses level-local coordinates (levels only offset in Y, not XZ).
+ * Pass levelYOffset (the level group's current world Y) and slabElevation (the
+ * wall mesh's Y within the level group) so the cursor lands at the correct world
+ * height — matching how WallSystem positions the wall mesh at slabElevation.
+ */
+export function wallLocalToWorld(
+  wallNode: WallNode,
+  localX: number,
+  localY: number,
+  levelYOffset = 0,
+  slabElevation = 0,
+): [number, number, number] {
+  const wallLength = getWallCurveLength(wallNode)
+  const frame = getWallCurveFrameAt(wallNode, wallLength > 1e-6 ? localX / wallLength : 0)
+  return [frame.point.x, slabElevation + localY + levelYOffset, frame.point.y]
+}
+
+/**
+ * Clamps window center position so it stays fully within wall bounds. The Y
+ * ceiling is the wall's RESOLVED top (storey plane for plane-bound walls,
+ * stored height for explicit ones, minus the elected slab base) — `nodes` is
+ * required because a plane-bound wall's top lives on its level, not on the
+ * wall record.
+ */
+export function clampToWall(
+  wallNode: WallNode,
+  localX: number,
+  localY: number,
+  width: number,
+  height: number,
+  nodes: Readonly<Record<AnyNodeId, AnyNode>>,
+): { clampedX: number; clampedY: number } {
+  const wallLength = getWallCurveLength(wallNode)
+  const wallHeight = resolveWallOpeningCeiling(wallNode, nodes)
+  const margin = wallNode.wallType === 'curtain' ? getCurtainWallConfig(wallNode).perimeterWidth : 0
+
+  const clampedX = Math.max(margin + width / 2, Math.min(wallLength - margin - width / 2, localX))
+  const clampedY = Math.max(margin + height / 2, Math.min(wallHeight - margin - height / 2, localY))
+  return { clampedX, clampedY }
+}
+
+/**
+ * Wall-child overlap is shared by door + window placement (one source of
+ * truth in `shared/wall-attach-target.ts`). Re-exported here so existing
+ * `./window-math` importers don't change.
+ */
+export { hasWallChildOverlap } from '../shared/wall-attach-target'

@@ -1,0 +1,18 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { AgentsCatalog } from "../components/brand/AgentsCatalog";
+import { agents, searchIndex } from "../lib/site-data";
+import data from "../../public/data/agents.json";
+---
+
+<BaseLayout
+  title="Agents | Awesome GitHub Copilot"
+  description="Browse community-contributed custom agents for GitHub Copilot."
+>
+  <AgentsCatalog
+    client:load
+    agents={agents as any}
+    filters={data.filters as any}
+    searchIndex={searchIndex}
+  />
+</BaseLayout>

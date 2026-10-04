@@ -1,0 +1,405 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License
+
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <arrow/ipc/api.h>
+#include <gtest/gtest.h>
+#include "db/common/file_helper.h"
+#include "db/index/common/version_manager.h"
+#include "db/index/segment/segment.h"
+#include "db/sqlengine/sqlengine.h"
+#include "zvec/db/index_params.h"
+#include "zvec/db/schema.h"
+#include "zvec/db/type.h"
+#include "test_helper.h"
+
+namespace zvec::sqlengine {
+
+static Doc create_doc(const uint64_t doc_id) {
+  Doc new_doc;
+  new_doc.set_pk("pk_" + std::to_string(doc_id));
+  new_doc.set_doc_id(doc_id);
+
+  auto name = std::string("user-");
+  if (doc_id >= 5000 && doc_id < 8000) {
+    name += "%";
+  } else if (doc_id >= 8000) {
+    name += '_';
+  }
+  name += std::to_string(doc_id % 100);
+  new_doc.set<std::string>("name", name);
+  new_doc.set<std::string>("invert_name", name);
+  new_doc.set<std::string>("extended_invert_name", name);
+  return new_doc;
+}
+
+class LikeTest : public testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    FileHelper::RemoveDirectory(seg_path_);
+    FileHelper::CreateDirectory(seg_path_);
+
+    auto invert_params = std::make_shared<InvertIndexParams>(true);
+    collection_schema_ = std::make_shared<CollectionSchema>(
+        "test_collection",
+        std::vector<FieldSchema::Ptr>{
+            std::make_shared<FieldSchema>("name", DataType::STRING, false,
+                                          nullptr),
+            std::make_shared<FieldSchema>(
+                "invert_name", DataType::STRING, false,
+                std::make_shared<InvertIndexParams>(false, false)),
+            std::make_shared<FieldSchema>(
+                "extended_invert_name", DataType::STRING, false,
+                std::make_shared<InvertIndexParams>(false, true)),
+        });
+    auto segment = create_segment(seg_path_, *collection_schema_);
+    if (segment == nullptr) {
+      LOG_ERROR("create segment failed");
+      EXPECT_TRUE(segment != nullptr);
+      std::exit(EXIT_FAILURE);
+    }
+    auto status = InsertDoc(segment, 0, 10000, &create_doc);
+    if (!status.ok()) {
+      LOG_ERROR("insert doc failed: %s", status.c_str());
+      EXPECT_TRUE(status.ok());
+      std::exit(EXIT_FAILURE);
+    }
+    segments_.push_back(segment);
+  }
+
+  static void TearDownTestSuite() {
+    segments_.clear();
+    FileHelper::RemoveDirectory(seg_path_);
+  }
+
+ protected:
+  static inline std::string seg_path_ = "./test_collection";
+  static inline CollectionSchema::Ptr collection_schema_;
+  static inline std::vector<Segment::Ptr> segments_;
+};
+
+
+TEST_F(LikeTest, ForwardLikeAll) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "name like '%'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+  }
+}
+
+TEST_F(LikeTest, InvertLikeAll) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "invert_name like '%'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(i));
+  }
+}
+
+TEST_F(LikeTest, ForwardPrefixLike) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "name like 'user-22%'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    int doc_id = i * 100 + 22;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, InvertPrefixLike) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "invert_name like 'user-22%'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    int doc_id = i * 100 + 22;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, ForwardSuffixLike) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "name like '%ser-22'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  ASSERT_EQ(docs.size(), 50u);
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    int doc_id = i * 100 + 22;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, NotExtendedInvertSuffixLikeRunAsForward) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "invert_name like '%ser-22'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  ASSERT_EQ(docs.size(), 50u);
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    int doc_id = i * 100 + 22;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, ExtendedInvertSuffixLike) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "extended_invert_name like '%ser-22'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  ASSERT_EQ(docs.size(), 50u);
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    int doc_id = i * 100 + 22;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, ForwardMiddleLike) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "name like 'user%2'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 0; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    while (doc_id % 100 % 10 != 2) {
+      doc_id++;
+    }
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, ExtendedInvertMiddleLike) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "extended_invert_name like 'user%2'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 0; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    while (doc_id % 100 % 10 != 2) {
+      doc_id++;
+    }
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, PrefixSuffixMustNotOverlap) {
+  struct TestCase {
+    const char *pattern;
+    size_t expected_count;
+  };
+  const TestCase cases[] = {
+      {"user-2%2", 50},      {"user-%-22", 0}, {"user-22%user-22", 0},
+      {"user-X%2", 0},       {"u%2", 1000},    {R"(user-\%%2)", 300},
+      {R"(user-\_%2)", 200},
+  };
+  for (const auto &test : cases) {
+    for (const auto *field : {"name", "invert_name", "extended_invert_name"}) {
+      SearchQuery query;
+      query.output_fields_ = {"name"};
+      query.topk_ = 10000;
+      query.filter_ = std::string(field) + " like '" + test.pattern + "'";
+      SCOPED_TRACE(query.filter_);
+      auto engine = SQLEngine::create(std::make_shared<Profiler>());
+      auto ret = engine->execute(collection_schema_, query, segments_);
+      ASSERT_TRUE(ret.has_value()) << ret.error();
+      EXPECT_EQ(ret.value().size(), test.expected_count);
+      if (std::string(test.pattern) == "user-2%2") {
+        for (size_t i = 0; i < ret.value().size(); ++i) {
+          EXPECT_EQ(ret.value()[i]->pk(), "pk_" + std::to_string(i * 100 + 22));
+        }
+      }
+    }
+  }
+}
+
+TEST_F(LikeTest, UnderScore) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "name like 'user-_2'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 0; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    while (doc_id % 100 % 10 != 2 || doc_id % 100 < 10) {
+      doc_id++;
+    }
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, InvertUnderScoreRunAsForward) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = "invert_name like 'user-_2'";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 0; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    while (doc_id % 100 % 10 != 2 || doc_id % 100 < 10) {
+      doc_id++;
+    }
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, ForwardEscapePercent) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = R"(name like 'user-\%%')";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 5000; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, InvertEscapePercent) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = R"(invert_name like 'user-\%%')";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 5000; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, ForwardEscapeUnderscore) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = R"(name like 'user-\_%')";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 8000; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, InvertEscapeUnderscore) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = R"(invert_name like 'user-\_%')";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  ASSERT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0, doc_id = 8000; i < docs.size(); i++, doc_id++) {
+    auto doc = docs[i];
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+TEST_F(LikeTest, NoPercentRunAsEqual) {
+  SearchQuery query;
+  query.output_fields_ = {"name"};
+  query.topk_ = 200;
+  query.filter_ = R"(invert_name like 'user-22')";
+
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  auto ret = engine->execute(collection_schema_, query, segments_);
+  EXPECT_TRUE(ret.has_value()) << ret.error();
+  auto docs = std::move(ret.value());
+  for (size_t i = 0; i < docs.size(); i++) {
+    auto doc = docs[i];
+    int doc_id = i * 100 + 22;
+    EXPECT_EQ(doc->pk(), "pk_" + std::to_string(doc_id));
+  }
+}
+
+}  // namespace zvec::sqlengine

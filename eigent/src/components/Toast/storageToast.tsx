@@ -1,0 +1,42 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+import i18n from '@/i18n';
+import { SITE_URL } from '@/lib';
+import { toast } from 'sonner';
+
+export function showStorageToast() {
+  toast(
+    <div>
+      {i18n.t(
+        'chat.your-cloud-storage-has-reached-the-limit-of-your-current-plan'
+      )}{' '}
+      {i18n.t('chat.please', { defaultValue: 'Please' })}{' '}
+      <a
+        className="cursor-pointer underline"
+        onClick={() => (window.location.href = `${SITE_URL}/pricing`)}
+      >
+        {i18n.t('chat.upgrade')}
+      </a>{' '}
+      {i18n.t(
+        'chat.your-account-or-switch-to-a-self-hosted-model-and-api-in'
+      )}{' '}
+    </div>,
+    {
+      id: 'eigent-storage',
+      duration: Infinity,
+      closeButton: true,
+    }
+  );
+}

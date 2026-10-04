@@ -1,0 +1,89 @@
+---
+title: "Checking service status"
+description: "Check the current uptime and incident status for Reactive Resume's hosted servers, and see what to do when the service is down or slow."
+---
+
+## Status page
+
+You can check the health of Reactive Resume's servers at any time on the status page:
+
+<Card title="Status Page" icon="signal" href="https://status.rxresu.me">
+  View real-time server metrics including uptime, CPU usage, memory usage, and more.
+</Card>
+
+The status page shows:
+
+- **Uptime**: How long the servers have been running without interruption
+- **CPU Usage**: Current processor utilization
+- **Memory Usage**: RAM consumption across services
+- **Response Times**: How quickly the servers are responding to requests
+
+---
+
+## What to do if servers are down
+
+If the servers are under high load or unreachable:
+
+<Steps>
+  <Step title="Check the status page">
+    Visit [status.rxresu.me](https://status.rxresu.me) to confirm if there's an ongoing issue. The page will show you the current state of all services.
+  </Step>
+
+  <Step title="Wait and try again later">
+    If the servers are under heavy load, wait a while and try again. Peak usage times can cause temporary slowdowns.
+
+    <Info>
+      Reactive Resume is a **free, open-source service** used by thousands of people worldwide. During peak times, the servers may experience higher than usual load.
+    </Info>
+
+  </Step>
+
+  <Step title="Check for announcements">
+    For major outages or planned maintenance, announcements may be posted on our [GitHub repository](https://github.com/reactive-resume/reactive-resume).
+  </Step>
+</Steps>
+
+---
+
+## A note on server capacity
+
+<Warning>
+  Reactive Resume is a **free service** that runs on limited server resources. As an open-source project maintained by a
+  single developer, it's not feasible to invest in powerful dedicated servers without community support.
+</Warning>
+
+Thousands of people use the service every day. Because it is free and has no venture funding behind it, server capacity stays constrained.
+
+If Reactive Resume is useful to you and you want to help keep the servers running (and maybe scale them up), consider supporting the project.
+
+---
+
+## Support the project
+
+Donations go directly toward server costs, better infrastructure, and keeping Reactive Resume free for everyone.
+
+<Card title="Donate on Open Collective" icon="heart" href="https://opencollective.com/reactive-resume/donate">
+  Support Reactive Resume's development and server costs through Open Collective. Every contribution helps keep the
+  service running.
+</Card>
+
+<CardGroup cols={2}>
+  <Card title="One-time Donation" icon="gift">
+    Make a single contribution of any amount to help with immediate server costs.
+  </Card>
+  <Card title="Recurring Support" icon="repeat">
+    Become a backer with a monthly contribution to provide sustainable support.
+  </Card>
+</CardGroup>
+
+---
+
+## Self-hosting as an alternative
+
+If you need guaranteed uptime, or want to avoid the limits of a shared server, you can self-host Reactive Resume on your own infrastructure.
+
+<Card title="Self-Hosting Guide" icon="server" href="/self-hosting/docker">
+  Learn how to deploy Reactive Resume on your own servers using Docker.
+</Card>
+
+Self-hosting gives you full control over your data and infrastructure, availability that depends only on your own server capacity, and no resources shared with other users.

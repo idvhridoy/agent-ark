@@ -1,0 +1,716 @@
+# Copyright 2025-present the zvec project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import sys
+import time
+import pickle
+
+
+import numpy as np
+import pytest
+from zvec import (
+    AddColumnOption,
+    AlterColumnOption,
+    CollectionOption,
+    DiskAnnIndexParam,
+    FlatIndexParam,
+    HnswIndexParam,
+    IvfRabitqIndexParam,
+    IndexOption,
+    InvertIndexParam,
+    IVFIndexParam,
+    OptimizeOption,
+    HnswQueryParam,
+    IvfRabitqQueryParam,
+    IVFQueryParam,
+    Query,
+    VectorQuery,
+    IndexType,
+    MetricType,
+    QuantizeType,
+    QuantizerParam,
+    DataType,
+    VectorSchema,
+    VamanaIndexParam,
+)
+
+from zvec._zvec.param import _SearchQuery
+
+
+@pytest.mark.parametrize(
+    "param_type",
+    [
+        FlatIndexParam,
+        IVFIndexParam,
+        DiskAnnIndexParam,
+        HnswIndexParam,
+        VamanaIndexParam,
+    ],
+)
+@pytest.mark.parametrize(
+    "quantize_type,expected_name",
+    [
+        (QuantizeType.UNDEFINED, "UNDEFINED"),
+        (QuantizeType.FP16, "FP16"),
+        (QuantizeType.INT8, "INT8"),
+        (QuantizeType.INT4, "INT4"),
+        (QuantizeType.UNIFORM_UINT7, "UNIFORM_UINT7"),
+        (QuantizeType.UNIFORM_UINT8, "UNIFORM_UINT8"),
+        (QuantizeType.UNIFORM_UINT4, "UNIFORM_UINT4"),
+    ],
+)
+def test_quantizer_parameter_representation(param_type, quantize_type, expected_name):
+    # Parameters can be represented even when their index/quantizer combination
+    # is rejected at collection creation. Compare to the specified name, not
+    # only to the original: a round trip can preserve an incorrect string.
+    param = param_type(metric_type=MetricType.L2, quantize_type=quantize_type)
+    for value in (param, param.clone(), pickle.loads(pickle.dumps(param))):
+        assert value.quantize_type == quantize_type
+        assert value.to_dict()["quantize_type"] == expected_name
+        assert expected_name in repr(value)
+
+
+# ----------------------------
+# Invert Index Param Test Case
+# ----------------------------
+
+
+class TestInvertIndexParam:
+    def test_default(self):
+        param = InvertIndexParam()
+        assert param.enable_range_optimization is False
+        assert param.enable_extended_wildcard is False
+        assert param.type == IndexType.INVERT
+
+    def test_custom(self):
+        param = InvertIndexParam(
+            enable_range_optimization=True, enable_extended_wildcard=True
+        )
+        assert param.enable_range_optimization is True
+        assert param.enable_extended_wildcard is True
+
+    def test_readonly(self):
+        param = InvertIndexParam()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            param.enable_range_optimization = False
+            param.enable_extended_wildcard = False
+
+
+# ----------------------------
+# Hnsw Index Param Test Case
+# ----------------------------
+
+
+class TestHnswIndexParam:
+    def test_default(self):
+        param = HnswIndexParam()
+        assert param.metric_type == MetricType.IP
+        assert param.m == 50
+        assert param.ef_construction == 500
+        assert param.quantize_type == QuantizeType.UNDEFINED
+        assert param.use_flat_contiguous_memory is False
+        assert param.flat_data_type == DataType.VECTOR_FP32
+        assert param.type == IndexType.HNSW
+
+    def test_custom(self):
+        param = HnswIndexParam(
+            metric_type=MetricType.L2,
+            m=10,
+            ef_construction=1000,
+            quantize_type=QuantizeType.FP16,
+            use_flat_contiguous_memory=True,
+            flat_data_type=DataType.VECTOR_FP16,
+        )
+        assert param.metric_type == MetricType.L2
+        assert param.m == 10
+        assert param.ef_construction == 1000
+        assert param.quantize_type == QuantizeType.FP16
+        assert param.use_flat_contiguous_memory is True
+        assert param.flat_data_type == DataType.VECTOR_FP16
+
+    @pytest.mark.parametrize(
+        "attr",
+        [
+            "metric_type",
+            "m",
+            "ef_construction",
+            "quantize_type",
+            "use_flat_contiguous_memory",
+            "flat_data_type",
+        ],
+    )
+    def test_readonly_attributes(self, attr):
+        param = HnswIndexParam()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# Flat Index Param Test Case
+# ----------------------------
+class TestFlatIndexParam:
+    def test_default(self):
+        param = FlatIndexParam()
+        assert param.type == IndexType.FLAT
+        assert param.quantize_type == QuantizeType.UNDEFINED
+        assert param.metric_type == MetricType.IP
+        assert param.use_contiguous_memory is False
+
+    def test_custom(self):
+        param = FlatIndexParam(
+            metric_type=MetricType.L2,
+            quantize_type=QuantizeType.INT8,
+            use_contiguous_memory=True,
+        )
+        assert param.metric_type == MetricType.L2
+        assert param.quantize_type == QuantizeType.INT8
+        assert param.use_contiguous_memory is True
+
+    @pytest.mark.parametrize(
+        "attr", ["metric_type", "quantize_type", "use_contiguous_memory"]
+    )
+    def test_readonly_attributes(self, attr):
+        param = FlatIndexParam()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# Ivf Index Param Test Case
+# ----------------------------
+class TestIVFIndexParam:
+    def test_default(self):
+        param = IVFIndexParam()
+        assert param.metric_type == MetricType.IP
+        assert param.n_list == 10
+        assert param.quantize_type == QuantizeType.UNDEFINED
+        assert param.type == IndexType.IVF
+
+    def test_custom(self):
+        param = IVFIndexParam(
+            metric_type=MetricType.L2, n_list=1000, quantize_type=QuantizeType.FP16
+        )
+        assert param.metric_type == MetricType.L2
+        assert param.n_list == 1000
+        assert param.quantize_type == QuantizeType.FP16
+        assert param.type == IndexType.IVF
+
+    @pytest.mark.parametrize("attr", ["metric_type", "n_list", "quantize_type"])
+    def test_readonly_attributes(self, attr):
+        param = IVFIndexParam()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# Ivf Rabitq Index Param Test Case
+# ----------------------------
+class TestIvfRabitqIndexParam:
+    def test_default(self):
+        param = IvfRabitqIndexParam()
+        assert param.metric_type == MetricType.IP
+        assert param.nlist == 1024
+        assert param.total_bits == 7
+        assert param.sample_count == 0
+        assert param.quantize_type == QuantizeType.RABITQ
+        assert param.type == IndexType.IVF_RABITQ
+
+    def test_custom(self):
+        param = IvfRabitqIndexParam(
+            metric_type=MetricType.L2, nlist=128, total_bits=6, sample_count=1000
+        )
+        assert param.metric_type == MetricType.L2
+        assert param.nlist == 128
+        assert param.total_bits == 6
+        assert param.sample_count == 1000
+        assert param.quantize_type == QuantizeType.RABITQ
+        assert param.type == IndexType.IVF_RABITQ
+
+    def test_to_dict(self):
+        param = IvfRabitqIndexParam(
+            metric_type=MetricType.L2, nlist=128, total_bits=6, sample_count=1000
+        )
+        data = param.to_dict()
+        assert data["type"] == "IVF_RABITQ"
+        assert data["metric_type"] == "L2"
+        assert data["quantize_type"] == "RABITQ"
+        assert data["nlist"] == 128
+        assert data["total_bits"] == 6
+        assert data["sample_count"] == 1000
+
+    def test_vector_schema_accepts_param(self):
+        param = IvfRabitqIndexParam(metric_type=MetricType.L2, nlist=128)
+        schema = VectorSchema(
+            name="embedding",
+            data_type=DataType.VECTOR_FP32,
+            dimension=128,
+            index_param=param,
+        )
+        assert schema.index_param.type == IndexType.IVF_RABITQ
+        assert schema.index_param.nlist == 128
+
+    @pytest.mark.parametrize(
+        "attr", ["metric_type", "nlist", "total_bits", "sample_count", "quantize_type"]
+    )
+    def test_readonly_attributes(self, attr):
+        param = IvfRabitqIndexParam()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# CollectionOption Test Case
+# ----------------------------
+class TestCollectionOption:
+    def test_default(self):
+        option = CollectionOption()
+        assert option is not None
+        assert option.read_only == False
+        assert option.enable_mmap == True
+
+    def test_custom(self):
+        option = CollectionOption(read_only=True, enable_mmap=False)
+        assert option.read_only == True
+        assert option.enable_mmap == False
+
+        option = CollectionOption(read_only=False, enable_mmap=True)
+        assert option.read_only == False
+        assert option.enable_mmap == True
+
+    @pytest.mark.parametrize("attr", ["read_only", "enable_mmap"])
+    def test_readonly_attributes(self, attr):
+        param = CollectionOption()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# IndexOption Test Case
+# ----------------------------
+class TestIndexOption:
+    def test_default(self):
+        option = IndexOption()
+        assert option is not None
+        assert option.concurrency == 0
+
+    def test_custom(self):
+        option = IndexOption(concurrency=10)
+        assert option.concurrency == 10
+
+    @pytest.mark.parametrize("attr", ["concurrency"])
+    def test_readonly_attributes(self, attr):
+        param = IndexOption()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# AddColumnOption Test Case
+# ----------------------------
+class TestAddColumnOption:
+    def test_default(self):
+        option = AddColumnOption()
+        assert option is not None
+        assert option.concurrency == 0
+
+    def test_custom(self):
+        option = AddColumnOption(concurrency=10)
+        assert option.concurrency == 10
+
+    @pytest.mark.parametrize("attr", ["concurrency"])
+    def test_readonly_attributes(self, attr):
+        param = AddColumnOption()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# AlterColumnOption Test Case
+# ----------------------------
+class TestAlterColumnOption:
+    def test_default(self):
+        option = AlterColumnOption()
+        assert option is not None
+        assert option.concurrency == 0
+
+    def test_custom(self):
+        option = AlterColumnOption(concurrency=10)
+        assert option.concurrency == 10
+
+    @pytest.mark.parametrize("attr", ["concurrency"])
+    def test_readonly_attributes(self, attr):
+        param = AlterColumnOption()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# OptimizeOption Test Case
+# ----------------------------
+class TestOptimizeOption:
+    def test_default(self):
+        option = OptimizeOption()
+        assert option is not None
+        assert option.concurrency == 0
+
+    def test_custom(self):
+        option = OptimizeOption(concurrency=10)
+        assert option.concurrency == 10
+
+    @pytest.mark.parametrize("attr", ["concurrency"])
+    def test_readonly_attributes(self, attr):
+        param = OptimizeOption()
+        import sys
+
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            setattr(param, attr, getattr(param, attr))
+
+
+# ----------------------------
+# HnswQueryParam Test Case
+# ----------------------------
+class TestHnswQueryParam:
+    def test_default(self):
+        param = HnswQueryParam()
+        assert param is not None
+        assert param.ef == 300
+        assert param.is_using_refiner == False
+        assert param.radius == 0
+        assert param.is_linear == False
+        assert param.prefetch_offset == 8
+        assert param.prefetch_lines == 0
+
+    def test_custom(self):
+        param = HnswQueryParam(
+            ef=10,
+            is_using_refiner=True,
+            radius=30,
+            is_linear=True,
+            extra_params={
+                "prefetch_offset": 16,
+                "prefetch_lines": 4,
+            },
+        )
+        assert param.ef == 10
+        assert param.is_using_refiner == True
+        assert param.radius == 30
+        assert param.is_linear == True
+        assert param.prefetch_offset == 16
+        assert param.prefetch_lines == 4
+
+    def test_readonly_attributes(self):
+        param = HnswQueryParam()
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+            with pytest.raises(AttributeError, match=match_pattern):
+                param.ef = 10
+                param.is_using_refiner = True
+                param.radius = 30
+                param.is_linear = True
+
+
+# ----------------------------
+# IvfRabitqQueryParam Test Case
+# ----------------------------
+class TestIvfRabitqQueryParam:
+    def test_default(self):
+        param = IvfRabitqQueryParam()
+        assert param is not None
+        assert param.nprobe == 10
+        assert param.is_using_refiner == False
+        assert param.radius == 0
+        assert param.is_linear == False
+        assert param.scale_factor == 10.0
+        assert param.type == IndexType.IVF_RABITQ
+
+    def test_custom(self):
+        param = IvfRabitqQueryParam(
+            nprobe=20,
+            is_using_refiner=True,
+            radius=30,
+            is_linear=True,
+            scale_factor=3.5,
+        )
+        assert param.nprobe == 20
+        assert param.is_using_refiner == True
+        assert param.radius == 30
+        assert param.is_linear == True
+        assert param.scale_factor == 3.5
+        assert param.type == IndexType.IVF_RABITQ
+
+    def test_query_accepts_param(self):
+        param = IvfRabitqQueryParam(nprobe=20)
+        query = Query(field_name="embedding", vector=[0.1, 0.2], param=param)
+        assert query.param == param
+        assert query.param.type == IndexType.IVF_RABITQ
+
+    def test_pickle_roundtrip(self):
+        import pickle
+
+        param = IvfRabitqQueryParam(nprobe=20, is_using_refiner=True, scale_factor=3.5)
+        restored = pickle.loads(pickle.dumps(param))
+        assert restored.nprobe == 20
+        assert restored.is_using_refiner == True
+        assert restored.scale_factor == 3.5
+
+    def test_readonly_attributes(self):
+        param = IvfRabitqQueryParam()
+        if sys.version_info >= (3, 11):
+            match_pattern = r"(can't set attribute|has no setter|readonly attribute)"
+        else:
+            match_pattern = r"can't set attribute"
+        with pytest.raises(AttributeError, match=match_pattern):
+            param.nprobe = 10
+
+
+# # ----------------------------
+# # IVFQueryParam Test Case
+# # ----------------------------
+# class TestIVFQueryParam:
+#     def test_default(self):
+#         param = IVFQueryParam()
+#         assert param is not None
+#         assert param.nprobe == 10
+#         assert param.is_using_refiner == False
+#         assert param.radius == 0
+#         assert param.is_linear == False
+#         assert param.scale_factor == 10
+#
+#     def test_custom(self):
+#         param = IVFQueryParam(
+#             nprobe=20,
+#             is_using_refiner=True,
+#             radius=30,
+#             is_linear=True,
+#             scale_factor=40
+#         )
+#         assert param.nprobe == 20
+#         assert param.is_using_refiner == True
+#         assert param.radius == 30
+#         assert param.is_linear == True
+#         assert param.scale_factor == 40
+
+
+class TestQuery:
+    def test_init_with_valid_id(self):
+        vq = Query(field_name="embedding", id="doc123")
+        assert vq.field_name == "embedding"
+        assert vq.id == "doc123"
+        assert vq.vector is None
+        assert vq.param is None
+
+    def test_init_with_valid_vector(self):
+        vec = [0.1, 0.2, 0.3]
+        param = HnswQueryParam(ef=300)
+        vq = Query(field_name="embedding", vector=vec, param=param)
+        assert vq.field_name == "embedding"
+        assert vq.vector == vec
+        assert vq.param == param
+
+    def test_init_both_id_and_vector_raises_error(self):
+        with pytest.raises(ValueError):
+            Query(field_name="embedding", id="doc123", vector=[0.1])._validate()
+
+    @pytest.mark.parametrize("field_name", [None, "", "   ", 123])
+    def test_init_without_valid_field_name_raises_error(self, field_name):
+        with pytest.raises(ValueError, match="Field name must be a non-empty string"):
+            Query(field_name=field_name)._validate()
+
+    def test_has_id_returns_true_when_id_set(self):
+        vq = Query(field_name="embedding", id="doc123")
+        assert vq.has_id()
+
+    def test_has_id_returns_false_when_no_id(self):
+        vq = Query(field_name="embedding", vector=[0.1])
+        assert not vq.has_id()
+
+    def test_has_vector_returns_true_with_non_empty_vector(self):
+        vq = Query(field_name="embedding", vector=[0.1])
+        assert vq.has_vector()
+
+    def test_validate_fails_on_both_id_and_vector(self):
+        vq = Query(field_name="test", id="doc123", vector=[0.1])
+        with pytest.raises(ValueError):
+            vq._validate()
+
+    def test_validate_fails_on_both_id_and_numpy_vector(self):
+        vq = Query(field_name="test", id="doc123", vector=np.array([0.1]))
+        with pytest.raises(ValueError, match="Cannot provide both id and vector"):
+            vq._validate()
+
+
+class TestVectorQueryDeprecated:
+    def test_deprecation_warning(self):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            vq = VectorQuery(field_name="embedding", id="doc123")
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "Query" in str(w[0].message)
+
+    def test_isinstance_compatibility(self):
+        import warnings
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            vq = VectorQuery(field_name="embedding", id="doc123")
+        assert isinstance(vq, Query)
+
+
+# ----------------------------
+# QuantizerParam Test Case
+# ----------------------------
+
+
+class TestQuantizerParam:
+    def test_default(self):
+        qp = QuantizerParam()
+        assert qp.enable_rotate is False
+
+    def test_enable_rotate_true(self):
+        qp = QuantizerParam(enable_rotate=True)
+        assert qp.enable_rotate is True
+
+    def test_enable_rotate_false(self):
+        qp = QuantizerParam(enable_rotate=False)
+        assert qp.enable_rotate is False
+
+    def test_equality(self):
+        qp1 = QuantizerParam(enable_rotate=True)
+        qp2 = QuantizerParam(enable_rotate=True)
+        qp3 = QuantizerParam(enable_rotate=False)
+        assert qp1 == qp2
+        assert qp1 != qp3
+
+    def test_to_dict(self):
+        qp = QuantizerParam(enable_rotate=True)
+        d = qp.to_dict()
+        assert isinstance(d, dict)
+        assert d.get("enable_rotate") is True
+
+    def test_repr(self):
+        qp = QuantizerParam(enable_rotate=True)
+        r = repr(qp)
+        assert "enable_rotate" in r or "QuantizerParam" in r
+
+    def test_pickle_roundtrip(self):
+        import pickle
+
+        qp = QuantizerParam(enable_rotate=True)
+        data = pickle.dumps(qp)
+        qp2 = pickle.loads(data)
+        assert qp2.enable_rotate is True
+        assert qp == qp2
+
+
+# ----------------------------
+# HnswIndexParam with QuantizerParam
+# ----------------------------
+
+
+class TestHnswIndexParamQuantizer:
+    def test_default_quantizer_param(self):
+        param = HnswIndexParam()
+        assert param.quantizer_param is not None
+        assert param.quantizer_param.enable_rotate is False
+
+    def test_with_quantizer_param(self):
+        qp = QuantizerParam(enable_rotate=True)
+        param = HnswIndexParam(
+            metric_type=MetricType.L2,
+            quantize_type=QuantizeType.INT8,
+            quantizer_param=qp,
+        )
+        assert param.quantizer_param.enable_rotate is True
+        assert param.quantize_type == QuantizeType.INT8
+
+
+# ----------------------------
+# FlatIndexParam with QuantizerParam
+# ----------------------------
+
+
+class TestFlatIndexParamQuantizer:
+    def test_with_quantizer_param(self):
+        qp = QuantizerParam(enable_rotate=True)
+        param = FlatIndexParam(
+            metric_type=MetricType.L2,
+            quantize_type=QuantizeType.INT8,
+            quantizer_param=qp,
+        )
+        assert param.quantizer_param.enable_rotate is True
+        assert param.quantize_type == QuantizeType.INT8

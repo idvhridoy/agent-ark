@@ -1,0 +1,328 @@
+---
+title: 'Getting Started with the GitHub Copilot app'
+description: 'Learn about the GitHub Copilot app, a desktop experience built for agent-native development. Understand its key features and who it''s for.'
+authors:
+  - GitHub Copilot Learning Hub Team
+lastUpdated: 2026-09-12
+estimatedReadingTime: '8 minutes'
+tags:
+  - copilot-app
+  - desktop
+  - agents
+  - parallel-work
+relatedArticles:
+  - ./using-automations-in-copilot-app.md
+  - ./using-copilot-coding-agent.md
+  - ./agentic-workflows.md
+  - ./what-are-agents-skills-instructions.md
+prerequisites:
+  - Understanding of GitHub Copilot agents
+  - Copilot Pro, Pro+, Business, or Enterprise plan
+---
+
+The GitHub Copilot app is a desktop experience built from the ground up for agent-native development. As agents become a central part of your development workflow, you need a place where you can see multiple agents working in parallel, inspect their progress, and take control when needed, all without context-switching between windows or losing track of what's running.
+
+This guide covers what the Copilot app is, its key features, and how to get started.
+
+## What Is the GitHub Copilot app?
+
+The Copilot app is a standalone desktop application that serves as a control center for agentic development. Instead of managing agents through GitHub.com pull requests, issues, and CLI windows, the Copilot app brings everything into one unified interface.
+
+Think of it as a command center where you can:
+- See all your active work at a glance
+- Spin up multiple agents working on different tasks simultaneously
+- Inspect what each agent is doing in real time
+- Redirect agents mid-task or approve their changes
+- Let agents handle automation (like merging PRs) while you focus elsewhere
+
+The key difference from existing Copilot experiences is that the app is purpose-built for parallel agent work. It handles the complexity of managing multiple isolated environments, branches, and worktrees automatically, so you don't have to.
+
+## Key Features
+
+### My Work View
+
+The central hub of the Copilot app is the **My Work** view. This dashboard shows:
+
+- **Active sessions**: Each agent working on a task gets its own isolated session
+- **Issues and PRs**: Your inbox of work items from connected repositories
+- **Background automations**: Tasks running in the background, like Agent Merge handling your pull requests
+- **Overall status**: A quick overview of what's in progress, what's done, and what's blocked
+
+Instead of checking GitHub, your CLI, and VS Code for updates, everything is in one place.
+
+### Automations
+
+The Copilot app includes built-in automations that can run scheduled tasks for you using the same agentic technology. You can use templates out of the box or create your own.
+
+Automations run in the context of a repository, so they can access issues, pull requests, and code. You can also choose whether they run as a plan, an interactive session, or on autopilot.
+
+### Isolated Worktrees for Parallel Work
+
+Each session the Copilot app creates runs in its own **git worktree**—a real, isolated copy of your branch. This is critical for parallel agent work:
+
+- Multiple agents can work on different tasks simultaneously without stepping on each other
+- Each agent has its own branch, its own environment, and its own changes
+- No manual branch juggling or cleanup required—the app handles it all
+- You can pick up a session from any device, on any worktree
+- A **Worktree location** setting in Settings > Sessions lets you customize where new worktrees are created, using a path template with repository, branch, and name placeholders
+
+This makes it easy to dispatch multiple agents and trust they won't interfere with each other.
+
+### Running in the Background
+
+Closing the app's main window keeps it running in the background instead of quitting, with tray (Windows/Linux) or Dock (macOS) support to bring it back. This means scheduled automations and in-progress sessions keep running even when the window isn't open.
+
+### Canvases
+
+**Canvases** are interactive work surfaces where you and agents collaborate. Instead of long chat threads, a canvas shows the actual work:
+
+- A canvas might display a plan, a pull request diff, a terminal output, or a live browser session
+- Agents update the canvas as they work, and you can edit, approve, or redirect changes on the same surface
+- This makes it easy to see exactly what an agent is doing and step in when needed
+
+For a hands-on guide to building canvases with `/create-canvas`, see [Working with Canvas Extensions](../working-with-canvas-extensions/).
+
+### Customize
+
+**Customize** *(v1.1.13+)* is a single place in the Copilot app to browse and manage everything that extends your agents: plugins, skills, MCP servers, and canvases. Instead of hunting through separate settings pages, open **Customize** to:
+
+- Browse **Featured** integrations (for example Azure DevOps or Figma) and install them with one click
+- See what's already **Installed**, with consistent icons and source labels across plugin, skill, MCP server, canvas, and connector types
+- Create, edit, or remove your own **personal skills** directly in the app, without hand-authoring a `SKILL.md` file
+
+This makes Customize a good starting point if you want to extend the app's capabilities but don't need the full `copilot plugin` CLI workflow described in [Installing and Using Plugins](../installing-and-using-plugins/).
+
+### Agent Merge
+
+**Agent Merge** is a feature that can carry your pull requests through the entire workflow:
+
+- Monitors CI/CD pipelines and waits for checks to pass
+- Addresses failing tests or linting errors
+- Tracks required reviewers and waits for approval
+- Can automatically merge when all conditions are met
+
+You control the automation level—decide whether Agent Merge should just run CI, address feedback, or go all the way to merging. It's a way to let Copilot handle the tedious parts of the review and merge process.
+
+Agent Merge also understands **stacked pull requests**: it shows a stack summary in the merge drawer with the pull requests that will be included, and lets you merge an entire stack together instead of merging each PR one at a time.
+
+### Requesting Code Reviews
+
+From the app, you can request a Copilot code review on a pull request—and re-request a review even from reviewers who already responded—without leaving the session. This keeps the review loop inside the same workspace where the change was made.
+
+### Setting a Persistent Goal for Autopilot
+
+**`/goal`** *(v1.1.15+)* sets a persistent objective for autopilot to work toward in local sessions, the same way `/autopilot <objective>` does in Copilot CLI (see [Agents and Subagents](../agents-and-subagents/)). Once set, the Goal pill in the composer shows live status—Active, Paused, or Done—and expands to show the objective, a completion summary, the pause reason (if paused), turn count, and AI Credits usage, so you can track long-running autonomous work without re-reading the whole transcript.
+
+### Quick App Settings and PR Editing
+
+Open app settings directly from the message composer with **`/settings`** *(v1.1.16+)*, without leaving your current conversation. You can also now edit issue and pull request titles and descriptions, and edit, delete, or hide comments *(v1.1.18+)*, directly from the app—useful when a Copilot-drafted PR description needs a quick fix before merge. Pull request fix buttons also gained a **"Fix with instructions"** option *(v1.1.18+)* so you can add guidance before Copilot runs the fix.
+
+### Generated Artifacts in the Files Tab
+
+*(v1.1.20+)* Generated Markdown artifacts—such as plans, summaries, or reports an agent writes during a session—now open in the **Files tab** alongside your repository's own files, with a switcher to move between them. You can also promote a generated artifact into the repository directly from this view, turning a scratch document into a tracked file without manually copying its contents.
+
+### Multi-Plugin Agent Disambiguation
+
+*(v1.1.20+)* If two installed plugins each ship a custom agent with the same display name, the agent picker now distinguishes them by their owning plugin, so you can tell at a glance which agent you're selecting when names collide.
+
+> **Terminology note (v1.1.20+)**: The "Start from scratch" option in session creation menus and project pickers has been renamed to **"Chat"**.
+
+## Who is the Copilot app for?
+
+The Copilot app isn't a replacement for existing Copilot experiences—it's another tool in the toolbox. Here's who it serves best:
+
+### Developers Who Want to Direct Multiple Agents
+
+If you're using agents regularly and need to manage parallel work, the Copilot app gives you a dedicated control center. Instead of checking multiple windows, you see everything in one place.
+
+### Team Members in Non-Developer Roles
+
+The Copilot app has a more accessible, desktop-first interface compared to developer-centric experiences like VS Code or the CLI. This makes it appealing to business analysts, product managers, and other technical team members who want to work with agents but find traditional developer tools overwhelming.
+
+### Teams Leveraging Parallel Agent Work
+
+The app's worktree architecture makes it natural to dispatch multiple agents on different tasks without coordination. If your team frequently has agents working on multiple initiatives simultaneously, the app is built for this workflow.
+
+### Developers Who Prefer a Graphical Interface
+
+While the CLI is powerful, some developers prefer a visual interface for common tasks. The Copilot app provides a GUI-first experience while still surfacing all the power of agents, hooks, skills, and custom instructions.
+
+### Comparison with Other Copilot Experiences
+
+| Experience | Best For | Strength |
+|------------|----------|----------|
+| **Copilot CLI** | Developers in the terminal | Raw power, scriptable, always available in your shell |
+| **VS Code extension** | Coding and real-time AI assistance | Integrated with your editor, instant feedback |
+| **GitHub.com** | Code review and PR management | Central hub for collaboration, always accessible on web |
+| **Copilot App** | Directing parallel agents, visual workflow | Control center for agentic development, multi-agent management |
+
+The Copilot app complements these experiences—you'll still use VS Code for coding, the CLI for automation, and GitHub.com for collaboration. The Copilot app fills a specific gap: managing multiple agents in parallel with a unified interface.
+
+## Getting Started
+
+### Requirements
+
+To use the GitHub Copilot app, you need:
+
+- A **GitHub Copilot Pro, Pro+, Business, or Enterprise plan**
+- A compatible operating system (macOS, Windows, or Linux)
+- Connected GitHub repositories
+
+### Installation
+
+1. Visit [GitHub Copilot app](https://github.com/features/ai/github-app) and download the installer for your platform
+2. Install and launch the app
+3. Authenticate with your GitHub account
+4. Connect your repositories
+
+### Creating Your First Session
+
+Once installed, you can create a session by:
+
+1. **From an issue**: Assign a GitHub issue to Copilot, and the app will create a session to work on it
+2. **From a prompt**: Open the Copilot app and describe what you want done (e.g., "Fix the login bug" or "Add dark mode support")
+3. **From your inbox**: The app syncs your GitHub inbox—click an issue and start a session for it
+
+Each session runs in its own worktree with its own isolated environment. You can run multiple sessions in parallel.
+
+### Launching Sessions from the Terminal with Deep Links
+
+> **New (v1.0.81+)**: Run `copilot app` from GitHub Copilot CLI to open the GitHub Copilot app directly in the current directory — a quicker alternative to constructing a deep link by hand when you just want to hand off your current working directory to the desktop app.
+
+The GitHub Copilot app supports URL deep links. This is useful when you want to open the app or start a session directly from your terminal workflow.
+
+Supported schemes:
+
+- `ghapp://` (canonical)
+- `github-app://`
+- `gh://`
+
+In examples below, replace `owner/repo` with your repository.
+
+#### Open a new session
+
+Use the `session/new` route:
+
+```bash
+# Basic new session
+open "ghapp://session/new?repo=owner/repo"
+
+# Start from a branch
+open "ghapp://session/new?repo=owner/repo&branch=main"
+
+# Start from a pull request
+open "ghapp://session/new?repo=owner/repo&pr=1234"
+
+# Start with a kickoff prompt
+open "ghapp://session/new?repo=owner/repo&prompt=fix%20the%20flaky%20test"
+
+# Set the initial session mode
+open "ghapp://session/new?repo=owner/repo&mode=plan"
+```
+
+`session/new` supports:
+
+- `repo` (**required**, format `owner/repo`)
+- `pr` (integer, mutually exclusive with `branch`)
+- `branch` (mutually exclusive with `pr`)
+- `prompt` (URL-encoded text)
+- `mode` (`plan`, `interactive`, or `autopilot`)
+
+#### Other useful deep links
+
+- `ghapp://repo/owner/repo` - Open (or clone) a repo into projects
+- `ghapp://clone/owner/repo` - Clone a repo
+- `ghapp://sessions/<sessionId>` - Open an existing session
+- `ghapp://chats` - Open chats
+- `ghapp://mywork` - Open the My Work view
+- `ghapp://recent` - Open recent workspaces
+- `ghapp://workflows` - Open automations
+- `ghapp://owner/repo/issues/123` - Open an issue
+- `ghapp://owner/repo/pull/456` - Open a pull request
+
+#### Important limitations
+
+- Deep links are **repo-centric** and expect `owner/repo`.
+- There is no deep link that directly opens an arbitrary local folder.
+- For local folders, use the app's **Add local folder** flow; if the folder is already a Git repository with a `github.com` remote, resolve that remote to `owner/repo` and use `session/new`.
+
+### Understanding Session Workflow
+
+Here's what happens when you create a session:
+
+```
+1. You describe the work or assign an issue
+          ↓
+2. Copilot app creates an isolated worktree
+          ↓
+3. The agent reads your issue, instructions, and codebase
+          ↓
+4. It plans and implements a solution
+          ↓
+5. You can monitor progress in the My Work view
+          ↓
+6. You can redirect the agent or let it finish
+          ↓
+7. Changes are ready for review (either a PR or approval)
+```
+
+### Connecting Repositories
+
+To give Copilot access to your repositories:
+
+1. In the Copilot app, open **Settings** → **Connected Repositories**
+2. Click **Add Repository** and select repositories from your GitHub account
+3. Grant the necessary permissions
+4. The app now has access to your code, issues, and pull requests
+
+## Using the Copilot App with Your Custom Configuration
+
+The Copilot app respects all your existing GitHub Copilot customizations:
+
+- **Custom agents** (`.agent.md` files in `.github/agents/`)
+- **Skills** (specialized task guidance in `.github/skills/`)
+- **Instructions** (coding standards in `.github/instructions/`)
+- **Hooks** (automated checks and formatting in `.github/hooks/`)
+- **Setup steps** (`.github/copilot-setup-steps.yml`)
+
+If you haven't set up custom agents, skills, or instructions yet, see [Copilot Configuration Basics](../copilot-configuration-basics/) to get started.
+
+## Common Workflows
+
+### Parallel Bug Fixes
+
+Create multiple sessions to fix different bugs simultaneously:
+
+1. Open the Copilot app
+2. Create a session for "Fix login timeout issue"
+3. While that's running, create another session for "Fix dark mode button styling"
+4. Monitor both in the My Work view
+5. Review and merge each PR independently
+
+### Parallel Feature Development
+
+Assign multiple features to agents on different sprints:
+
+1. Connect your issue tracker
+2. Let Copilot pull features from your backlog
+3. Create a session for each feature
+4. Each agent works independently in its own worktree
+5. PRs land without interfering with each other
+
+### Automated PR Merge with Agent Merge
+
+Enable Agent Merge to automate routine PR workflows:
+
+1. Configure Agent Merge in the Copilot app settings
+2. Specify what automations to enable (run CI, address feedback, merge)
+3. Create a session to implement a feature
+4. When the PR is created, Agent Merge monitors it
+5. It runs CI, waits for reviews, addresses feedback, and merges when ready
+
+## Next Steps
+
+- **Set Up Your Repository**: [Copilot Configuration Basics](../copilot-configuration-basics/) — Add custom agents, skills, and instructions
+- **Understand Agent Skills**: [Creating Effective Skills](../creating-effective-skills/) — Build reusable task guidance
+- **Automate with Hooks**: [Automating with Hooks](../automating-with-hooks/) — Add guardrails to autonomous work
+
+---

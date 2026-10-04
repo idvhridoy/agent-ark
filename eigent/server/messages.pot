@@ -1,0 +1,141 @@
+# Translations template for PROJECT.
+# Copyright (C) 2026 ORGANIZATION
+# This file is distributed under the same license as the PROJECT project.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: PROJECT VERSION\n"
+"Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
+"POT-Creation-Date: 2026-08-27 16:40+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: app/api/demo_controller.py:27
+msgid "no auth"
+msgstr ""
+
+#: app/api/demo_controller.py:27
+msgid "hello"
+msgstr ""
+
+#: app/domains/chat/api/snapshot_controller.py:43
+msgid "Invalid api_task_id: only letters, numbers, - and _ allowed"
+msgstr ""
+
+#: app/domains/config/api/config_controller.py:40
+#: app/domains/config/api/config_controller.py:73
+#: app/domains/config/api/config_controller.py:85
+msgid "Configuration not found"
+msgstr ""
+
+#: app/domains/config/api/config_controller.py:54
+msgid "Config Name is invalid"
+msgstr ""
+
+#: app/domains/config/api/config_controller.py:55
+#: app/domains/config/api/config_controller.py:75
+msgid "Configuration already exists for this user"
+msgstr ""
+
+#: app/domains/config/api/config_controller.py:74
+msgid "Invalid configuration group"
+msgstr ""
+
+#: app/domains/mcp/api/mcp_controller.py:80
+msgid "Mcp not found"
+msgstr ""
+
+#: app/domains/mcp/api/user_controller.py:65
+msgid "mcp is installed"
+msgstr ""
+
+#: app/domains/model_provider/api/provider_controller.py:53
+#: app/domains/model_provider/api/provider_controller.py:67
+#: app/domains/model_provider/api/provider_controller.py:74
+#: app/domains/model_provider/api/provider_controller.py:82
+msgid "Provider not found"
+msgstr ""
+
+#: app/domains/remote_sub_agent/api/provider_controller.py:63
+#: app/domains/remote_sub_agent/api/provider_controller.py:102
+#: app/domains/remote_sub_agent/api/provider_controller.py:118
+msgid "Remote sub agent provider not found"
+msgstr ""
+
+#: app/domains/user/api/login_controller.py:75
+msgid "Failed to create default user"
+msgstr ""
+
+#: app/domains/user/api/login_controller.py:92
+msgid "Account or password error"
+msgstr ""
+
+#: app/domains/user/api/login_controller.py:94
+#: app/domains/user/api/login_controller.py:118
+msgid "Your account has been blocked."
+msgstr ""
+
+#: app/domains/user/api/login_controller.py:96
+#: app/domains/user/api/login_controller.py:120
+msgid "Please activate your account via the email link."
+msgstr ""
+
+#: app/domains/user/api/login_controller.py:112
+msgid "Refresh token required"
+msgstr ""
+
+#: app/domains/user/api/login_controller.py:116
+msgid "User not found"
+msgstr ""
+
+#: app/domains/user/api/password_controller.py:37
+msgid "Password is incorrect"
+msgstr ""
+
+#: app/domains/user/api/password_controller.py:39
+msgid "The two passwords do not match"
+msgstr ""
+
+#: app/model/abstract/model.py:109
+msgid "There is no data that meets the conditions"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:56
+msgid "Admin user not found"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:69
+msgid "Your are not authorized to access this function"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:77
+msgid "Invalid token type - admin required"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:80
+msgid "Validate credentials expired"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:83
+msgid "Could not validate credentials"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:114
+msgid "Token required"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:118
+msgid "Token has been revoked"
+msgstr ""
+
+#: app/shared/auth/admin_auth.py:121
+msgid "Admin not found"
+msgstr ""
+

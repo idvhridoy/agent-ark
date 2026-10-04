@@ -1,0 +1,40 @@
+{
+  "name": "aasb-aas-automation-builder",
+  "version": "18.9.0",
+  "description": "Install the \"AAS Automation Builder\" workflow plugin from Agentic Awesome Skills.",
+  "author": {
+    "name": "sickn33 and contributors",
+    "url": "https://github.com/sickn33/agentic-awesome-skills"
+  },
+  "homepage": "https://github.com/sickn33/agentic-awesome-skills",
+  "repository": "https://github.com/sickn33/agentic-awesome-skills",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "skills",
+    "bundle",
+    "aas-automation-builder",
+    "productivity"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AAS Automation Builder",
+    "shortDescription": "Design reliable automations across apps, MCP tools, Make/Zapier, Airtable, Notion, Slack, Sheets, GitHub, and n8n.",
+    "longDescription": "Design reliable automations across apps, MCP tools, Make/Zapier, Airtable, Notion, Slack, Sheets, GitHub, and n8n. Design an automation with explicit triggers, mappings, retries and a reviewable test run. Recommended for: Ops teams, Automation builders, Teams connecting SaaS workflows. Not for: Accounts or connectors installed and authenticated by this skill bundle, Production infrastructure provisioning: use DevOps & Cloud. Covers Workflow Automation, MCP Builder, and 8 more skills.",
+    "developerName": "sickn33 and contributors",
+    "category": "Specialized Product Plugins - Next Wave",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://aaskills.tech/",
+    "privacyPolicyURL": "https://github.com/sickn33/agentic-awesome-skills/blob/main/PRIVACY.md",
+    "termsOfServiceURL": "https://github.com/sickn33/agentic-awesome-skills/blob/main/TERMS.md",
+    "brandColor": "#111827",
+    "defaultPrompt": [
+      "Map this process into triggers, actions, field mappings, deduplication and failure recovery. Inspect which connectors and accounts are actually available, then prepare a test using nonproduction data. Show the intended external writes before enabling the live workflow.",
+      "Use this plugin to design an MCP-backed automation and the tool schemas it needs.",
+      "Use this plugin to review this automation for idempotency, permissions, expressions, and observability gaps."
+    ]
+  }
+}

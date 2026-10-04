@@ -1,0 +1,4771 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include "hnsw_streamer.h"
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <atomic>
+#include <cstdlib>
+#ifndef _MSC_VER
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <random>
+#include <set>
+#include <gtest/gtest.h>
+#include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/container/vector.h>
+#include "tests/test_util.h"
+
+#if defined(__GNUC__) || defined(__GNUG__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+#endif
+
+using namespace std;
+using namespace testing;
+using namespace zvec::ailego;
+
+namespace zvec {
+namespace core {
+
+constexpr size_t static dim = 16;
+
+std::string EncodeUniformUint8Record(size_t dimension, uint32_t seed) {
+  std::string record(dimension + sizeof(uint32_t), '\0');
+  uint32_t sum_squared = 0;
+  for (size_t d = 0; d < dimension; ++d) {
+    const uint8_t code =
+        static_cast<uint8_t>((seed * 73U + d * 29U + d * seed * 3U) & 0xffU);
+    record[d] = static_cast<char>(static_cast<int>(code) - 128);
+    sum_squared += static_cast<uint32_t>(code) * code;
+  }
+  std::memcpy(record.data() + dimension, &sum_squared, sizeof(sum_squared));
+  return record;
+}
+
+class HnswStreamerTest : public testing::Test {
+ protected:
+  void SetUp() override;
+  void TearDown() override;
+
+  static std::string dir_;
+  static shared_ptr<IndexMeta> index_meta_ptr_;
+};
+
+std::string HnswStreamerTest::dir_("hnsw_streamer_test_dir/");
+shared_ptr<IndexMeta> HnswStreamerTest::index_meta_ptr_;
+
+void HnswStreamerTest::SetUp() {
+  index_meta_ptr_.reset(new (nothrow)
+                            IndexMeta(IndexMeta::DataType::DT_FP32, dim));
+  index_meta_ptr_->set_metric("SquaredEuclidean", 0, ailego::Params());
+
+  zvec::test_util::RemoveTestPath(dir_);
+}
+
+void HnswStreamerTest::TearDown() {
+  zvec::test_util::RemoveTestPath(dir_);
+}
+
+TEST_F(HnswStreamerTest, TestAddVector) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set("proxima.hnsw.streamer.max_neighbor_count", 16U);
+  params.set("proxima.hnsw.streamer.upper_neighbor_count", 8U);
+  params.set("proxima.hnsw.streamer.scaling_factor", 5U);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "Test/AddVector", true));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < 1000UL; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  streamer->flush(0UL);
+  streamer.reset();
+}
+
+// TODO: context cannot shared by different searcher
+TEST_F(HnswStreamerTest, TestLinearSearch) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set("proxima.hnsw.streamer.max_neighbor_count", 16U);
+  params.set("proxima.hnsw.streamer.upper_neighbor_count", 8U);
+  params.set("proxima.hnsw.streamer.scaling_factor", 5U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestLinearSearch.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t cnt = 5000UL;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  NumericalVector<float> vec(dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  size_t topk = 3;
+  for (size_t i = 0; i < cnt; i += 1) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ctx->set_topk(1U);
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, ctx));
+    auto &result1 = ctx->result();
+    ASSERT_EQ(1UL, result1.size());
+    ASSERT_EQ(i, result1[0].key());
+
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    ctx->set_topk(topk);
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, ctx));
+    auto &result2 = ctx->result();
+    ASSERT_EQ(topk, result2.size());
+    ASSERT_EQ(i, result2[0].key());
+    ASSERT_EQ(i == cnt - 1 ? i - 1 : i + 1, result2[1].key());
+    ASSERT_EQ(i == 0 ? 2 : (i == cnt - 1 ? i - 2 : i - 1), result2[2].key());
+  }
+
+  ctx->set_topk(100U);
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = 10.1f;
+  }
+  ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, ctx));
+  auto &result = ctx->result();
+  ASSERT_EQ(100U, result.size());
+  ASSERT_EQ(10, result[0].key());
+  ASSERT_EQ(11, result[1].key());
+  ASSERT_EQ(5, result[10].key());
+  ASSERT_EQ(0, result[20].key());
+  ASSERT_EQ(30, result[30].key());
+  ASSERT_EQ(35, result[35].key());
+  ASSERT_EQ(99, result[99].key());
+}
+
+// TODO: context cannot shared by different searcher
+
+TEST_F(HnswStreamerTest, TestLinearSearchByKeys) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set("proxima.hnsw.streamer.max_neighbor_count", 16U);
+  params.set("proxima.hnsw.streamer.upper_neighbor_count", 8U);
+  params.set("proxima.hnsw.streamer.scaling_factor", 5U);
+  params.set("proxima.hnsw.streamer.get_vector_enable", true);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestLinearSearchByKeys.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t cnt = 5000UL;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  NumericalVector<float> vec(dim);
+
+  std::vector<std::vector<uint64_t>> p_keys;
+  p_keys.resize(1);
+  p_keys[0].resize(cnt);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+    p_keys[0][i] = i;
+  }
+
+  size_t topk = 3;
+  for (size_t i = 0; i < cnt; i += 1) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ctx->set_topk(1U);
+    ASSERT_EQ(
+        0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta, ctx));
+    auto &result1 = ctx->result();
+    ASSERT_EQ(1UL, result1.size());
+    ASSERT_EQ(i, result1[0].key());
+
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    ctx->set_topk(topk);
+    ASSERT_EQ(
+        0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta, ctx));
+    auto &result2 = ctx->result();
+    ASSERT_EQ(topk, result2.size());
+    ASSERT_EQ(i, result2[0].key());
+    ASSERT_EQ(i == cnt - 1 ? i - 1 : i + 1, result2[1].key());
+    ASSERT_EQ(i == 0 ? 2 : (i == cnt - 1 ? i - 2 : i - 1), result2[2].key());
+  }
+
+  {
+    ctx->set_topk(100U);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = 10.1f;
+    }
+    ASSERT_EQ(
+        0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta, ctx));
+    auto &result = ctx->result();
+    ASSERT_EQ(100U, result.size());
+    ASSERT_EQ(10, result[0].key());
+    ASSERT_EQ(11, result[1].key());
+    ASSERT_EQ(5, result[10].key());
+    ASSERT_EQ(0, result[20].key());
+    ASSERT_EQ(30, result[30].key());
+    ASSERT_EQ(35, result[35].key());
+    ASSERT_EQ(99, result[99].key());
+  }
+
+  {
+    ctx->set_topk(100U);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = 10.1f;
+    }
+    p_keys[0] = {{cnt + 1, 10, 1, 15, cnt + 2}};
+    ASSERT_EQ(
+        0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta, ctx));
+    auto &result = ctx->result();
+    ASSERT_EQ(3U, result.size());
+    ASSERT_EQ(10, result[0].key());
+    ASSERT_EQ(15, result[1].key());
+    ASSERT_EQ(1, result[2].key());
+  }
+
+  {
+    ctx->set_topk(100U);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = 9.1f;
+    }
+    p_keys[0].clear();
+    for (size_t j = 0; j < cnt; j += 10) {
+      p_keys[0].push_back((uint64_t)j);
+    }
+    ASSERT_EQ(
+        0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta, ctx));
+    auto &result = ctx->result();
+    ASSERT_EQ(100U, result.size());
+    ASSERT_EQ(10, result[0].key());
+    ASSERT_EQ(0, result[1].key());
+    ASSERT_EQ(100, result[10].key());
+    ASSERT_EQ(200, result[20].key());
+    ASSERT_EQ(300, result[30].key());
+    ASSERT_EQ(350, result[35].key());
+    ASSERT_EQ(990, result[99].key());
+  }
+}
+
+TEST_F(HnswStreamerTest, TestKnnSearch) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestKnnSearch.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 5000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  [[maybe_unused]] uint64_t knn_total_time = 0;
+  [[maybe_unused]] uint64_t linear_total_time = 0;
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / cnt;
+  // float cost = linearTotalTime * 1.0f / knnTotalTime;
+#if 0
+    printf("knnTotalTime=%zd linearTotalTime=%zd totalHits=%d totalCnts=%d "
+           "R@%zd=%f R@1=%f cost=%f\n",
+           knnTotalTime, linearTotalTime, totalHits, totalCnts, topk, recall,
+           topk1Recall, cost);
+#endif
+  EXPECT_GT(recall, 0.90f);
+  EXPECT_GT(topk1_recall, 0.95f);
+  // // EXPECT_GT(cost, 2.0f);
+}
+
+TEST_F(HnswStreamerTest, TestBuildFromOriginalVectorProvider) {
+  auto provider =
+      make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP32>>(dim);
+  size_t cnt = 5000UL;
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_TRUE(provider->emplace(i, vec));
+  }
+
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  std::dynamic_pointer_cast<HnswStreamer>(streamer)->set_provider(
+      provider, *index_meta_ptr_);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestBuildFromProvider.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (auto it = provider->create_iterator(); it->is_valid(); it->next()) {
+    ASSERT_EQ(0, streamer->add_impl(it->key(), it->data(), qmeta, ctx));
+  }
+  streamer->flush(0UL);
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  int query_cnt = 0;
+  NumericalVector<float> vec(dim);
+  for (size_t i = 0; i < cnt; i += 10) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+    query_cnt++;
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / query_cnt;
+  EXPECT_GT(recall, 0.90f);
+  EXPECT_GT(topk1_recall, 0.95f);
+}
+
+TEST_F(HnswStreamerTest, TestBuildFromProviderWithMismatchedMeta) {
+  // Original vectors are FP32 while the index stores FP16, build
+  // distances should be computed in the FP32 space
+  auto provider =
+      make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP32>>(dim);
+  size_t cnt = 2000UL;
+  // Keep values small to avoid FP16 distance overflow during search
+  const float scale = 1.0f / 64;
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i * scale;
+    }
+    ASSERT_TRUE(provider->emplace(i, vec));
+  }
+
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  // provider meta carries no metric, the build path falls back to the
+  // index metric
+  IndexMeta provider_meta(IndexMeta::DataType::DT_FP32, dim);
+  std::dynamic_pointer_cast<HnswStreamer>(streamer)->set_provider(
+      provider, provider_meta);
+
+  IndexMeta fp16_meta(IndexMeta::DataType::DT_FP16, dim);
+  fp16_meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestBuildFromProviderFp16.index", true));
+  ASSERT_EQ(0, streamer->init(fp16_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP16, dim);
+  NumericalVector<uint16_t> fp16_vec(dim);
+  for (auto it = provider->create_iterator(); it->is_valid(); it->next()) {
+    const float *data = static_cast<const float *>(it->data());
+    for (size_t j = 0; j < dim; ++j) {
+      fp16_vec[j] = ailego::FloatHelper::ToFP16(data[j]);
+    }
+    ASSERT_EQ(0, streamer->add_impl(it->key(), fp16_vec.data(), qmeta, ctx));
+  }
+  streamer->flush(0UL);
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  size_t topk = 100;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  int query_cnt = 0;
+  for (size_t i = 0; i < cnt; i += 10) {
+    for (size_t j = 0; j < dim; ++j) {
+      fp16_vec[j] = ailego::FloatHelper::ToFP16(i * scale);
+    }
+    ASSERT_EQ(0, streamer->search_impl(fp16_vec.data(), qmeta, knn_ctx));
+    ASSERT_EQ(0, streamer->search_bf_impl(fp16_vec.data(), qmeta, linear_ctx));
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+    query_cnt++;
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / query_cnt;
+  EXPECT_GT(recall, 0.90f);
+  EXPECT_GT(topk1_recall, 0.95f);
+}
+
+TEST_F(HnswStreamerTest, TestBuildFromProviderWithDifferentMetric) {
+  // Layout is identical to the index, only the build metric differs. The
+  // graph is built with Euclidean while search uses SquaredEuclidean,
+  // which preserves the neighbor ordering
+  auto provider =
+      make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP32>>(dim);
+  size_t cnt = 2000UL;
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_TRUE(provider->emplace(i, vec));
+  }
+
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  IndexMeta provider_meta(IndexMeta::DataType::DT_FP32, dim);
+  provider_meta.set_metric("Euclidean", 0, ailego::Params());
+  streamer->set_provider(provider, provider_meta);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestBuildFromProviderMetric.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (auto it = provider->create_iterator(); it->is_valid(); it->next()) {
+    ASSERT_EQ(0, streamer->add_impl(it->key(), it->data(), qmeta, ctx));
+  }
+  streamer->flush(0UL);
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  size_t topk = 100;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  int query_cnt = 0;
+  NumericalVector<float> query(dim);
+  for (size_t i = 0; i < cnt; i += 10) {
+    for (size_t j = 0; j < dim; ++j) {
+      query[j] = i;
+    }
+    ASSERT_EQ(0, streamer->search_impl(query.data(), qmeta, knn_ctx));
+    ASSERT_EQ(0, streamer->search_bf_impl(query.data(), qmeta, linear_ctx));
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+    query_cnt++;
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / query_cnt;
+  EXPECT_GT(recall, 0.90f);
+  EXPECT_GT(topk1_recall, 0.95f);
+}
+
+TEST_F(HnswStreamerTest, TestBuildFromProviderAddWithId) {
+  // Nodes added with an explicit id are keyed by the id itself, the
+  // provider vectors are fetched with it during build
+  auto provider =
+      make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP32>>(dim);
+  size_t cnt = 2000UL;
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_TRUE(provider->emplace(i, vec));
+  }
+
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  ASSERT_EQ(0, streamer->set_provider(provider, *index_meta_ptr_));
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestBuildFromProviderWithId.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  NumericalVector<float> vec(dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_EQ(0, streamer->add_with_id_impl(i, vec.data(), qmeta, ctx));
+  }
+  streamer->flush(0UL);
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  size_t topk = 100;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  int query_cnt = 0;
+  for (size_t i = 0; i < cnt; i += 10) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+    query_cnt++;
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / query_cnt;
+  EXPECT_GT(recall, 0.90f);
+  EXPECT_GT(topk1_recall, 0.95f);
+}
+
+TEST_F(HnswStreamerTest, TestBuildFromProviderMissingKey) {
+  // A vector whose key is missing from the provider must be rejected
+  // before it is stored, leaving no orphan node in the index
+  auto provider =
+      make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP32>>(dim);
+  size_t cnt = 200UL;
+  const uint64_t missing_key = 100UL;
+  for (size_t i = 0; i < cnt; i++) {
+    if (i == missing_key) {
+      continue;
+    }
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_TRUE(provider->emplace(i, vec));
+  }
+
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  ASSERT_EQ(0, streamer->set_provider(provider, *index_meta_ptr_));
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0,
+            storage->open(dir_ + "TestBuildFromProviderMissing.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  NumericalVector<float> vec(dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    int ret = streamer->add_with_id_impl(i, vec.data(), qmeta, ctx);
+    if (i == missing_key) {
+      ASSERT_NE(0, ret);
+    } else {
+      ASSERT_EQ(0, ret);
+    }
+  }
+  streamer->flush(0UL);
+  EXPECT_EQ(cnt - 1, streamer->stats().added_count());
+  EXPECT_EQ(1UL, streamer->stats().discarded_count());
+
+  // the rejected vector must not appear in brute force results
+  auto linear_ctx = streamer->create_context();
+  size_t topk = 10;
+  linear_ctx->set_topk(topk);
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = missing_key;
+  }
+  ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+  auto &linear_result = linear_ctx->result();
+  ASSERT_EQ(topk, linear_result.size());
+  for (size_t k = 0; k < topk; ++k) {
+    EXPECT_NE(missing_key, linear_result[k].key());
+  }
+}
+
+TEST_F(HnswStreamerTest, TestSetProviderAfterOpenRejected) {
+  // The build distance is derived from the provider meta during open,
+  // so binding a provider afterwards must be rejected
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestSetProviderAfterOpen.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto provider =
+      make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP32>>(dim);
+  EXPECT_EQ(IndexError_Unsupported,
+            streamer->set_provider(provider, *index_meta_ptr_));
+}
+
+TEST_F(HnswStreamerTest, TestAddAndSearch) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestAddAndSearch.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 20000U;
+  auto ctx = streamer->create_context();
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  // streamer->print_debug_info();
+
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  [[maybe_unused]] uint64_t knn_total_time = 0;
+  [[maybe_unused]] uint64_t linear_total_time = 0;
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  for (size_t i = 0; i < cnt; i += 100) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 100.0f / cnt;
+  // float cost = linearTotalTime * 1.0f / knnTotalTime;
+#if 0
+    printf("knnTotalTime=%zd linearTotalTime=%zd totalHits=%d totalCnts=%d "
+           "R@%zd=%f R@1=%f cost=%f\n",
+           knnTotalTime, linearTotalTime, totalHits, totalCnts, topk, recall,
+           topk1Recall, cost);
+#endif
+  EXPECT_GT(recall, 0.80f);
+  EXPECT_GT(topk1_recall, 0.80f);
+  // EXPECT_GT(cost, 2.0f);
+}
+
+TEST_F(HnswStreamerTest, TestUniformUint8BatchExtraValues) {
+  constexpr size_t kOriginalDimension = 128;
+  constexpr size_t kEncodedDimension = kOriginalDimension + sizeof(uint32_t);
+  constexpr uint32_t kCount = 64;
+  constexpr uint32_t kProbe = 37;
+
+  ailego::Params metric_params;
+  metric_params.set("proxima.uniform_uint8.metric.origin_metric_name",
+                    std::string("SquaredEuclidean"));
+  IndexMeta meta(IndexMeta::DataType::DT_INT8, kEncodedDimension);
+  meta.set_metric("UniformUint8", 0, metric_params);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 16U);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16U);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, kCount);
+  params.set(PARAM_HNSW_STREAMER_EF, kCount);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1U);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(ailego::Params()));
+  ASSERT_EQ(0, storage->open(dir_ + "TestUniformUint8BatchExtraValues", true));
+
+  auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(nullptr, streamer);
+  ASSERT_EQ(0, streamer->init(meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  IndexQueryMeta query_meta(IndexMeta::DataType::DT_INT8, kEncodedDimension);
+  auto context = streamer->create_context();
+  ASSERT_NE(nullptr, context);
+  for (uint32_t id = 0; id < kCount; ++id) {
+    const auto record = EncodeUniformUint8Record(kOriginalDimension, id);
+    ASSERT_EQ(
+        0, streamer->add_with_id_impl(id, record.data(), query_meta, context));
+  }
+
+  const auto query = EncodeUniformUint8Record(kOriginalDimension, kProbe);
+  context->set_topk(1);
+  ASSERT_EQ(0, streamer->search_impl(query.data(), query_meta, context));
+  ASSERT_EQ(1U, context->result().size());
+  EXPECT_EQ(kProbe, context->result()[0].key());
+  EXPECT_FLOAT_EQ(0.0F, context->result()[0].score());
+
+  ASSERT_EQ(0, streamer->search_bf_impl(query.data(), query_meta, context));
+  ASSERT_EQ(1U, context->result().size());
+  EXPECT_EQ(kProbe, context->result()[0].key());
+  EXPECT_FLOAT_EQ(0.0F, context->result()[0].score());
+
+  ASSERT_EQ(0, streamer->close());
+  ASSERT_EQ(0, storage->close());
+}
+
+TEST_F(HnswStreamerTest, TestKnnSearchRandomData) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  constexpr size_t static dim = 128;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 128);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 20);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 200);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_EF, 10);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestKnnSearchRandomData", true));
+  ASSERT_EQ(0, streamer->init(meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  NumericalVector<float> vec(dim);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  size_t cnt = 1500;
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+    }
+    streamer->add_impl(i + cnt, vec.data(), qmeta, ctx);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  size_t topk = 100;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  uint64_t knn_total_time = 0;
+  uint64_t linear_total_time = 0;
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  cnt = 500;
+  for (size_t i = 0; i < cnt; i += 1) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+    }
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+    knn_total_time += t3 - t2;
+    linear_total_time += t2 - t1;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+
+    topk1_hits += linear_result[0].key() == knn_result[0].key();
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+
+  std::cout << "knnTotalTime: " << knn_total_time << std::endl;
+  std::cout << "linearTotalTime: " << linear_total_time << std::endl;
+
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / cnt;
+  // float cost = linearTotalTime * 1.0f / knnTotalTime;
+#if 0
+    printf("knnTotalTime=%zd linearTotalTime=%zd totalHits=%d totalCnts=%d "
+           "R@%zd=%f R@1=%f cost=%f\n",
+           knnTotalTime, linearTotalTime, totalHits, totalCnts, topk, recall,
+           topk1Recall, cost);
+#endif
+  EXPECT_GT(recall, 0.50f);
+  EXPECT_GT(topk1_recall, 0.80f);
+  // EXPECT_GT(cost, 5.0f);
+}
+
+TEST_F(HnswStreamerTest, TestOpenClose) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  constexpr size_t static dim = 2048;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  auto storage1 = IndexFactory::CreateStorage("MMapFileStorage");
+  auto storage2 = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage1);
+  ASSERT_NE(nullptr, storage2);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage1->init(stg_params));
+  ASSERT_EQ(0, storage1->open(dir_ + "TessOpenAndClose1", true));
+  ASSERT_EQ(0, storage2->init(stg_params));
+  ASSERT_EQ(0, storage2->open(dir_ + "TessOpenAndClose2", true));
+  ASSERT_EQ(0, streamer->init(meta, params));
+  auto check_iter = [](size_t base, size_t total,
+                       IndexStreamer::Pointer &streamer) {
+    auto provider = streamer->create_provider();
+    auto iter = provider->create_iterator();
+    ASSERT_TRUE(!!iter);
+    size_t cur = base;
+    size_t cnt = 0;
+    while (iter->is_valid()) {
+      float *data = (float *)iter->data();
+      ASSERT_EQ(cur, iter->key());
+      for (size_t d = 0; d < dim; ++d) {
+        ASSERT_FLOAT_EQ((float)cur, data[d]);
+      }
+      iter->next();
+      cur += 2;
+      cnt++;
+    }
+    ASSERT_EQ(cnt, total);
+  };
+
+  size_t test_cnt = 200;
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < test_cnt; i += 2) {
+    float v1 = (float)i;
+    ASSERT_EQ(0, streamer->open(storage1));
+    auto ctx = streamer->create_context();
+    ASSERT_TRUE(!!ctx);
+    std::vector<float> vec1(dim);
+    for (size_t d = 0; d < dim; ++d) {
+      vec1[d] = v1;
+    }
+    ASSERT_EQ(0, streamer->add_impl(i, vec1.data(), qmeta, ctx));
+    check_iter(0, i / 2 + 1, streamer);
+    ASSERT_EQ(0, streamer->flush(0UL));
+    ASSERT_EQ(0, streamer->close());
+
+    float v2 = (float)(i + 1);
+    std::vector<float> vec2(dim);
+    for (size_t d = 0; d < dim; ++d) {
+      vec2[d] = v2;
+    }
+    ASSERT_EQ(0, streamer->open(storage2));
+    ctx = streamer->create_context();
+    ASSERT_TRUE(!!ctx);
+    ASSERT_EQ(0, streamer->add_impl(i + 1, vec2.data(), qmeta, ctx));
+    check_iter(1, i / 2 + 1, streamer);
+    ASSERT_EQ(0, streamer->flush(0UL));
+    ASSERT_EQ(0, streamer->close());
+  }
+
+  IndexStreamer::Pointer streamer1 =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  ASSERT_EQ(0, streamer1->init(meta, params));
+  ASSERT_EQ(0, streamer1->open(storage1));
+
+  IndexStreamer::Pointer streamer2 =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  ASSERT_EQ(0, streamer2->init(meta, params));
+  ASSERT_EQ(0, streamer2->open(storage2));
+
+  check_iter(0, test_cnt / 2, streamer1);
+  check_iter(1, test_cnt / 2, streamer2);
+}
+
+TEST_F(HnswStreamerTest, TestCreateIterator) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  params.set(PARAM_HNSW_STREAMER_FILTER_SAME_KEY, true);
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestCreateIterator", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto check_iter = [](size_t total, IndexStreamer::Pointer &streamer) {
+    auto provider = streamer->create_provider();
+    auto iter = provider->create_iterator();
+    ASSERT_TRUE(!!iter);
+    size_t cur = 0;
+    while (iter->is_valid()) {
+      float *data = (float *)iter->data();
+      ASSERT_EQ(cur, iter->key());
+      for (size_t d = 0; d < dim; ++d) {
+        ASSERT_FLOAT_EQ((float)cur, data[d]);
+      }
+      iter->next();
+      cur++;
+    }
+    ASSERT_EQ(cur, total);
+  };
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 200;
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+    check_iter(i + 1, streamer);
+  }
+
+  streamer->flush(0UL);
+  streamer->close();
+  ASSERT_EQ(0, streamer->open(storage));
+  check_iter(cnt, streamer);
+
+  // check getVector
+  auto provider = streamer->create_provider();
+  for (size_t i = 0; i < cnt; i++) {
+    const float *data = (const float *)provider->get_vector(i);
+    ASSERT_NE(data, nullptr);
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_FLOAT_EQ(i, data[j]);
+    }
+  }
+}
+
+TEST_F(HnswStreamerTest, TestNoInit) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  streamer->cleanup();
+}
+
+TEST_F(HnswStreamerTest, TestForceFlush) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  params.set(PARAM_HNSW_STREAMER_FILTER_SAME_KEY, true);
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  stg_params.set("proxima.mmap_file.storage.copy_on_write", true);
+  stg_params.set("proxima.mmap_file.storage.force_flush", true);
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestForceFlush", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto check_iter = [](size_t total, IndexStreamer::Pointer &streamer) {
+    auto provider = streamer->create_provider();
+    auto iter = provider->create_iterator();
+    ASSERT_TRUE(!!iter);
+    size_t cur = 0;
+    while (iter->is_valid()) {
+      float *data = (float *)iter->data();
+      ASSERT_EQ(cur, iter->key());
+      for (size_t d = 0; d < dim; ++d) {
+        ASSERT_FLOAT_EQ((float)cur, data[d]);
+      }
+      iter->next();
+      cur++;
+    }
+    ASSERT_EQ(cur, total);
+  };
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 200;
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+    check_iter(i + 1, streamer);
+  }
+
+  streamer->flush(0UL);
+  streamer->close();
+  storage->close();
+
+  storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestForceFlush", true));
+  ASSERT_EQ(0, streamer->open(storage));
+  check_iter(cnt, streamer);
+
+  // check getVector
+  auto provider = streamer->create_provider();
+  for (size_t i = 0; i < cnt; i++) {
+    const float *data = (const float *)provider->get_vector(i);
+    ASSERT_NE(data, nullptr);
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_FLOAT_EQ(i, data[j]);
+    }
+  }
+}
+
+TEST_F(HnswStreamerTest, TestKnnMultiThread) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  constexpr size_t static dim = 32;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 128);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 10);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 64);
+  params.set(PARAM_HNSW_STREAMER_MAX_INDEX_SIZE, 30 * 1024 * 1024U);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_EF, 32);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+  ASSERT_EQ(0, streamer->init(meta, params));
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TessKnnMultiThread", true));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto add_vector = [&streamer](int base_key, size_t add_cnt) {
+    NumericalVector<float> vec(dim);
+    IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+    size_t succ_add = 0;
+    auto ctx = streamer->create_context();
+    for (size_t i = 0; i < add_cnt; i++) {
+      for (size_t j = 0; j < dim; ++j) {
+        vec[j] = (float)i + base_key;
+      }
+      succ_add += !streamer->add_impl(base_key + i, vec.data(), qmeta, ctx);
+    }
+    streamer->flush(0UL);
+    return succ_add;
+  };
+  auto t2 = std::async(std::launch::async, add_vector, 1000, 1000);
+  auto t3 = std::async(std::launch::async, add_vector, 2000, 1000);
+  auto t1 = std::async(std::launch::async, add_vector, 0, 1000);
+  ASSERT_EQ(1000U, t1.get());
+  ASSERT_EQ(1000U, t2.get());
+  ASSERT_EQ(1000U, t3.get());
+  streamer->close();
+
+  // checking data
+  ASSERT_EQ(0, streamer->open(storage));
+  auto provider = streamer->create_provider();
+  auto iter = provider->create_iterator();
+  ASSERT_TRUE(!!iter);
+  size_t total = 0;
+  uint64_t min = 1000;
+  uint64_t max = 0;
+  while (iter->is_valid()) {
+    float *data = (float *)iter->data();
+    for (size_t d = 0; d < dim; ++d) {
+      ASSERT_FLOAT_EQ((float)iter->key(), data[d]);
+    }
+    total++;
+    min = std::min(min, iter->key());
+    max = std::max(max, iter->key());
+    iter->next();
+  }
+  ASSERT_EQ(3000, total);
+  ASSERT_EQ(0, min);
+  ASSERT_EQ(2999, max);
+
+  // ====== multi thread search
+  size_t topk = 100;
+  size_t cnt = 3000;
+  auto knn_search = [&]() {
+    NumericalVector<float> vec(dim);
+    auto linear_ctx = streamer->create_context();
+    auto linear_by_pkeys_ctx = streamer->create_context();
+    auto ctx = streamer->create_context();
+    IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+    linear_ctx->set_topk(topk);
+    linear_by_pkeys_ctx->set_topk(topk);
+    ctx->set_topk(topk);
+    size_t total_cnts = 0;
+    size_t total_hits = 0;
+    for (size_t i = 0; i < cnt; i += 1) {
+      for (size_t j = 0; j < dim; ++j) {
+        vec[j] = i + 0.1f;
+      }
+      ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+      ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+      std::vector<std::vector<uint64_t>> p_keys = {{0, 1, 2}};
+      ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta,
+                                                      linear_by_pkeys_ctx));
+      auto &r1 = ctx->result();
+      ASSERT_EQ(topk, r1.size());
+      auto &r2 = linear_ctx->result();
+      ASSERT_EQ(topk, r2.size());
+      ASSERT_EQ(i, r2[0].key());
+      auto &r3 = linear_by_pkeys_ctx->result();
+      ASSERT_EQ(std::min(topk, p_keys[0].size()), r3.size());
+#if 0
+            printf("linear: %zd => %zd %zd %zd %zd %zd\n", i, r2[0].key,
+                   r2[1].key, r2[2].key, r2[3].key, r2[4].key);
+            printf("knn: %zd => %zd %zd %zd %zd %zd\n", i, r1[0].key, r1[1].key,
+                   r1[2].key, r1[3].key, r1[4].key);
+#endif
+      for (size_t k = 0; k < topk; ++k) {
+        total_cnts++;
+        for (size_t j = 0; j < topk; ++j) {
+          if (r2[j].key() == r1[k].key()) {
+            total_hits++;
+            break;
+          }
+        }
+      }
+    }
+    // printf("%f\n", totalHits * 1.0f / totalCnts);
+    ASSERT_TRUE((total_hits * 1.0f / total_cnts) > 0.80f);
+  };
+  auto s1 = std::async(std::launch::async, knn_search);
+  auto s2 = std::async(std::launch::async, knn_search);
+  auto s3 = std::async(std::launch::async, knn_search);
+  s1.wait();
+  s2.wait();
+  s3.wait();
+}
+
+TEST_F(HnswStreamerTest, TestKnnConcurrentAddAndSearch) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  constexpr size_t static dim = 32;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 128);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 10);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 64);
+  params.set(PARAM_HNSW_STREAMER_MAX_INDEX_SIZE, 30 * 1024 * 1024U);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_CHUNK_SIZE, 4096);
+  params.set(PARAM_HNSW_STREAMER_EF, 32);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+  ASSERT_EQ(0, streamer->init(meta, params));
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TessKnnConcurrentAddAndSearch", true));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto add_vector = [&streamer](int base_key, size_t add_cnt) {
+    NumericalVector<float> vec(dim);
+    IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+    auto ctx = streamer->create_context();
+    size_t succ_add = 0;
+    for (size_t i = 0; i < add_cnt; i++) {
+      for (size_t j = 0; j < dim; ++j) {
+        vec[j] = (float)i + base_key;
+      }
+      succ_add += !streamer->add_impl(base_key + i, vec.data(), qmeta, ctx);
+    }
+    streamer->flush(0UL);
+    return succ_add;
+  };
+
+  // ====== multi thread search
+  auto knn_search = [&]() {
+    size_t topk = 100;
+    size_t cnt = 3000;
+    NumericalVector<float> vec(dim);
+    auto linear_ctx = streamer->create_context();
+    auto linear_by_p_keys_ctx = streamer->create_context();
+    auto ctx = streamer->create_context();
+    linear_ctx->set_topk(topk);
+    linear_by_p_keys_ctx->set_topk(topk);
+    ctx->set_topk(topk);
+    size_t total_cnts = 0;
+    size_t total_hits = 0;
+    IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+    for (size_t i = 0; i < cnt; i += 1) {
+      for (size_t j = 0; j < dim; ++j) {
+        vec[j] = i + 0.1f;
+      }
+      ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+      ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+      std::vector<std::vector<uint64_t>> p_keys = {{0, 1, 2}};
+      ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta,
+                                                      linear_by_p_keys_ctx));
+      auto &r1 = ctx->result();
+      ASSERT_EQ(topk, r1.size());
+      auto &r2 = linear_ctx->result();
+      ASSERT_EQ(topk, r2.size());
+      auto &r3 = linear_by_p_keys_ctx->result();
+      ASSERT_EQ(std::min(topk, p_keys[0].size()), r3.size());
+// ASSERT_EQ(i, r2[0].key);
+#if 0
+            printf("linear: %zd => %zd %zd %zd %zd %zd\n", i, r2[0].key,
+                   r2[1].key, r2[2].key, r2[3].key, r2[4].key);
+            printf("knn: %zd => %zd %zd %zd %zd %zd\n", i, r1[0].key, r1[1].key,
+                   r1[2].key, r1[3].key, r1[4].key);
+#endif
+      for (size_t k = 0; k < topk; ++k) {
+        total_cnts++;
+        for (size_t j = 0; j < topk; ++j) {
+          if (r2[j].key() == r1[k].key()) {
+            total_hits++;
+            break;
+          }
+        }
+      }
+    }
+    //        printf("%f\n", totalHits * 1.0f / totalCnts);
+    ASSERT_TRUE((total_hits * 1.0f / total_cnts) > 0.80f);
+  };
+  auto t0 = std::async(std::launch::async, add_vector, 0, 1000);
+  ASSERT_EQ(1000, t0.get());
+  auto t1 = std::async(std::launch::async, add_vector, 1000, 1000);
+  auto t2 = std::async(std::launch::async, add_vector, 2000, 1000);
+  auto s1 = std::async(std::launch::async, knn_search);
+  auto s2 = std::async(std::launch::async, knn_search);
+  ASSERT_EQ(1000, t1.get());
+  ASSERT_EQ(1000, t2.get());
+  s1.wait();
+  s2.wait();
+
+  // checking data
+  auto provider = streamer->create_provider();
+  auto iter = provider->create_iterator();
+  ASSERT_TRUE(!!iter);
+  size_t total = 0;
+  uint64_t min = 1000;
+  uint64_t max = 0;
+  while (iter->is_valid()) {
+    float *data = (float *)iter->data();
+    for (size_t d = 0; d < dim; ++d) {
+      ASSERT_FLOAT_EQ((float)iter->key(), data[d]);
+    }
+    total++;
+    min = std::min(min, iter->key());
+    max = std::max(max, iter->key());
+    iter->next();
+  }
+  ASSERT_EQ(3000, total);
+  ASSERT_EQ(0, min);
+  ASSERT_EQ(2999, max);
+}
+
+TEST_F(HnswStreamerTest, TestBfThreshold) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_EF, 16);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TessBfThreshold", true));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 100000;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  ctx->set_topk(1U);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+  streamer->flush(0UL);
+  streamer->close();
+
+  IndexStreamer::Pointer streamer1 =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(streamer1, nullptr);
+  auto params1 = params;
+  params1.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, cnt - 1);
+  ASSERT_EQ(0, streamer1->init(*index_meta_ptr_, params1));
+  ASSERT_EQ(0, streamer1->open(storage));
+  auto ctx1 = streamer1->create_context();
+
+  IndexStreamer::Pointer streamer2 =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(streamer2, nullptr);
+  auto params2 = params;
+  params2.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, cnt);
+  ASSERT_EQ(0, streamer2->init(*index_meta_ptr_, params2));
+  ASSERT_EQ(0, streamer2->open(storage));
+  auto ctx2 = streamer2->create_context();
+
+  // do searcher
+  size_t cost1 = 0;
+  size_t cost2 = 0;
+  for (size_t i = 0; i < 100; ++i) {
+    auto t1 = ailego::Monotime::MicroSeconds();
+    ASSERT_EQ(0, streamer1->search_impl(vec.data(), qmeta, ctx1));
+    auto t2 = ailego::Monotime::MicroSeconds();
+    ASSERT_EQ(0, streamer2->search_impl(vec.data(), qmeta, ctx2));
+    auto t3 = ailego::Monotime::MicroSeconds();
+    cost1 += t2 - t1;
+    cost2 += t3 - t2;
+  }
+
+  ASSERT_LT(cost1, cost2);
+
+  ailego::Params update_params;
+  update_params.set(PARAM_HNSW_STREAMER_VISIT_BLOOMFILTER_ENABLE, true);
+  update_params.set(PARAM_HNSW_STREAMER_EF, 50);
+  ctx1->set_debug_mode(true);
+  ctx1->update(update_params);
+  ASSERT_EQ(0, streamer1->search_impl(vec.data(), qmeta, ctx1));
+  LOG_DEBUG("%s", ctx1->debug_string().c_str());
+}
+
+TEST_F(HnswStreamerTest, TestFilter) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 1000);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TessFilter", true));
+  ASSERT_EQ(0, streamer->open(storage));
+
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 2000;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  ctx->set_topk(10U);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  std::vector<std::vector<uint64_t>> p_keys;
+  p_keys.resize(1);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+    p_keys[0].push_back(i);
+  }
+
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = 100.1;
+  }
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  auto &results = ctx->result();
+  ASSERT_EQ(10, results.size());
+  ASSERT_EQ(100, results[0].key());
+  ASSERT_EQ(101, results[1].key());
+  ASSERT_EQ(99, results[2].key());
+
+  auto filter_func = [](uint64_t key) {
+    if (key == 100UL || key == 101UL) {
+      return true;
+    }
+    return false;
+  };
+  ctx->set_filter(filter_func);
+
+  // after set filter
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  auto &results1 = ctx->result();
+  ASSERT_EQ(10, results1.size());
+  ASSERT_EQ(99, results1[0].key());
+  ASSERT_EQ(102, results1[1].key());
+  ASSERT_EQ(98, results1[2].key());
+
+  // linear
+  ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, ctx));
+  auto &results2 = ctx->result();
+  ASSERT_EQ(10, results2.size());
+  ASSERT_EQ(99, results2[0].key());
+  ASSERT_EQ(102, results2[1].key());
+  ASSERT_EQ(98, results2[2].key());
+
+  // linear by p_keys
+  ASSERT_EQ(0,
+            streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta, ctx));
+  auto &results3 = ctx->result();
+  ASSERT_EQ(10, results3.size());
+  ASSERT_EQ(99, results3[0].key());
+  ASSERT_EQ(102, results3[1].key());
+  ASSERT_EQ(98, results3[2].key());
+}
+
+TEST_F(HnswStreamerTest, TestMaxIndexSize) {
+  GTEST_SKIP();
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  constexpr size_t static dim = 128;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  ASSERT_EQ(0, streamer->init(meta, params));
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TessMaxIndexSize", true));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t vsz0 = 0;
+  size_t rss0 = 0;
+  if (!ailego::MemoryHelper::SelfUsage(&vsz0, &rss0)) {
+    // do not check if get mem usage failed
+    return;
+  }
+  if (vsz0 > 1024 * 1024 * 1024 * 1024UL) {
+    // asan mode
+    return;
+  }
+
+  NumericalVector<float> vec(dim);
+  size_t write_cnt1 = 10000;
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  auto ctx = streamer->create_context();
+  for (size_t i = 0; i < write_cnt1; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+  size_t vsz1 = 0;
+  size_t rss1 = 0;
+  ailego::MemoryHelper::SelfUsage(&vsz1, &rss1);
+  size_t increment1 = rss1 - rss0;
+  ASSERT_GT(write_cnt1 * 128 * 4 + write_cnt1 * 100 * 4, increment1 * 0.8f);
+  ASSERT_LT(write_cnt1 * 128 * 4 + write_cnt1 * 100 * 4, increment1 * 1.2f);
+
+  streamer->flush(0UL);
+  streamer.reset();
+}
+
+TEST_F(HnswStreamerTest, TestKnnCleanUp) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage1 = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage1);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage1->init(stg_params));
+  ASSERT_EQ(0, storage1->open(dir_ + "TessKnnCluenUp1", true));
+  ailego::Params params;
+  constexpr size_t static dim1 = 32;
+  IndexMeta meta1(IndexMeta::DataType::DT_FP32, dim1);
+  meta1.set_metric("SquaredEuclidean", 0, ailego::Params());
+  NumericalVector<float> vec1(dim1);
+  ASSERT_EQ(0, streamer->init(meta1, params));
+  ASSERT_EQ(0, streamer->open(storage1));
+  IndexQueryMeta qmeta1(IndexMeta::DataType::DT_FP32, dim1);
+  auto ctx1 = streamer->create_context();
+  ASSERT_EQ(0, streamer->add_impl(1, vec1.data(), qmeta1, ctx1));
+  ASSERT_EQ(0, streamer->close());
+  ASSERT_EQ(0, streamer->cleanup());
+
+  auto storage2 = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage2);
+  ASSERT_EQ(0, storage2->init(stg_params));
+  ASSERT_EQ(0, storage2->open(dir_ + "TessKnnCluenUp2", true));
+  constexpr size_t static dim2 = 64;
+  IndexMeta meta2(IndexMeta::DataType::DT_FP32, dim2);
+  meta2.set_metric("SquaredEuclidean", 0, ailego::Params());
+  NumericalVector<float> vec2(dim2);
+  ASSERT_EQ(0, streamer->init(meta2, params));
+  ASSERT_EQ(0, streamer->open(storage2));
+  IndexQueryMeta qmeta2(IndexMeta::DataType::DT_FP32, dim2);
+  auto ctx2 = streamer->create_context();
+  ASSERT_EQ(0, streamer->add_impl(2, vec2.data(), qmeta2, ctx2));
+  ASSERT_EQ(0, streamer->close());
+  ASSERT_EQ(0, streamer->cleanup());
+}
+
+TEST_F(HnswStreamerTest, TestIndexSizeQuota) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestIndexSizeQuota", true));
+  ailego::Params params;
+  constexpr size_t static dim = 512;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  params.set(PARAM_HNSW_STREAMER_MAX_INDEX_SIZE, 2 * 1024 * 1024U);
+  params.set(PARAM_HNSW_STREAMER_CHUNK_SIZE, 100 * 1024U);
+  ASSERT_EQ(0, streamer->init(meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+  NumericalVector<float> vec(dim);
+  size_t write_cnt1 = 850;
+  int ret = 0;
+  auto ctx = streamer->create_context();
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < write_cnt1; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    int i_ret = streamer->add_impl(i, vec.data(), qmeta, ctx);
+    if (i_ret != 0) {
+      ret = i_ret;
+    }
+  }
+  ASSERT_EQ(IndexError_IndexFull, ret);
+  ASSERT_EQ(0, streamer->close());
+  ASSERT_EQ(0, streamer->cleanup());
+}
+
+TEST_F(HnswStreamerTest, TestBloomFilter) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestBloomFilter", true));
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_VISIT_BLOOMFILTER_ENABLE, true);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  auto ctx = streamer->create_context();
+  ASSERT_NE(nullptr, ctx);
+  ctx->set_topk(10U);
+  size_t cnt = 5000;
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+    if ((i + 1) % 10 == 0) {
+      ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+      auto &results = ctx->result();
+      ASSERT_EQ(10, results.size());
+    }
+  }
+}
+
+TEST_F(HnswStreamerTest, TestStreamerParams) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestStreamerParams", true));
+  ailego::Params params;
+  params.set("proxima.hnsw.streamer.docs_hard_limit", 5);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  auto ctx = streamer->create_context();
+  ASSERT_EQ(0, streamer->add_impl(1, vec.data(), qmeta, ctx));
+  ASSERT_EQ(0, streamer->add_impl(2, vec.data(), qmeta, ctx));
+  ASSERT_EQ(0, streamer->add_impl(3, vec.data(), qmeta, ctx));
+  ASSERT_EQ(0, streamer->add_impl(4, vec.data(), qmeta, ctx));
+  ASSERT_EQ(0, streamer->add_impl(5, vec.data(), qmeta, ctx));
+  ASSERT_EQ(IndexError_IndexFull,
+            streamer->add_impl(6, vec.data(), qmeta, ctx));
+}
+
+#if 0
+TEST_F(HnswStreamerTest, TestCheckCrc)
+{
+    IndexStreamer::Pointer streamer =
+        IndexFactory::CreateStreamer("HnswStreamer");
+    ASSERT_TRUE(streamer != nullptr);
+
+    auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+    ASSERT_NE(nullptr, storage);
+    ailego::Params stg_params;
+    ASSERT_EQ(0, storage->init(stg_params));
+    std::string path = dir_ + "TestCheckCrc";
+    ASSERT_EQ(0, storage->open(path, true));
+    ailego::Params params;
+    params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+    params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+    params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+    params.set(PARAM_HNSW_STREAMER_EF, 100);
+    params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+    params.set(PARAM_HNSW_STREAMER_VISIT_BLOOMFILTER_ENABLE, true);
+    ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+    ASSERT_EQ(0, streamer->open(storage));
+
+    NumericalVector<float> vec(dim);
+    auto ctx = streamer->create_context();
+    ASSERT_NE(nullptr, ctx);
+    IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+    size_t cnt = 100;
+    for (size_t i = 0; i < cnt; i++) {
+        for (size_t j = 0; j < dim; ++j) {
+            vec[j] = i;
+        }
+        streamer->add_impl(i, vec.data(), qmeta, ctx);
+    }
+    streamer->flush(0UL);
+    streamer->close();
+    storage->flush();
+    storage->close();
+
+    int fd = open(path.c_str(), O_RDWR);
+    ASSERT_GT(fd, 0);
+    struct stat fs;
+    ASSERT_EQ(0, fstat(fd, &fs));
+    char buf[1024];
+    pwrite(fd, buf, sizeof(buf), fs.st_size/2);
+
+    ASSERT_EQ(0, storage->open(path, true));
+    IndexStreamer::Pointer streamer2 =
+        IndexFactory::CreateStreamer("HnswStreamer");
+    ASSERT_NE(streamer2, nullptr);
+
+    ailego::Params params2;
+    params2.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+    params2.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+    params2.set("proxima.hnsw.streamer.check_crc_enable", true);
+    ASSERT_EQ(0, streamer2->init(*index_meta_ptr_, params2));
+    ASSERT_EQ(0, streamer2->open(storage));
+}
+#endif
+
+TEST_F(HnswStreamerTest, TestCheckStats) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  std::string path = dir_ + "TestCheckStats.index";
+  ASSERT_EQ(0, storage->open(path, true));
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 100);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  params.set(PARAM_HNSW_STREAMER_FILTER_SAME_KEY, true);
+  params.set(PARAM_HNSW_STREAMER_CHUNK_SIZE, 512 * 1024U);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto &stats = streamer->stats();
+  ASSERT_EQ(0U, stats.revision_id());
+  ASSERT_EQ(0U, stats.loaded_count());
+  ASSERT_EQ(0U, stats.added_count());
+  ASSERT_EQ(0U, stats.discarded_count());
+  ASSERT_EQ(0u, stats.index_size() % ailego::MemoryHelper::PageSize());
+  ASSERT_EQ(0U, stats.dumped_size());
+  ASSERT_EQ(0U, stats.check_point());
+  auto create_time = stats.create_time();
+  auto update_time = stats.update_time();
+  ASSERT_GT(create_time, 0UL);
+  ASSERT_EQ(create_time, update_time);
+
+  NumericalVector<float> vec(dim);
+  auto ctx = streamer->create_context();
+  ASSERT_NE(nullptr, ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  size_t cnt = 3000;
+  size_t size1 = stats.index_size();
+  size_t size2 = 0;
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_EQ(0, streamer->add_impl(i, vec.data(), qmeta, ctx));
+    ASSERT_EQ(i + 1, stats.added_count());
+    if (i == 0UL) {
+      size2 = stats.index_size();
+    }
+  }
+  size_t size3 = stats.index_size();
+  ASSERT_GT(size2, size1);
+  ASSERT_GT(size3, size2);
+  LOG_INFO("size1=%zu size2=%zu size3=%zu", size1, size2, size3);
+
+  uint64_t check_point = 23423UL;
+  streamer->flush(check_point);
+  size_t size4 = stats.index_size();
+  ASSERT_EQ(size3, size4);
+  auto stats1 = streamer->stats();
+  ASSERT_EQ(1U, stats1.revision_id());
+  ASSERT_EQ(0U, stats1.loaded_count());
+  ASSERT_EQ(cnt, stats1.added_count());
+  ASSERT_EQ(0U, stats1.discarded_count());
+  ASSERT_GT(stats1.index_size(), 0U);
+  ASSERT_EQ(0U, stats1.dumped_size());
+  ASSERT_EQ(check_point, stats1.check_point());
+  auto create_time1 = stats1.create_time();
+  auto update_time1 = stats1.update_time();
+  ASSERT_GE(update_time1, create_time1);
+  ASSERT_EQ(create_time, create_time1);
+  streamer->close();
+
+  ASSERT_EQ(0, streamer->open(storage));
+  auto &stats2 = streamer->stats();
+  ctx = streamer->create_context();
+  ASSERT_NE(nullptr, ctx);
+  ASSERT_EQ(0, streamer->add_impl(10000UL, vec.data(), qmeta, ctx));
+  ASSERT_EQ(2U, stats2.revision_id());
+  ASSERT_EQ(cnt, stats2.loaded_count());
+  ASSERT_EQ(1U, stats2.added_count());
+  ASSERT_EQ(0U, stats2.discarded_count());
+  ASSERT_GT(stats1.index_size(), 0);
+  ASSERT_EQ(0U, stats2.dumped_size());
+  ASSERT_EQ(check_point, stats2.check_point());
+  auto create_time2 = stats2.create_time();
+  auto update_time2 = stats2.update_time();
+  ASSERT_EQ(create_time2, create_time1);
+  ASSERT_GE(update_time2, update_time1);
+
+  sleep(1);
+  streamer->flush(check_point + 1);
+  ASSERT_NE(0, streamer->add_impl(0U, vec.data(), qmeta, ctx));
+  auto &stats3 = streamer->stats();
+  ASSERT_EQ(2U, stats3.revision_id());
+  ASSERT_EQ(cnt, stats3.loaded_count());
+  ASSERT_EQ(1U, stats3.added_count());
+  ASSERT_EQ(1U, stats3.discarded_count());
+  ASSERT_EQ(stats2.index_size(), stats3.index_size());
+  ASSERT_EQ(0U, stats3.dumped_size());
+  ASSERT_EQ(check_point + 1, stats3.check_point());
+  auto create_time3 = stats3.create_time();
+  auto update_time3 = stats3.update_time();
+  ASSERT_EQ(create_time3, create_time1);
+  ASSERT_GT(update_time3, update_time2);
+
+  auto dpath = dir_ + "dumpIndex";
+  auto dumper = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(dumper, nullptr);
+  ASSERT_EQ(0, dumper->create(dpath));
+  ASSERT_EQ(0, streamer->dump(dumper));
+  ASSERT_EQ(0, dumper->close());
+  size_t doc_cnt = stats3.loaded_count() + stats3.added_count();
+  struct stat st;
+  ASSERT_EQ(3001UL, doc_cnt);
+  ASSERT_EQ(0, stat(dpath.c_str(), &st));
+  ASSERT_LT(st.st_size - stats3.dumped_size(), 8192);
+
+  streamer->close();
+}
+
+TEST_F(HnswStreamerTest, TestCheckDuplicateAndGetVector) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestCheckDuplicateAndGetVec", true));
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  params.set(PARAM_HNSW_STREAMER_FILTER_SAME_KEY, true);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  auto ctx = streamer->create_context();
+  ASSERT_NE(nullptr, ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < 1000; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_EQ(0, streamer->add_impl(i, vec.data(), qmeta, ctx));
+  }
+  for (size_t i = 0; i < 1000; i += 10) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    ASSERT_EQ(IndexError_Duplicate,
+              streamer->add_impl(i, vec.data(), qmeta, ctx));
+  }
+  auto provider = streamer->create_provider();
+  for (size_t i = 0; i < 1000; i++) {
+    const float *data = (const float *)provider->get_vector(i);
+    ASSERT_NE(data, nullptr);
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_FLOAT_EQ(i, data[j]);
+    }
+  }
+
+  streamer->flush(0UL);
+  streamer.reset();
+}
+
+class TestDumper : public IndexDumper {
+  int init(const ailego::Params &) override {
+    return 0;
+  }
+  int cleanup() override {
+    return 0;
+  }
+  int create(const std::string &path) override {
+    return 0;
+  }
+  uint32_t magic() const override {
+    return 0;
+  }
+  int close() override {
+    return 0;
+  }
+  int append(const std::string &id, size_t data_size, size_t padding_size,
+             uint32_t crc) override {
+    usleep(100000);
+    return 0;
+  }
+  size_t write(const void *data, size_t len) override {
+    return len;
+  }
+};
+
+TEST_F(HnswStreamerTest, TestDumpIndexAndAdd) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestDumpIndexAndAdd", true));
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  auto ctx = streamer->create_context();
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  ASSERT_NE(nullptr, ctx);
+  int code = 0;
+  std::atomic<bool> async_started{false};
+  auto add_vector = [&](int a, int b, bool signal_start) {
+    int success = 0;
+    if (signal_start) {
+      async_started.store(true, std::memory_order_release);
+    }
+    for (int i = a; i < b; i++) {
+      for (size_t j = 0; j < dim; ++j) {
+        vec[j] = i;
+      }
+      int ret = streamer->add_impl(i, vec.data(), qmeta, ctx);
+      if (ret != 0) {
+        code = ret;
+        ASSERT_EQ(IndexError_Unsupported, code);
+        i = i - 1;  // retry
+        usleep(10000);
+      } else {
+        success++;
+      }
+    }
+    std::cout << "addVector: " << success << " success" << std::endl;
+  };
+  add_vector(0, 2000, false);
+  auto t2 = std::async(std::launch::async, add_vector, 2000, 3000, true);
+  auto path1 = dir_ + "dumpIndex1";
+  auto dumper1 = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(dumper1, nullptr);
+  ASSERT_EQ(0, dumper1->create(path1));
+  while (!async_started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  auto test_dumper = std::make_shared<TestDumper>();
+  ASSERT_EQ(0, streamer->dump(test_dumper));
+  ASSERT_EQ(0, streamer->dump(dumper1));
+  ASSERT_EQ(0, dumper1->close());
+  t2.get();
+  streamer->close();
+  ASSERT_TRUE(code == IndexError_Unsupported || code == 0);
+
+  // check dump index
+  IndexStreamer::Pointer read_streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(read_streamer, nullptr);
+  ASSERT_EQ(0, read_streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, read_streamer->open(storage));
+  auto iter = read_streamer->create_provider()->create_iterator();
+  size_t docs = 0;
+  while (iter->is_valid()) {
+    auto key = iter->key();
+    const float *d = reinterpret_cast<const float *>(iter->data());
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_FLOAT_EQ(d[j], key);
+    }
+    docs++;
+    iter->next();
+  }
+  ASSERT_GE(docs, 2000U);
+
+  // check streamer
+  ASSERT_EQ(0, streamer->open(storage));
+  iter = streamer->create_provider()->create_iterator();
+  docs = 0;
+  while (iter->is_valid()) {
+    auto key = iter->key();
+    const float *d = reinterpret_cast<const float *>(iter->data());
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_FLOAT_EQ(d[j], key);
+    }
+    docs++;
+    iter->next();
+  }
+  ASSERT_EQ(docs, 3000U);
+}
+
+
+TEST_F(HnswStreamerTest, TestProvider) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestGetVector", true));
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+  auto ctx = streamer->create_context();
+  ASSERT_NE(nullptr, ctx);
+
+  //! prepare data
+  size_t docs = 10000UL;
+  srand(ailego::Realtime::MilliSeconds());
+  std::vector<key_t> keys(docs);
+  bool rand_key = rand() % 2;
+  bool rand_order = rand() % 2;
+  size_t step = rand() % 2 + 1;
+  LOG_DEBUG("randKey=%u randOrder=%u step=%zu", rand_key, rand_order, step);
+  if (rand_key) {
+    std::mt19937 mt;
+    std::uniform_int_distribution<size_t> dt(
+        0, std::numeric_limits<size_t>::max());
+    for (size_t i = 0; i < docs; ++i) {
+      keys[i] = dt(mt);
+    }
+  } else {
+    std::iota(keys.begin(), keys.end(), 0U);
+    std::transform(keys.begin(), keys.end(), keys.begin(),
+                   [&](key_t k) { return step * k; });
+    if (rand_order) {
+      uint32_t seed = ailego::Realtime::Seconds();
+      std::shuffle(keys.begin(), keys.end(), std::default_random_engine(seed));
+    }
+  }
+  NumericalVector<float> vec(dim);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < keys.size(); i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = keys[i];
+    }
+    streamer->add_impl(keys[i], vec.data(), qmeta, ctx);
+  }
+
+  auto path1 = dir_ + "TestGetVector1";
+  auto dumper1 = IndexFactory::CreateDumper("FileDumper");
+  ASSERT_NE(dumper1, nullptr);
+  ASSERT_EQ(0, dumper1->create(path1));
+  ASSERT_EQ(0, streamer->dump(dumper1));
+  ASSERT_EQ(0, dumper1->close());
+  streamer->close();
+
+  // check dump index
+  IndexStreamer::Pointer read_streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(read_streamer, nullptr);
+  ASSERT_EQ(0, read_streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, read_streamer->open(storage));
+  auto iter = read_streamer->create_provider()->create_iterator();
+  size_t cnt = 0;
+  while (iter->is_valid()) {
+    auto key = iter->key();
+    const float *d = reinterpret_cast<const float *>(iter->data());
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_FLOAT_EQ(d[j], key);
+    }
+    cnt++;
+    iter->next();
+  }
+  ASSERT_EQ(cnt, docs);
+
+  // check streamer
+  ASSERT_EQ(0, streamer->open(storage));
+  iter = streamer->create_provider()->create_iterator();
+  cnt = 0;
+  while (iter->is_valid()) {
+    auto key = iter->key();
+    const float *d = reinterpret_cast<const float *>(iter->data());
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_FLOAT_EQ(d[j], key);
+    }
+    cnt++;
+    iter->next();
+  }
+  ASSERT_EQ(cnt, docs);
+}
+
+TEST_F(HnswStreamerTest, TestSharedContext) {
+  auto create_streamer = [](std::string path) {
+    IndexStreamer::Pointer streamer =
+        IndexFactory::CreateStreamer("HnswStreamer");
+    auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+    ailego::Params stg_params;
+    storage->init(stg_params);
+    storage->open(path, true);
+    ailego::Params params;
+    streamer->init(*index_meta_ptr_, params);
+    streamer->open(storage);
+    return streamer;
+  };
+  auto streamer1 = create_streamer(dir_ + "TestSharedContext.index1");
+  auto streamer2 = create_streamer(dir_ + "TestSharedContext.index2");
+  auto streamer3 = create_streamer(dir_ + "TestSharedContext.index3");
+
+  srand(ailego::Realtime::MilliSeconds());
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  auto do_test = [&](int start) {
+    auto code = rand() % 3;
+    IndexStreamer::Context::Pointer ctx;
+    switch (code) {
+      case 0:
+        ctx = streamer1->create_context();
+        break;
+      case 1:
+        ctx = streamer2->create_context();
+        break;
+      case 2:
+        ctx = streamer3->create_context();
+        break;
+    };
+    ctx->set_topk(1);
+    uint64_t key1 = start + 0;
+    uint64_t key2 = start + 1;
+    uint64_t key3 = start + 2;
+    NumericalVector<float> query(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      query[j] = 0.1f;
+    }
+    for (int i = 0; i < 1000; ++i) {
+      NumericalVector<float> vec(dim);
+      for (size_t j = 0; j < dim; ++j) {
+        vec[j] = rand();
+      }
+      int ret = 0;
+      auto code = rand() % 3;
+      switch (code) {
+        case 0:
+          streamer1->add_impl(key1, vec.data(), qmeta, ctx);
+          key1 += 3;
+          ret = streamer1->search_impl(query.data(), qmeta, ctx);
+          break;
+        case 1:
+          streamer2->add_impl(key2, vec.data(), qmeta, ctx);
+          key2 += 3;
+          streamer2->add_impl(key2, vec.data(), qmeta, ctx);
+          key2 += 3;
+          ret = streamer2->search_impl(query.data(), qmeta, ctx);
+          break;
+        case 2:
+          streamer3->add_impl(key3, vec.data(), qmeta, ctx);
+          key3 += 3;
+          streamer3->add_impl(key3, vec.data(), qmeta, ctx);
+          key3 += 3;
+          streamer3->add_impl(key3, vec.data(), qmeta, ctx);
+          key3 += 3;
+          ret = streamer3->search_impl(query.data(), qmeta, ctx);
+          break;
+      }
+      EXPECT_EQ(0, ret);
+      auto &results = ctx->result();
+      EXPECT_EQ(1, results.size());
+      EXPECT_EQ(code, results[0].key() % 3);
+    }
+  };
+
+  auto t1 = std::async(std::launch::async, do_test, 0);
+  auto t2 = std::async(std::launch::async, do_test, 30000000);
+  t1.wait();
+  t2.wait();
+}
+
+TEST_F(HnswStreamerTest, TestMipsEuclideanMetric) {
+  constexpr size_t static dim = 32;
+  std::srand(ailego::Realtime::MilliSeconds());
+  // int injection_type = rand() % 2;
+  int injection_type = 0;
+
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim);
+  ailego::Params params;
+  params.set("proxima.mips_euclidean.metric.injection_type", injection_type);
+  meta.set_metric("MipsSquaredEuclidean", 0, params);
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestMipsSquaredEuclidean", true));
+  const size_t COUNT = 10000;
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  {
+    IndexStreamer::Pointer streamer =
+        IndexFactory::CreateStreamer("HnswStreamer");
+    ASSERT_TRUE(streamer != nullptr);
+    ASSERT_EQ(0, streamer->init(meta, params));
+    ASSERT_EQ(0, streamer->open(storage));
+    const auto &metric_params = streamer->meta().metric_params();
+    EXPECT_FLOAT_EQ(0.0, metric_params.get_as_float(
+                             "proxima.mips_euclidean.metric.max_l2_norm"));
+    auto ctx = streamer->create_context();
+    for (size_t i = COUNT; i < 2 * COUNT; i++) {
+      std::vector<float> vec(dim);
+      for (size_t d = 0; d < dim; ++d) {
+        vec[d] = i;
+      }
+      ASSERT_EQ(0, streamer->add_impl(i, vec.data(), qmeta, ctx));
+    }
+    ASSERT_EQ(0, streamer->flush(0UL));
+    ASSERT_EQ(0, streamer->close());
+  }
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+  ASSERT_EQ(0, streamer->init(meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+  const auto &metric_params = streamer->meta().metric_params();
+  // NoTrain for LocalizedSpherical (type == 1), so max_l2_norm equals to 0
+  EXPECT_FLOAT_EQ(
+      injection_type == 0 ? 0.0f : 113131.0f,
+      metric_params.get_as_float("proxima.mips_euclidean.metric.max_l2_norm"));
+  auto ctx = streamer->create_context();
+  for (size_t i = 0; i < COUNT; i++) {
+    std::vector<float> vec(dim);
+    for (size_t d = 0; d < dim; ++d) {
+      vec[d] = i;
+    }
+    ASSERT_EQ(0, streamer->add_impl(i, vec.data(), qmeta, ctx));
+  }
+  std::vector<float> vec(dim);
+  for (size_t d = 0; d < dim; ++d) {
+    vec[d] = 1.0;
+  }
+
+  ctx->set_topk(10);
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  const auto &results = ctx->result();
+  EXPECT_EQ(results.size(), 10);
+  EXPECT_NEAR((uint64_t)(2 * COUNT - 1), results[0].key(), 10);
+}
+
+TEST_F(HnswStreamerTest, TestBruteForceSetupInContext) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0,
+            storage->open(dir_ + "TestBruteForceSetupInContext.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 5000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  size_t topk = 200;
+  [[maybe_unused]] uint64_t knn_total_time = 0;
+  [[maybe_unused]] uint64_t linear_total_time = 0;
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+
+  bool set_bf_threshold = false;
+  bool use_update = false;
+
+  for (size_t i = 0; i < cnt; i++) {
+    auto linear_ctx = streamer->create_context();
+    auto knn_ctx = streamer->create_context();
+
+    ASSERT_TRUE(!!linear_ctx);
+    ASSERT_TRUE(!!linear_ctx);
+
+    linear_ctx->set_topk(topk);
+    knn_ctx->set_topk(topk);
+
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    auto t1 = ailego::Realtime::MicroSeconds();
+
+    if (set_bf_threshold) {
+      if (use_update) {
+        ailego::Params streamer_params_extra;
+
+        streamer_params_extra.set("proxima.hnsw.streamer.brute_force_threshold",
+                                  cnt);
+        knn_ctx->update(streamer_params_extra);
+      } else {
+        knn_ctx->set_bruteforce_threshold(cnt);
+      }
+
+      use_update = !use_update;
+    }
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+
+    auto t2 = ailego::Realtime::MicroSeconds();
+
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+
+    // auto t3 = ailego::Realtime::MicroSeconds();
+
+    if (set_bf_threshold) {
+      linear_total_time += t2 - t1;
+    } else {
+      knn_total_time += t2 - t1;
+    }
+
+    set_bf_threshold = !set_bf_threshold;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / cnt;
+  // float cost = linearTotalTime * 1.0f / knnTotalTime;
+#if 0
+    printf("knnTotalTime=%zd linearTotalTime=%zd totalHits=%d totalCnts=%d "
+           "R@%zd=%f R@1=%f cost=%f\n",
+           knnTotalTime, linearTotalTime, totalHits, totalCnts, topk, recall,
+           topk1Recall, cost);
+#endif
+  EXPECT_GT(recall, 0.90f);
+  EXPECT_GT(topk1_recall, 0.95f);
+  // EXPECT_GT(cost, 2.0f);
+}
+
+TEST_F(HnswStreamerTest, TestKnnSearchCosine) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 50);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP32, dim);
+  index_meta_raw.set_metric("Cosine", 0, ailego::Params());
+
+  ailego::Params converter_params;
+  auto converter = IndexFactory::CreateConverter("CosineFp32Converter");
+  ASSERT_TRUE(converter != nullptr);
+
+  converter->init(index_meta_raw, converter_params);
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_TRUE(reformer != nullptr);
+
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestKnnSearchCosine.index", true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 4000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  float fixed_value = float(cnt) / 2;
+  for (size_t i = 0; i < cnt; i++) {
+    float add_on = i * 10;
+
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_vec;
+    IndexQueryMeta new_meta;
+
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+  }
+
+  size_t query_cnt = 200U;
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  [[maybe_unused]] uint64_t knn_total_time = 0;
+  [[maybe_unused]] uint64_t linear_total_time = 0;
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+
+
+  for (size_t i = 0; i < query_cnt; i++) {
+    float add_on = i * 10;
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_query;
+    IndexQueryMeta new_meta;
+    ASSERT_EQ(0, reformer->transform(vec.data(), qmeta, &new_query, &new_meta));
+
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0,
+              streamer->search_bf_impl(new_query.data(), new_meta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    // On platforms without SIMD (e.g., RISC-V), scalar FP rounding
+    // differences may cause adjacent vectors with near-identical cosine
+    // distances to swap in ranking. Allow top-1 to be within +/-1.
+    EXPECT_LE(std::abs(static_cast<int64_t>(linear_result[0].key()) -
+                       static_cast<int64_t>(i)),
+              1);
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 1.0f / query_cnt;
+  // float cost = linearTotalTime * 1.0f / knnTotalTime;
+#if 0
+    printf("knnTotalTime=%zd linearTotalTime=%zd totalHits=%d totalCnts=%d "
+           "R@%zd=%f R@1=%f cost=%f\n",
+           knnTotalTime, linearTotalTime, totalHits, totalCnts, topk, recall,
+           topk1Recall, cost);
+#endif
+  EXPECT_GT(recall, 0.90f);
+  EXPECT_GT(topk1_recall, 0.90f);
+  // EXPECT_GT(cost, 2.0f);
+}
+
+TEST_F(HnswStreamerTest, TestFetchVector) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+  ailego::Params stg_params;
+
+  IndexMeta index_meta(IndexMeta::DataType::DT_FP32, dim);
+  index_meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestFetchVector.index", true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 2000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  for (size_t i = 0; i < cnt; i++) {
+    const void *vector = streamer->get_vector(i);
+    ASSERT_NE(vector, nullptr);
+
+    float vector_value = *(float *)(vector);
+    ASSERT_FLOAT_EQ(vector_value, i);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  knn_ctx->set_fetch_vector(true);
+
+  size_t query_cnt = 200U;
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  uint64_t knn_total_time = 0;
+  uint64_t linear_total_time = 0;
+  for (size_t i = 0; i < query_cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    ASSERT_NE(knn_result[0].vector(), nullptr);
+    float vector_value = *((float *)(knn_result[0].vector()));
+    ASSERT_FLOAT_EQ(vector_value, i);
+  }
+  std::cout << "knnTotalTime: " << knn_total_time << std::endl;
+  std::cout << "linearTotalTime: " << linear_total_time << std::endl;
+}
+
+TEST_F(HnswStreamerTest, TestFetchVectorCosine) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 50);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+  ailego::Params stg_params;
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP32, dim);
+  index_meta_raw.set_metric("Cosine", 0, ailego::Params());
+
+  ailego::Params converter_params;
+  auto converter = IndexFactory::CreateConverter("CosineFp32Converter");
+  ASSERT_TRUE(converter != nullptr);
+
+  converter->init(index_meta_raw, converter_params);
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_TRUE(reformer != nullptr);
+
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestFetchVectorCosine.index", true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 2000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  IndexQueryMeta new_meta;
+
+  const float epsilon = 1e-2;
+  float fixed_value = float(cnt) / 2;
+  for (size_t i = 0; i < cnt; i++) {
+    float add_on = i * 10;
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_vec;
+
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+  }
+
+  for (size_t i = 0; i < cnt; i++) {
+    float add_on = i * 10;
+
+    const void *vector = streamer->get_vector(i);
+    ASSERT_NE(vector, nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(vector, new_meta, &denormalized_vec);
+
+    float vector_value = *((float *)(denormalized_vec.data()) + dim - 1);
+    EXPECT_NEAR(vector_value, fixed_value + add_on, epsilon);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  linear_ctx->set_fetch_vector(true);
+  knn_ctx->set_fetch_vector(true);
+
+  size_t query_cnt = 200U;
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  uint64_t knn_total_time = 0;
+  uint64_t linear_total_time = 0;
+  for (size_t i = 0; i < query_cnt; i++) {
+    float add_on = i * 10;
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_query;
+    IndexQueryMeta new_meta;
+    ASSERT_EQ(0, reformer->transform(vec.data(), qmeta, &new_query, &new_meta));
+
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0,
+              streamer->search_bf_impl(new_query.data(), new_meta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    // On platforms without SIMD (e.g., RISC-V), scalar FP rounding
+    // differences may cause adjacent vectors with near-identical cosine
+    // distances to swap in ranking. Allow top-1 to be within +/-1.
+    EXPECT_LE(std::abs(static_cast<int64_t>(linear_result[0].key()) -
+                       static_cast<int64_t>(i)),
+              1);
+
+    ASSERT_NE(knn_result[0].vector(), nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(linear_result[0].vector(), new_meta, &denormalized_vec);
+
+    float expected_add_on = linear_result[0].key() * 10;
+    float vector_value = *(((float *)(denormalized_vec.data()) + dim - 1));
+    EXPECT_NEAR(vector_value, fixed_value + expected_add_on, epsilon);
+  }
+  std::cout << "knnTotalTime: " << knn_total_time << std::endl;
+  std::cout << "linearTotalTime: " << linear_total_time << std::endl;
+}
+
+TEST_F(HnswStreamerTest, TestFetchVectorCosineHalfFloatConverter) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 50);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+  ailego::Params stg_params;
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP16, dim);
+  index_meta_raw.set_metric("Cosine", 0, ailego::Params());
+
+  ailego::Params converter_params;
+  auto converter = IndexFactory::CreateConverter("CosineHalfFloatConverter");
+  ASSERT_TRUE(converter != nullptr);
+
+  converter->init(index_meta_raw, converter_params);
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_TRUE(reformer != nullptr);
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(
+      0, storage->open(dir_ + "TestFetchVectorCosineHalfFloatConverter.index",
+                       true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t cnt = 2000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP16, dim);
+  IndexQueryMeta new_meta;
+
+  const float epsilon = 0.1;
+
+  std::random_device rd;
+  std::mt19937 gen(rd());
+
+  std::uniform_real_distribution<float> dist(-2.0, 2.0);
+
+  std::vector<NumericalVector<uint16_t>> vecs;
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<uint16_t> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = ailego::FloatHelper::ToFP16(dist(gen));
+    }
+
+    std::string new_vec;
+
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+
+    vecs.push_back(vec);
+  }
+
+  for (size_t i = 0; i < cnt; i++) {
+    uint16_t expected_vec_value = vecs[i][dim - 1];
+
+    const void *vector = streamer->get_vector(i);
+    ASSERT_NE(vector, nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(uint16_t));
+    reformer->revert(vector, new_meta, &denormalized_vec);
+
+    uint16_t vector_value = *((uint16_t *)(denormalized_vec.data()) + dim - 1);
+    float vector_value_float = ailego::FloatHelper::ToFP32(vector_value);
+
+    float expected_vec_float = ailego::FloatHelper::ToFP32(expected_vec_value);
+
+    EXPECT_NEAR(expected_vec_float, vector_value_float, epsilon);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  linear_ctx->set_fetch_vector(true);
+  knn_ctx->set_fetch_vector(true);
+
+  size_t query_cnt = 200U;
+  size_t topk = 30;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  uint64_t knn_total_time = 0;
+  uint64_t linear_total_time = 0;
+
+  for (size_t i = 0; i < query_cnt; i++) {
+    auto &vec = vecs[i];
+
+    std::string new_query;
+    IndexQueryMeta new_meta;
+    ASSERT_EQ(0, reformer->transform(vec.data(), qmeta, &new_query, &new_meta));
+
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0,
+              streamer->search_bf_impl(new_query.data(), new_meta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    ASSERT_NE(knn_result[0].vector(), nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(uint16_t));
+    reformer->revert(linear_result[0].vector(), new_meta, &denormalized_vec);
+
+    uint16_t expected_vec_value = vec[dim - 1];
+    uint16_t vector_value =
+        *(((uint16_t *)(denormalized_vec.data()) + dim - 1));
+
+    float vector_value_float = ailego::FloatHelper::ToFP32(vector_value);
+    float expected_vec_float = ailego::FloatHelper::ToFP32(expected_vec_value);
+
+    EXPECT_NEAR(expected_vec_float, vector_value_float, epsilon);
+  }
+
+  std::cout << "knnTotalTime: " << knn_total_time << std::endl;
+  std::cout << "linearTotalTime: " << linear_total_time << std::endl;
+}
+
+TEST_F(HnswStreamerTest, TestFetchVectorCosineFp16Converter) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 50);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+  ailego::Params stg_params;
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP32, dim);
+  index_meta_raw.set_metric("Cosine", 0, ailego::Params());
+
+  ailego::Params converter_params;
+  auto converter = IndexFactory::CreateConverter("CosineFp16Converter");
+  ASSERT_TRUE(converter != nullptr);
+
+  converter->init(index_meta_raw, converter_params);
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_TRUE(reformer != nullptr);
+
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestFetchVectorCosineFp16Converter.index",
+                             true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t cnt = 2000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  IndexQueryMeta new_meta;
+
+  const float epsilon = 0.1;
+
+  std::random_device rd;
+  std::mt19937 gen(rd());
+
+  std::uniform_real_distribution<float> dist(-2.0, 2.0);
+
+  std::vector<NumericalVector<float>> vecs;
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = dist(gen);
+    }
+
+    std::string new_vec;
+
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+
+    vecs.push_back(vec);
+  }
+
+  for (size_t i = 0; i < cnt; i++) {
+    float expected_vec_value = vecs[i][dim - 1];
+
+    const void *vector = streamer->get_vector(i);
+
+
+    ASSERT_NE(vector, nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(vector, new_meta, &denormalized_vec);
+    float vector_value = *((float *)(denormalized_vec.data()) + dim - 1);
+
+    EXPECT_NEAR(expected_vec_value, vector_value, epsilon);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  linear_ctx->set_fetch_vector(true);
+  knn_ctx->set_fetch_vector(true);
+
+  size_t query_cnt = 200U;
+  size_t topk = 30;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  uint64_t knn_total_time = 0;
+  uint64_t linear_total_time = 0;
+
+  for (size_t i = 0; i < query_cnt; i++) {
+    auto &vec = vecs[i];
+
+    std::string new_query;
+    IndexQueryMeta new_meta;
+    ASSERT_EQ(0, reformer->transform(vec.data(), qmeta, &new_query, &new_meta));
+
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0,
+              streamer->search_bf_impl(new_query.data(), new_meta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    ASSERT_NE(knn_result[0].vector(), nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(linear_result[0].vector(), new_meta, &denormalized_vec);
+
+    float expected_vec_value = vec[dim - 1];
+    float vector_value = *(((float *)(denormalized_vec.data()) + dim - 1));
+
+    EXPECT_NEAR(expected_vec_value, vector_value, epsilon);
+  }
+
+  std::cout << "knnTotalTime: " << knn_total_time << std::endl;
+  std::cout << "linearTotalTime: " << linear_total_time << std::endl;
+}
+
+TEST_F(HnswStreamerTest, TestFetchVectorCosineInt8Converter) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 50);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+  ailego::Params stg_params;
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP32, dim);
+  index_meta_raw.set_metric("Cosine", 0, ailego::Params());
+
+  ailego::Params converter_params;
+  auto converter = IndexFactory::CreateConverter("CosineInt8Converter");
+  ASSERT_TRUE(converter != nullptr);
+
+  converter->init(index_meta_raw, converter_params);
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_TRUE(reformer != nullptr);
+
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestFetchVectorCosineInt8Converter.index",
+                             true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 2000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  IndexQueryMeta new_meta;
+
+  const float epsilon = 1e-2;
+  float fixed_value = float(cnt) / 2;
+  for (size_t i = 0; i < cnt; i++) {
+    float add_on = i * 10;
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < 3 * dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_vec;
+
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+  }
+
+  for (size_t i = 0; i < cnt; i++) {
+    float add_on = i * 10;
+
+    const void *vector = streamer->get_vector(i);
+    ASSERT_NE(vector, nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(vector, new_meta, &denormalized_vec);
+
+    float vector_value = *((float *)(denormalized_vec.data()) + dim - 1);
+    EXPECT_NEAR(vector_value, fixed_value + add_on, epsilon);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  linear_ctx->set_fetch_vector(true);
+  auto knn_ctx = streamer->create_context();
+  knn_ctx->set_fetch_vector(true);
+
+  size_t query_cnt = 200U;
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  uint64_t knn_total_time = 0;
+  uint64_t linear_total_time = 0;
+  for (size_t i = 0; i < query_cnt; i++) {
+    float add_on = i * 10;
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < 3 * dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_query;
+    IndexQueryMeta new_meta;
+    ASSERT_EQ(0, reformer->transform(vec.data(), qmeta, &new_query, &new_meta));
+
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0,
+              streamer->search_bf_impl(new_query.data(), new_meta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    ASSERT_NE(knn_result[0].vector(), nullptr);
+    ASSERT_NE(linear_result[0].vector(), nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(linear_result[0].vector(), new_meta, &denormalized_vec);
+
+    float vector_value = *(((float *)(denormalized_vec.data()) + dim - 1));
+    EXPECT_NEAR(vector_value, fixed_value + add_on, epsilon);
+  }
+
+  std::cout << "knnTotalTime: " << knn_total_time << std::endl;
+  std::cout << "linearTotalTime: " << linear_total_time << std::endl;
+}
+
+TEST_F(HnswStreamerTest, TestFetchVectorCosineInt4Converter) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 50);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+  ailego::Params stg_params;
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP32, dim);
+  index_meta_raw.set_metric("Cosine", 0, ailego::Params());
+
+  ailego::Params converter_params;
+  auto converter = IndexFactory::CreateConverter("CosineInt4Converter");
+  ASSERT_TRUE(converter != nullptr);
+
+  converter->init(index_meta_raw, converter_params);
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_TRUE(reformer != nullptr);
+
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestFetchVectorCosineInt4Converter.index",
+                             true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 2000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  IndexQueryMeta new_meta;
+
+  const float epsilon = 1e-2;
+  float fixed_value = float(cnt) / 2;
+  for (size_t i = 0; i < cnt; i++) {
+    float add_on = i * 10;
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_vec;
+
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+  }
+
+  for (size_t i = 0; i < cnt; i++) {
+    float add_on = i * 10;
+
+    const void *vector = streamer->get_vector(i);
+    ASSERT_NE(vector, nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(vector, new_meta, &denormalized_vec);
+
+    float vector_value = *((float *)(denormalized_vec.data()) + dim - 1);
+    EXPECT_NEAR(vector_value, fixed_value + add_on, epsilon);
+  }
+
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  linear_ctx->set_fetch_vector(true);
+  knn_ctx->set_fetch_vector(true);
+
+  size_t query_cnt = 100U;
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  uint64_t knn_total_time = 0;
+  uint64_t linear_total_time = 0;
+  for (size_t i = 0; i < query_cnt; i++) {
+    float add_on = i * 10;
+    for (size_t j = 0; j < dim; ++j) {
+      if (j < dim / 4)
+        vec[j] = fixed_value;
+      else
+        vec[j] = fixed_value + add_on;
+    }
+
+    std::string new_query;
+    IndexQueryMeta new_meta;
+    ASSERT_EQ(0, reformer->transform(vec.data(), qmeta, &new_query, &new_meta));
+
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0,
+              streamer->search_bf_impl(new_query.data(), new_meta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    ASSERT_NE(knn_result[0].vector(), nullptr);
+
+    std::string denormalized_vec;
+    denormalized_vec.resize(dim * sizeof(float));
+    reformer->revert(linear_result[0].vector(), new_meta, &denormalized_vec);
+
+    float vector_value = *(((float *)(denormalized_vec.data()) + dim - 1));
+    EXPECT_NEAR(vector_value, fixed_value + add_on, epsilon);
+  }
+
+  std::cout << "knnTotalTime: " << knn_total_time << std::endl;
+  std::cout << "linearTotalTime: " << linear_total_time << std::endl;
+}
+
+TEST_F(HnswStreamerTest, TestRnnSearch) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  // params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+
+  IndexMeta index_meta(IndexMeta::DataType::DT_FP32, dim);
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestRnnSearchInnerProduct.index", true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t cnt = 1000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+
+    ASSERT_EQ(0, streamer->add_impl(i, vec.data(), qmeta, ctx));
+  }
+
+  NumericalVector<float> vec(dim);
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = 1.0;
+  }
+
+  size_t topk = 50;
+  ctx->set_topk(topk);
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  auto &results = ctx->result();
+  ASSERT_EQ(topk, results.size());
+
+  float radius = results[topk / 2].score();
+  ctx->set_threshold(radius);
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  ASSERT_GT(topk, results.size());
+  for (size_t k = 0; k < results.size(); ++k) {
+    ASSERT_GE(radius, results[k].score());
+  }
+
+  // Test Reset Threshold
+  ctx->reset_threshold();
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  ASSERT_EQ(topk, results.size());
+  ASSERT_LT(radius, results[topk - 1].score());
+}
+
+TEST_F(HnswStreamerTest, TestRnnSearchInnerProduct) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 50);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  // params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+
+  IndexMeta index_meta(IndexMeta::DataType::DT_FP32, dim);
+  index_meta.set_metric("InnerProduct", 0, ailego::Params());
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestRnnSearchInnerProduct.index", true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t cnt = 1000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+
+    ASSERT_EQ(0, streamer->add_impl(i, vec.data(), qmeta, ctx));
+  }
+
+  NumericalVector<float> vec(dim);
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = 1.0;
+  }
+
+  size_t topk = 50;
+  ctx->set_topk(topk);
+
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  auto &results = ctx->result();
+  ASSERT_EQ(topk, results.size());
+
+  float radius = -results[topk / 2].score();
+  ctx->set_threshold(radius);
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  ASSERT_GT(topk, results.size());
+  for (size_t k = 0; k < results.size(); ++k) {
+    ASSERT_GE(radius, results[k].score());
+  }
+
+  // Test Reset Threshold
+  ctx->reset_threshold();
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  ASSERT_EQ(topk, results.size());
+  ASSERT_LT(-radius, results[topk - 1].score());
+}
+
+TEST_F(HnswStreamerTest, TestRnnSearchCosine) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  // params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP32, dim);
+  index_meta_raw.set_metric("Cosine", 0, ailego::Params());
+
+  ailego::Params converter_params;
+  auto converter = IndexFactory::CreateConverter("CosineFp32Converter");
+  ASSERT_TRUE(converter != nullptr);
+
+  converter->init(index_meta_raw, converter_params);
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_TRUE(reformer != nullptr);
+
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestRnnSearchCosine.index", true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  size_t cnt = 1000U;
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  std::random_device rd;
+  std::mt19937 gen(rd());
+
+  std::uniform_real_distribution<float> dist(-1.0, 1.0);
+
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = dist(gen);
+    }
+
+    std::string new_vec;
+    IndexQueryMeta new_meta;
+
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+  }
+
+  size_t topk = 50;
+  ctx->set_topk(topk);
+
+  NumericalVector<float> vec(dim);
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = 1.0;
+  }
+
+  std::string new_query;
+  IndexQueryMeta new_meta;
+  ASSERT_EQ(0, reformer->transform(vec.data(), qmeta, &new_query, &new_meta));
+
+  ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, ctx));
+  auto &results = ctx->result();
+  ASSERT_EQ(topk, results.size());
+
+  float radius = 0.5f;
+  ctx->set_threshold(radius);
+  ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, ctx));
+  ASSERT_GT(topk, results.size());
+  for (size_t k = 0; k < results.size(); ++k) {
+    ASSERT_GE(radius, results[k].score());
+  }
+
+  // Test Reset Threshold
+  ctx->reset_threshold();
+  ASSERT_EQ(0, streamer->search_impl(new_query.data(), new_meta, ctx));
+  ASSERT_EQ(topk, results.size());
+  ASSERT_LT(radius, results[topk - 1].score());
+}
+
+TEST_F(HnswStreamerTest, TestGroup) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestGroup.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  size_t cnt = 5000U;
+  NumericalVector<float> vec(dim);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i / 10.0;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  size_t group_topk = 20;
+  uint64_t total_time = 0;
+
+  auto groupby_func = [](uint64_t key) {
+    uint32_t group_id = key / 10 % 10;
+    // std::cout << "key: " << key << ", group id: " << group_id << std::endl;
+    return std::string("g_") + std::to_string(group_id);
+  };
+
+  size_t group_num = 5;
+
+  ctx->set_group_params(group_num, group_topk);
+  ctx->set_group_by(groupby_func);
+
+  size_t query_value = cnt / 2;
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = float(query_value) / 10 + 0.1f;
+  }
+
+  auto t1 = ailego::Realtime::MicroSeconds();
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  auto t2 = ailego::Realtime::MicroSeconds();
+
+  total_time += t2 - t1;
+  std::cout << "Total time: " << total_time << std::endl;
+
+  auto &group_result = ctx->group_result();
+  ASSERT_EQ(group_result.size(), group_num);
+
+  for (uint32_t i = 0; i < group_result.size(); ++i) {
+    auto &result = group_result[i].docs();
+
+    ASSERT_GT(result.size(), 0);
+
+    // const std::string &group_id = group_result[i].group_id();
+    // std::cout << "Group ID: " << group_id << std::endl;
+
+    // for (uint32_t j = 0; j < result.size(); ++j) {
+    //   std::cout << "\tKey: " << result[j].key() << std::fixed
+    //             << std::setprecision(3) << ", Score: " << result[j].score()
+    //             << std::endl;
+    // }
+  }
+
+  // do linear search by p_keys test
+  auto groupby_func_linear = [](uint64_t key) {
+    uint32_t group_id = key % 10;
+
+    return std::string("g_") + std::to_string(group_id);
+  };
+
+  auto linear_pk_ctx = streamer->create_context();
+
+  linear_pk_ctx->set_group_params(group_num, group_topk);
+  linear_pk_ctx->set_group_by(groupby_func_linear);
+
+  std::vector<std::vector<uint64_t>> p_keys;
+  p_keys.resize(1);
+  p_keys[0] = {4, 3, 2, 1, 5, 6, 7, 8, 9, 10};
+
+  ASSERT_EQ(0, streamer->search_bf_by_p_keys_impl(vec.data(), p_keys, qmeta,
+                                                  linear_pk_ctx));
+  auto &linear_by_pkeys_group_result = linear_pk_ctx->group_result();
+  ASSERT_EQ(linear_by_pkeys_group_result.size(), group_num);
+
+  for (uint32_t i = 0; i < linear_by_pkeys_group_result.size(); ++i) {
+    auto &result = linear_by_pkeys_group_result[i].docs();
+
+    ASSERT_GT(result.size(), 0);
+
+    // const std::string &group_id = linear_by_pkeys_group_result[i].group_id();
+    //  std::cout << "Group ID: " << group_id << std::endl;
+
+    // for (uint32_t j = 0; j < result.size(); ++j) {
+    //   std::cout << "\tKey: " << result[j].key() << std::fixed
+    //             << std::setprecision(3) << ", Score: " << result[j].score()
+    //             << std::endl;
+    // }
+
+    ASSERT_EQ(10 - i, result[0].key());
+  }
+}
+
+TEST_F(HnswStreamerTest, TestGroupNotEnoughNum) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestGroupNotEnoughNum.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  size_t cnt = 5000U;
+  NumericalVector<float> vec(dim);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i / 10.0;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  size_t group_topk = 20;
+  uint64_t total_time = 0;
+
+  auto groupby_func = [](uint64_t key) {
+    uint32_t group_id = key / 10 % 10;
+    // std::cout << "key: " << key << ", group id: " << group_id << std::endl;
+    return std::string("g_") + std::to_string(group_id);
+  };
+
+  size_t group_num = 12;
+  ctx->set_group_params(group_num, group_topk);
+  ctx->set_group_by(groupby_func);
+
+  size_t query_value = cnt / 2;
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = float(query_value) / 10 + 0.1f;
+  }
+
+  auto t1 = ailego::Realtime::MicroSeconds();
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  auto t2 = ailego::Realtime::MicroSeconds();
+  total_time += t2 - t1;
+
+  std::cout << "Total time: " << total_time << std::endl;
+
+  auto &group_result = ctx->group_result();
+
+  ASSERT_EQ(group_result.size(), 10);
+  for (uint32_t i = 0; i < group_result.size(); ++i) {
+    auto &result = group_result[i].docs();
+
+    ASSERT_GT(result.size(), 0);
+
+    // const std::string &group_id = group_result[i].group_id();
+    // std::cout << "Group ID: " << group_id << std::endl;
+
+    // for (uint32_t j = 0; j < result.size(); ++j) {
+    //   std::cout << "\tKey: " << result[j].key() << std::fixed
+    //             << std::setprecision(3) << ", Score: " << result[j].score()
+    //             << std::endl;
+    // }
+  }
+}
+
+TEST_F(HnswStreamerTest, TestGroupInBruteforceSearch) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  size_t cnt = 5000U;
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, cnt * 2);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestGroupInBruteforceSearch.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+
+  NumericalVector<float> vec(dim);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i / 10.0;
+    }
+    streamer->add_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  size_t group_topk = 20;
+  uint64_t total_time = 0;
+
+  auto groupby_func = [](uint64_t key) {
+    uint32_t group_id = key / 10 % 10;
+    // std::cout << "key: " << key << ", group id: " << group_id << std::endl;
+    return std::string("g_") + std::to_string(group_id);
+  };
+
+  size_t group_num = 5;
+  ctx->set_group_params(group_num, group_topk);
+  ctx->set_group_by(groupby_func);
+
+  size_t query_value = cnt / 2;
+  for (size_t j = 0; j < dim; ++j) {
+    vec[j] = float(query_value) / 10 + 0.1f;
+  }
+
+  auto t1 = ailego::Realtime::MicroSeconds();
+  ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, ctx));
+  auto t2 = ailego::Realtime::MicroSeconds();
+  total_time += t2 - t1;
+
+  std::cout << "Total time: " << total_time << std::endl;
+
+  auto &group_result = ctx->group_result();
+
+  ASSERT_EQ(group_result.size(), 5);
+  for (uint32_t i = 0; i < group_result.size(); ++i) {
+    auto &result = group_result[i].docs();
+
+    ASSERT_GT(result.size(), 0);
+
+    // const std::string &group_id = group_result[i].group_id();
+    //  std::cout << "Group ID: " << group_id << std::endl;
+
+    // for (uint32_t j = 0; j < result.size(); ++j) {
+    //   std::cout << "\tKey: " << result[j].key() << std::fixed
+    //             << std::setprecision(3) << ", Score: " << result[j].score()
+    //             << std::endl;
+    // }
+  }
+}
+
+TEST_F(HnswStreamerTest, TestAddAndSearchWithID) {
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer != nullptr);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestAddAndSearch.index", true));
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  NumericalVector<float> vec(dim);
+  size_t cnt = 20000U;
+  auto ctx = streamer->create_context();
+  auto linear_ctx = streamer->create_context();
+  auto knn_ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  for (size_t i = 0; i < cnt; i += 4) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_with_id_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  for (size_t i = 2; i < cnt; i += 4) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i;
+    }
+    streamer->add_with_id_impl(i, vec.data(), qmeta, ctx);
+  }
+
+  // streamer->print_debug_info();
+
+  size_t topk = 200;
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  [[maybe_unused]] uint64_t knn_total_time = 0;
+  [[maybe_unused]] uint64_t linear_total_time = 0;
+  int total_hits = 0;
+  int total_cnts = 0;
+  int topk1_hits = 0;
+  for (size_t i = 0; i < cnt / 10; i += 2) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = i + 0.1f;
+    }
+    auto t1 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_impl(vec.data(), qmeta, knn_ctx));
+    auto t2 = ailego::Realtime::MicroSeconds();
+    ASSERT_EQ(0, streamer->search_bf_impl(vec.data(), qmeta, linear_ctx));
+    auto t3 = ailego::Realtime::MicroSeconds();
+    knn_total_time += t2 - t1;
+    linear_total_time += t3 - t2;
+
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    topk1_hits += i == knn_result[0].key();
+
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+
+    for (size_t j = 0; j < topk; ++j) {
+      ASSERT_NE(linear_result[j].key(), kInvalidKey);
+      ASSERT_NE(linear_result[j].index(), kInvalidKey);
+      auto linear_vec = static_cast<const float *>(
+          streamer->get_vector_by_id(linear_result[j].index()));
+
+      for (size_t z = 0; z < dim; ++z) {
+        ASSERT_FLOAT_EQ(linear_vec[z], linear_result[j].index());
+      }
+    }
+    for (size_t j = 0; j < topk; ++j) {
+      ASSERT_NE(knn_result[j].key(), kInvalidKey);
+      ASSERT_NE(knn_result[j].index(), kInvalidKey);
+      auto knn_vec = static_cast<const float *>(
+          streamer->get_vector_by_id(knn_result[j].index()));
+      for (size_t z = 0; z < dim; ++z) {
+        ASSERT_FLOAT_EQ(knn_vec[z], knn_result[j].index());
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  float topk1_recall = topk1_hits * 100.0f / cnt;
+  // float cost = linearTotalTime * 1.0f / knnTotalTime;
+#if 0
+    printf("knnTotalTime=%zd linearTotalTime=%zd totalHits=%d totalCnts=%d "
+           "R@%zd=%f R@1=%f cost=%f\n",
+           knnTotalTime, linearTotalTime, totalHits, totalCnts, topk, recall,
+           topk1Recall, cost);
+#endif
+  EXPECT_GT(recall, 0.80f);
+  EXPECT_GT(topk1_recall, 0.80f);
+  // EXPECT_GT(cost, 2.0f);
+}
+
+TEST_F(HnswStreamerTest, TestContiguousMemorySearch) {
+  // Build index with mmap mode
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestContiguous.index", true));
+
+  {
+    auto builder = IndexFactory::CreateStreamer("HnswStreamer");
+    ASSERT_NE(nullptr, builder);
+    ailego::Params build_params;
+    build_params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 16U);
+    build_params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5U);
+    build_params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 32U);
+    build_params.set(PARAM_HNSW_STREAMER_EF, 16U);
+    build_params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 2000U);
+    ASSERT_EQ(0, builder->init(*index_meta_ptr_, build_params));
+    ASSERT_EQ(0, builder->open(storage));
+
+    auto ctx = builder->create_context();
+    ASSERT_TRUE(!!ctx);
+    IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+    NumericalVector<float> vec(dim);
+    size_t cnt = 3000UL;
+    for (size_t i = 0; i < cnt; i++) {
+      for (size_t j = 0; j < dim; ++j) {
+        vec[j] = static_cast<float>(i);
+      }
+      ASSERT_EQ(0, builder->add_impl(i, vec.data(), qmeta, ctx));
+    }
+    ASSERT_EQ(0, builder->flush(0UL));
+    ASSERT_EQ(0, builder->close());
+  }
+
+  // Re-open with contiguous memory mode
+  auto searcher = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(nullptr, searcher);
+  ailego::Params search_params;
+  search_params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 16U);
+  search_params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5U);
+  search_params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 32U);
+  search_params.set(PARAM_HNSW_STREAMER_EF, 16U);
+  search_params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 2000U);
+  search_params.set(PARAM_HNSW_STREAMER_USE_CONTIGUOUS_MEMORY, true);
+  ASSERT_EQ(0, searcher->init(*index_meta_ptr_, search_params));
+  ASSERT_EQ(0, searcher->open(storage));
+
+  size_t cnt = 3000UL;
+  size_t topk = 50;
+  NumericalVector<float> vec(dim);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim);
+  auto linear_ctx = searcher->create_context();
+  auto knn_ctx = searcher->create_context();
+  linear_ctx->set_topk(topk);
+  knn_ctx->set_topk(topk);
+  int total_hits = 0;
+  int total_cnts = 0;
+  for (size_t i = 0; i < cnt; i++) {
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = static_cast<float>(i) + 0.1f;
+    }
+    ASSERT_EQ(0, searcher->search_impl(vec.data(), qmeta, knn_ctx));
+    ASSERT_EQ(0, searcher->search_bf_impl(vec.data(), qmeta, linear_ctx));
+    auto &knn_result = knn_ctx->result();
+    ASSERT_EQ(topk, knn_result.size());
+    auto &linear_result = linear_ctx->result();
+    ASSERT_EQ(topk, linear_result.size());
+    ASSERT_EQ(i, linear_result[0].key());
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      for (size_t j = 0; j < topk; ++j) {
+        if (linear_result[j].key() == knn_result[k].key()) {
+          total_hits++;
+          break;
+        }
+      }
+    }
+  }
+  float recall = total_hits * 1.0f / total_cnts;
+  EXPECT_GT(recall, 0.90f);
+}
+
+TEST_F(HnswStreamerTest, TestContiguousMultiThreadSearch) {
+  // static: gives dim_mt static storage duration so the addVector lambda below
+  // needs no capture for it (MSVC otherwise demands one, C3493, while Clang
+  // warns the capture is unused).
+  constexpr size_t static dim_mt = 32;
+  IndexMeta meta(IndexMeta::DataType::DT_FP32, dim_mt);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+
+  // Build with mmap mode
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ailego::Params stg_params;
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestContiguousMT", true));
+
+  {
+    ailego::Params build_params;
+    build_params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 128);
+    build_params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 10);
+    build_params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 64);
+    build_params.set(PARAM_HNSW_STREAMER_MAX_INDEX_SIZE, 30 * 1024 * 1024U);
+    build_params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+    build_params.set(PARAM_HNSW_STREAMER_EF, 32);
+    build_params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+
+    auto builder = IndexFactory::CreateStreamer("HnswStreamer");
+    ASSERT_NE(nullptr, builder);
+    ASSERT_EQ(0, builder->init(meta, build_params));
+    ASSERT_EQ(0, builder->open(storage));
+
+    auto add_vector = [&builder](int base_key, size_t add_cnt) {
+      NumericalVector<float> vec(dim_mt);
+      IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim_mt);
+      size_t succ_add = 0;
+      auto ctx = builder->create_context();
+      for (size_t i = 0; i < add_cnt; i++) {
+        for (size_t j = 0; j < dim_mt; ++j) {
+          vec[j] = static_cast<float>(i + base_key);
+        }
+        succ_add += !builder->add_impl(base_key + i, vec.data(), qmeta, ctx);
+      }
+      builder->flush(0UL);
+      return succ_add;
+    };
+    auto t1 = std::async(std::launch::async, add_vector, 0, 1000);
+    auto t2 = std::async(std::launch::async, add_vector, 1000, 1000);
+    auto t3 = std::async(std::launch::async, add_vector, 2000, 1000);
+    ASSERT_EQ(1000U, t1.get());
+    ASSERT_EQ(1000U, t2.get());
+    ASSERT_EQ(1000U, t3.get());
+    ASSERT_EQ(0, builder->close());
+  }
+
+  // Re-open with contiguous memory
+  ailego::Params search_params;
+  search_params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 128);
+  search_params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 10);
+  search_params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 64);
+  search_params.set(PARAM_HNSW_STREAMER_MAX_INDEX_SIZE, 30 * 1024 * 1024U);
+  search_params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  search_params.set(PARAM_HNSW_STREAMER_EF, 32);
+  search_params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+  search_params.set(PARAM_HNSW_STREAMER_USE_CONTIGUOUS_MEMORY, true);
+
+  auto searcher = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(nullptr, searcher);
+  ASSERT_EQ(0, searcher->init(meta, search_params));
+  ASSERT_EQ(0, searcher->open(storage));
+
+  // Verify data via provider
+  auto provider = searcher->create_provider();
+  auto iter = provider->create_iterator();
+  ASSERT_TRUE(!!iter);
+  size_t total = 0;
+  while (iter->is_valid()) {
+    float *data = (float *)iter->data();
+    for (size_t d = 0; d < dim_mt; ++d) {
+      ASSERT_FLOAT_EQ(static_cast<float>(iter->key()), data[d]);
+    }
+    total++;
+    iter->next();
+  }
+  ASSERT_EQ(3000, total);
+
+  // Multi-thread search on contiguous memory
+  size_t topk = 100;
+  size_t cnt = 3000;
+  auto knn_search = [&]() {
+    NumericalVector<float> vec(dim_mt);
+    auto linear_ctx = searcher->create_context();
+    auto knn_ctx = searcher->create_context();
+    IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dim_mt);
+    linear_ctx->set_topk(topk);
+    knn_ctx->set_topk(topk);
+    size_t total_cnts = 0;
+    size_t total_hits = 0;
+    for (size_t i = 0; i < cnt; i += 1) {
+      for (size_t j = 0; j < dim_mt; ++j) {
+        vec[j] = static_cast<float>(i) + 0.1f;
+      }
+      ASSERT_EQ(0, searcher->search_impl(vec.data(), qmeta, knn_ctx));
+      ASSERT_EQ(0, searcher->search_bf_impl(vec.data(), qmeta, linear_ctx));
+      auto &knn_result = knn_ctx->result();
+      ASSERT_EQ(topk, knn_result.size());
+      auto &linear_result = linear_ctx->result();
+      ASSERT_EQ(topk, linear_result.size());
+      ASSERT_EQ(i, linear_result[0].key());
+      for (size_t k = 0; k < topk; ++k) {
+        total_cnts++;
+        for (size_t j = 0; j < topk; ++j) {
+          if (linear_result[j].key() == knn_result[k].key()) {
+            total_hits++;
+            break;
+          }
+        }
+      }
+    }
+    ASSERT_TRUE((total_hits * 1.0f / total_cnts) > 0.80f);
+  };
+  auto s1 = std::async(std::launch::async, knn_search);
+  auto s2 = std::async(std::launch::async, knn_search);
+  auto s3 = std::async(std::launch::async, knn_search);
+  s1.wait();
+  s2.wait();
+  s3.wait();
+}
+
+// Test HNSW + INT8 quantization + rotation end-to-end
+TEST_F(HnswStreamerTest, TestInt8WithRotate) {
+  constexpr size_t kTestDim = 128;
+  constexpr size_t kCnt = 2000U;
+  constexpr size_t kTopk = 10;
+
+  IndexStreamer::Pointer streamer =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(nullptr, streamer);
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 16U);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 5U);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100);
+  params.set(PARAM_HNSW_STREAMER_EF, 100);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+
+  IndexMeta index_meta_raw(IndexMeta::DataType::DT_FP32, kTestDim);
+  index_meta_raw.set_metric("SquaredEuclidean", 0, ailego::Params());
+
+  // Create INT8 converter with rotation enabled
+  ailego::Params converter_params;
+  converter_params.set("integer_streaming.converter.enable_rotate", true);
+  auto converter = IndexFactory::CreateConverter("Int8StreamingConverter");
+  ASSERT_NE(nullptr, converter);
+  ASSERT_EQ(0, converter->init(index_meta_raw, converter_params));
+
+  IndexMeta index_meta = converter->meta();
+
+  auto reformer = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_NE(nullptr, reformer);
+  ASSERT_EQ(0, reformer->init(index_meta.reformer_params()));
+
+  ailego::Params stg_params;
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(stg_params));
+  ASSERT_EQ(0, storage->open(dir_ + "TestInt8WithRotate.index", true));
+  ASSERT_EQ(0, streamer->init(index_meta, params));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  // Add 2000 vectors
+  auto ctx = streamer->create_context();
+  ASSERT_TRUE(!!ctx);
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, kTestDim);
+
+  std::mt19937 gen(42);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  for (size_t i = 0; i < kCnt; i++) {
+    NumericalVector<float> vec(kTestDim);
+    for (size_t j = 0; j < kTestDim; ++j) vec[j] = dist(gen);
+
+    std::string new_vec;
+    IndexQueryMeta new_meta;
+    ASSERT_EQ(0, reformer->convert(vec.data(), qmeta, &new_vec, &new_meta));
+    ASSERT_EQ(0, streamer->add_impl(i, new_vec.data(), new_meta, ctx));
+  }
+
+  streamer->flush(0UL);
+  streamer.reset();
+  storage.reset();
+
+  // Reopen: reformer should auto-detect rotator from storage
+  auto storage2 = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage2);
+  ASSERT_EQ(0, storage2->init(stg_params));
+  ASSERT_EQ(0, storage2->open(dir_ + "TestInt8WithRotate.index", false));
+
+  auto streamer2 = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(nullptr, streamer2);
+  ASSERT_EQ(0, streamer2->init(index_meta, params));
+  ASSERT_EQ(0, streamer2->open(storage2));
+
+  auto reformer2 = IndexFactory::CreateReformer(index_meta.reformer_name());
+  ASSERT_NE(nullptr, reformer2);
+  ASSERT_EQ(0, reformer2->init(index_meta.reformer_params()));
+  ASSERT_EQ(0, reformer2->load(storage2));
+
+  // Search: verify knn results are non-empty
+  auto knn_ctx = streamer2->create_context();
+  knn_ctx->set_topk(kTopk);
+  auto linear_ctx = streamer2->create_context();
+  linear_ctx->set_topk(kTopk);
+
+  NumericalVector<float> query(kTestDim);
+  for (size_t j = 0; j < kTestDim; ++j) query[j] = dist(gen);
+
+  std::string new_query;
+  IndexQueryMeta new_qmeta;
+  ASSERT_EQ(0,
+            reformer2->transform(query.data(), qmeta, &new_query, &new_qmeta));
+  ASSERT_EQ(0, streamer2->search_impl(new_query.data(), new_qmeta, knn_ctx));
+  ASSERT_EQ(0,
+            streamer2->search_bf_impl(new_query.data(), new_qmeta, linear_ctx));
+
+  EXPECT_EQ(kTopk, knn_ctx->result().size());
+  EXPECT_EQ(kTopk, linear_ctx->result().size());
+}
+
+TEST_F(HnswStreamerTest, TestCompareFromOriginalVsBaseline) {
+  // The index stores FP16 while the provider keeps the original FP32
+  // vectors: index A builds its graph from the FP32 originals, index B
+  // builds from the FP16 vectors it stores. Both search the same stored
+  // FP16 vectors, so a recall difference comes only from the graph.
+  // Recall is measured against exhaustive ground truth in the original
+  // FP32 space, which is what a caller of this feature cares about
+  size_t cnt = 5000;
+  size_t topk = 200;
+
+  IndexMeta fp16_meta(IndexMeta::DataType::DT_FP16, dim);
+  fp16_meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  IndexMeta fp32_meta(IndexMeta::DataType::DT_FP32, dim);
+  fp32_meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+
+  //! deterministic pseudo random data in [0, 1), so that FP16 rounding
+  //! actually perturbs the distances instead of being exact
+  uint32_t seed = 12345U;
+  auto next_rand = [&seed]() {
+    seed = seed * 1103515245U + 12345U;
+    return static_cast<float>((seed >> 16) & 0x7FFFU) / 32768.0f;
+  };
+
+  auto provider =
+      make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP32>>(dim);
+  std::vector<std::vector<float>> originals(cnt);
+  for (size_t i = 0; i < cnt; i++) {
+    NumericalVector<float> vec(dim);
+    originals[i].resize(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      float v = next_rand();
+      vec[j] = v;
+      originals[i][j] = v;
+    }
+    ASSERT_TRUE(provider->emplace(i, vec));
+  }
+
+  //! the FP16 vectors actually stored in both indexes
+  std::vector<NumericalVector<uint16_t>> stored(cnt);
+  for (size_t i = 0; i < cnt; i++) {
+    stored[i] = NumericalVector<uint16_t>(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      stored[i][j] = ailego::FloatHelper::ToFP16(originals[i][j]);
+    }
+  }
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 10);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 10);
+  params.set(PARAM_HNSW_STREAMER_EF, 5);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 1000U);
+  ailego::Params stg_params;
+
+  // === Build index A: from original (with provider) ===
+  IndexStreamer::Pointer streamer_a =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer_a != nullptr);
+  ASSERT_EQ(0, streamer_a->set_provider(provider, fp32_meta));
+
+  auto storage_a = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage_a->init(stg_params));
+  ASSERT_EQ(0, storage_a->open(dir_ + "compare_from_original.index", true));
+  ASSERT_EQ(0, streamer_a->init(fp16_meta, params));
+  ASSERT_EQ(0, streamer_a->open(storage_a));
+
+  auto ctx_a = streamer_a->create_context();
+  IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP16, dim);
+  for (size_t i = 0; i < cnt; i++) {
+    ASSERT_EQ(0, streamer_a->add_impl(i, stored[i].data(), qmeta, ctx_a));
+  }
+  streamer_a->flush(0UL);
+
+  // === Build index B: baseline (no provider) ===
+  IndexStreamer::Pointer streamer_b =
+      IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(streamer_b != nullptr);
+
+  auto storage_b = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage_b->init(stg_params));
+  ASSERT_EQ(0, storage_b->open(dir_ + "compare_baseline.index", true));
+  ASSERT_EQ(0, streamer_b->init(fp16_meta, params));
+  ASSERT_EQ(0, streamer_b->open(storage_b));
+
+  auto ctx_b = streamer_b->create_context();
+  for (size_t i = 0; i < cnt; i++) {
+    ASSERT_EQ(0, streamer_b->add_impl(i, stored[i].data(), qmeta, ctx_b));
+  }
+  streamer_b->flush(0UL);
+
+  // === Search and compare ===
+  size_t query_cnt = 0;
+  int total_hits_a = 0, total_hits_b = 0;
+  int total_cnts = 0;
+  int topk1_hits_a = 0, topk1_hits_b = 0;
+
+  auto knn_ctx_a = streamer_a->create_context();
+  auto knn_ctx_b = streamer_b->create_context();
+  knn_ctx_a->set_topk(topk);
+  knn_ctx_b->set_topk(topk);
+
+  //! queries are the original vectors perturbed a little, so the answer is
+  //! not simply the query itself
+  std::vector<std::vector<float>> queries;
+  for (size_t i = 0; i < cnt; i += 10) {
+    std::vector<float> q(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      q[j] = originals[i][j] + 0.01f;
+    }
+    queries.push_back(std::move(q));
+  }
+
+  std::vector<std::vector<uint64_t>> results_a;
+  std::vector<std::vector<uint64_t>> results_b;
+  NumericalVector<uint16_t> fp16_query(dim);
+  for (auto &q : queries) {
+    for (size_t j = 0; j < dim; ++j) {
+      fp16_query[j] = ailego::FloatHelper::ToFP16(q[j]);
+    }
+
+    ASSERT_EQ(0, streamer_a->search_impl(fp16_query.data(), qmeta, knn_ctx_a));
+    auto &res_a = knn_ctx_a->result();
+    ASSERT_EQ(topk, res_a.size());
+    std::vector<uint64_t> keys_a(topk);
+    for (size_t k = 0; k < topk; ++k) keys_a[k] = res_a[k].key();
+    results_a.push_back(std::move(keys_a));
+
+    ASSERT_EQ(0, streamer_b->search_impl(fp16_query.data(), qmeta, knn_ctx_b));
+    auto &res_b = knn_ctx_b->result();
+    ASSERT_EQ(topk, res_b.size());
+    std::vector<uint64_t> keys_b(topk);
+    for (size_t k = 0; k < topk; ++k) keys_b[k] = res_b[k].key();
+    results_b.push_back(std::move(keys_b));
+
+    query_cnt++;
+  }
+
+  //! exhaustive ground truth in the original FP32 space
+  for (size_t qi = 0; qi < queries.size(); ++qi) {
+    const auto &q = queries[qi];
+    std::vector<std::pair<float, uint64_t>> dists(cnt);
+    for (size_t i = 0; i < cnt; ++i) {
+      float d = 0.0f;
+      for (size_t j = 0; j < dim; ++j) {
+        float diff = q[j] - originals[i][j];
+        d += diff * diff;
+      }
+      dists[i] = {d, i};
+    }
+    std::partial_sort(dists.begin(), dists.begin() + topk, dists.end());
+
+    std::set<uint64_t> gt;
+    for (size_t k = 0; k < topk; ++k) {
+      gt.insert(dists[k].second);
+    }
+    topk1_hits_a += (results_a[qi][0] == dists[0].second);
+    topk1_hits_b += (results_b[qi][0] == dists[0].second);
+    for (size_t k = 0; k < topk; ++k) {
+      total_cnts++;
+      total_hits_a += gt.count(results_a[qi][k]) > 0;
+      total_hits_b += gt.count(results_b[qi][k]) > 0;
+    }
+  }
+
+  float recall_a = total_hits_a * 1.0f / total_cnts;
+  float recall_b = total_hits_b * 1.0f / total_cnts;
+  float topk1_recall_a = topk1_hits_a * 1.0f / query_cnt;
+  float topk1_recall_b = topk1_hits_b * 1.0f / query_cnt;
+
+  printf("\n=== From-Original vs Baseline Comparison ===\n");
+  printf("From-Original: Recall@%zu=%.4f, Recall@1=%.4f\n", topk, recall_a,
+         topk1_recall_a);
+  printf("Baseline:      Recall@%zu=%.4f, Recall@1=%.4f\n", topk, recall_b,
+         topk1_recall_b);
+  printf("Delta (From-Original - Baseline): Recall@%zu=%+.4f, Recall@1=%+.4f\n",
+         topk, recall_a - recall_b, topk1_recall_a - topk1_recall_b);
+  printf("============================================\n");
+
+  //! Both graphs must be functional. Note that building from the original
+  //! vectors is not expected to beat the baseline here: search still runs
+  //! on the stored FP16 vectors, so a graph optimized for FP32 distances
+  //! can even be slightly off. See bench/REPORT.md for measurements on a
+  //! real dataset
+  EXPECT_GT(recall_a, 0.90f);
+  EXPECT_GT(recall_b, 0.90f);
+  EXPECT_GT(topk1_recall_a, 0.90f);
+  EXPECT_GT(topk1_recall_b, 0.90f);
+}
+
+TEST_F(HnswStreamerTest, TestTurboSearchWithFp16ProviderBuildFallback) {
+  constexpr size_t kProviderDim = 8;
+  constexpr size_t kCount = 64;
+  IndexMeta raw_meta(IndexMeta::DataType::DT_FP32, kProviderDim);
+  raw_meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  IndexQueryMeta query_meta(IndexMeta::DataType::DT_FP32, kProviderDim);
+
+  for (bool explicit_metric : {false, true}) {
+    for (bool explicit_id : {false, true}) {
+      SCOPED_TRACE(testing::Message() << "explicit_metric=" << explicit_metric
+                                      << ", explicit_id=" << explicit_id);
+      auto provider =
+          make_shared<MultiPassIndexProvider<IndexMeta::DataType::DT_FP16>>(
+              kProviderDim);
+      std::vector<std::vector<float>> vectors(kCount,
+                                              std::vector<float>(kProviderDim));
+      for (size_t i = 0; i < kCount; ++i) {
+        NumericalVector<uint16_t> original(kProviderDim);
+        for (size_t j = 0; j < kProviderDim; ++j) {
+          vectors[i][j] = i * 0.25f + j * 0.03125f;
+          original[j] = ailego::FloatHelper::ToFP16(vectors[i][j]);
+        }
+        ASSERT_TRUE(provider->emplace(i, std::move(original)));
+      }
+      IndexMeta provider_meta(IndexMeta::DataType::DT_FP16, kProviderDim);
+      if (explicit_metric) {
+        provider_meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+      }
+
+      auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+      ASSERT_NE(nullptr, quantizer);
+      ASSERT_EQ(0, quantizer->init(raw_meta, ailego::Params()));
+      auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
+      ASSERT_NE(nullptr, streamer);
+      auto hnsw_streamer = std::dynamic_pointer_cast<HnswStreamer>(streamer);
+      ASSERT_NE(nullptr, hnsw_streamer);
+      ASSERT_EQ(0, streamer->set_provider(provider, provider_meta));
+      ailego::Params params;
+      params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 16U);
+      params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100U);
+      params.set(PARAM_HNSW_STREAMER_EF, 100U);
+      params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 0U);
+      ASSERT_EQ(0, streamer->init(raw_meta, params, quantizer));
+      auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+      ASSERT_NE(nullptr, storage);
+      ASSERT_EQ(0, storage->init(ailego::Params()));
+      const std::string path = dir_ + "turbo_fp16_provider_" +
+                               std::to_string(explicit_metric) + "_" +
+                               std::to_string(explicit_id) + ".index";
+      ASSERT_EQ(0, storage->open(path, true));
+      ASSERT_EQ(0, streamer->open(storage));
+      EXPECT_TRUE(hnsw_streamer->uses_turbo_distance());
+      ASSERT_FALSE(hnsw_streamer->uses_turbo_build_distance());
+
+      auto context = streamer->create_context();
+      ASSERT_NE(nullptr, context);
+      auto *ctx = dynamic_cast<HnswContext *>(context.get());
+      ASSERT_NE(nullptr, ctx);
+      for (size_t i = 0; i < kCount; ++i) {
+        ASSERT_EQ(0, explicit_id
+                         ? streamer->add_with_id_impl(i, vectors[i].data(),
+                                                      query_meta, context)
+                         : streamer->add_impl(i, vectors[i].data(), query_meta,
+                                              context));
+      }
+
+      // The active build calculator must interpret provider records as FP16,
+      // even though the search quantizer consumes FP32 records.
+      EXPECT_FLOAT_EQ(0.5f,
+                      ctx->dist_calculator().dist(uint32_t{0}, uint32_t{1}));
+      ctx->reset_query_raw(provider->get_vector(3), provider_meta);
+      const void *candidates[] = {provider->get_vector(0),
+                                  provider->get_vector(1),
+                                  provider->get_vector(2)};
+      float distances[3];
+      ctx->dist_calculator().batch_dist(candidates, 3, distances, nullptr);
+      EXPECT_FLOAT_EQ(4.5f, distances[0]);
+      EXPECT_FLOAT_EQ(2.0f, distances[1]);
+      EXPECT_FLOAT_EQ(0.5f, distances[2]);
+
+      context->set_topk(1);
+      for (size_t probe : {size_t{0}, size_t{31}, kCount - 1}) {
+        ASSERT_EQ(0, streamer->search_impl(vectors[probe].data(), query_meta,
+                                           context));
+        ASSERT_EQ(1U, context->result().size());
+        EXPECT_EQ(probe, context->result()[0].key());
+        EXPECT_FLOAT_EQ(0.0f, context->result()[0].score());
+      }
+      ASSERT_EQ(0, streamer->close());
+      ASSERT_EQ(0, storage->close());
+    }
+  }
+}
+
+TEST_F(HnswStreamerTest, TestTurboInt8QuantizerDistance) {
+  constexpr size_t kTurboDim = 35;
+  constexpr size_t kCount = 128;
+  constexpr size_t kTopk = 10;
+
+  IndexMeta raw_meta(IndexMeta::DataType::DT_FP32, kTurboDim);
+  raw_meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto quantizer = IndexFactory::CreateQuantizer("Int8Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  ASSERT_EQ(0, quantizer->init(raw_meta, ailego::Params()));
+
+  IndexMeta quantized_meta = quantizer->meta();
+  quantized_meta.set_quantizer("Int8Quantizer", 0, ailego::Params());
+
+  ailego::Params params;
+  params.set(PARAM_HNSW_STREAMER_MAX_NEIGHBOR_COUNT, 16U);
+  params.set(PARAM_HNSW_STREAMER_SCALING_FACTOR, 16U);
+  params.set(PARAM_HNSW_STREAMER_EFCONSTRUCTION, 100U);
+  params.set(PARAM_HNSW_STREAMER_EF, 100U);
+  params.set(PARAM_HNSW_STREAMER_BRUTE_FORCE_THRESHOLD, 0U);
+
+  auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_NE(nullptr, streamer);
+  ASSERT_EQ(0, streamer->init(quantized_meta, params, quantizer));
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(ailego::Params()));
+  ASSERT_EQ(0, storage->open(dir_ + "turbo_int8.index", true));
+  ASSERT_EQ(0, streamer->open(storage));
+
+  std::mt19937 gen(2026);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<std::vector<float>> data(kCount, std::vector<float>(kTurboDim));
+  std::vector<std::string> codes(kCount);
+  IndexQueryMeta raw_qmeta(IndexMeta::DataType::DT_FP32, kTurboDim);
+  IndexQueryMeta quantized_qmeta;
+  auto add_ctx = streamer->create_context();
+  ASSERT_NE(nullptr, add_ctx);
+  for (size_t i = 0; i < kCount; ++i) {
+    for (float &value : data[i]) {
+      value = dist(gen);
+    }
+    ASSERT_EQ(0, quantizer->quantize(data[i].data(), raw_qmeta, &codes[i],
+                                     &quantized_qmeta));
+    ASSERT_EQ(0,
+              streamer->add_impl(i, codes[i].data(), quantized_qmeta, add_ctx));
+  }
+
+  const size_t query_index = 37;
+  auto linear_ctx = streamer->create_context();
+  ASSERT_NE(nullptr, linear_ctx);
+  linear_ctx->set_topk(kTopk);
+  ASSERT_EQ(0, streamer->search_bf_impl(codes[query_index].data(),
+                                        quantized_qmeta, linear_ctx));
+
+  std::vector<std::pair<float, size_t>> expected(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    expected[i] = {quantizer->calc_distance_dp_query(codes[i].data(),
+                                                     codes[query_index].data()),
+                   i};
+  }
+  std::partial_sort(expected.begin(), expected.begin() + kTopk, expected.end());
+
+  const auto &linear_result = linear_ctx->result();
+  ASSERT_EQ(kTopk, linear_result.size());
+  for (size_t i = 0; i < kTopk; ++i) {
+    EXPECT_EQ(expected[i].second, linear_result[i].key());
+    EXPECT_NEAR(expected[i].first, linear_result[i].score(),
+                1e-5f + std::abs(expected[i].first) * 1e-4f);
+  }
+
+  auto ann_ctx = streamer->create_context();
+  ASSERT_NE(nullptr, ann_ctx);
+  ann_ctx->set_topk(1);
+  ASSERT_EQ(0, streamer->search_impl(codes[query_index].data(), quantized_qmeta,
+                                     ann_ctx));
+  ASSERT_EQ(1U, ann_ctx->result().size());
+  EXPECT_EQ(query_index, ann_ctx->result()[0].key());
+  ASSERT_EQ(0, streamer->close());
+  ASSERT_EQ(0, storage->close());
+}
+
+}  // namespace core
+}  // namespace zvec
+
+#if defined(__GNUC__) || defined(__GNUG__)
+#pragma GCC diagnostic pop
+#endif

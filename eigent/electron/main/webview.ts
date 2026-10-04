@@ -1,0 +1,570 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+import { BrowserWindow, WebContentsView, type WebContents } from 'electron';
+
+interface WebViewInfo {
+  id: string;
+  view: WebContentsView;
+  initialUrl: string;
+  currentUrl: string;
+  isActive: boolean;
+  isShow: boolean;
+  browserToolkitAdvertised: boolean;
+  disposeContextMenu?: () => void;
+}
+
+export interface WebViewManagerOptions {
+  installContextMenu?: (
+    contents: WebContents,
+    ownerWindow: BrowserWindow
+  ) => () => void;
+}
+
+interface Size {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export const EIGENT_EMBEDDED_BROWSER_TARGET_PREFIX =
+  'about:blank#eigent-browser-toolkit=';
+
+export function embeddedBrowserTargetUrl(id: string): string {
+  return `${EIGENT_EMBEDDED_BROWSER_TARGET_PREFIX}${encodeURIComponent(id)}`;
+}
+
+export class WebViewManager {
+  private webViews = new Map<string, WebViewInfo>();
+  private win: BrowserWindow | null = null;
+  private size: Size = { x: 0, y: 0, width: 0, height: 0 };
+  private maxInactiveWebviews = 5;
+  private lastCleanupTime = Date.now();
+  private readonly installContextMenu?: WebViewManagerOptions['installContextMenu'];
+
+  private getHiddenBounds(id: string, width = 100, height = 100) {
+    const numericId = Number(id);
+    const idOffset = Number.isFinite(numericId) ? (numericId % 20) * 20 : 0;
+    const safeWidth = Math.max(width, 100);
+    const safeHeight = Math.max(height, 100);
+
+    return {
+      x: -10000 - safeWidth - idOffset,
+      y: -10000 - safeHeight - idOffset,
+      width: safeWidth,
+      height: safeHeight,
+    };
+  }
+
+  constructor(window: BrowserWindow, options: WebViewManagerOptions = {}) {
+    this.win = window;
+    this.installContextMenu = options.installContextMenu;
+  }
+
+  // Remove automatic IPC handler registration from constructor
+  // IPC handlers should be registered once in the main process
+
+  public async captureWebview(webviewId: string) {
+    const webViewInfo = this.webViews.get(webviewId);
+    if (!webViewInfo) return null;
+
+    const targetContents = webViewInfo.view.webContents;
+    if (!targetContents || targetContents.isDestroyed()) {
+      return null;
+    }
+
+    const debuggerApi = targetContents.debugger;
+    let attachedHere = false;
+
+    try {
+      if (!debuggerApi.isAttached()) {
+        debuggerApi.attach('1.3');
+        attachedHere = true;
+      }
+
+      const result = (await debuggerApi.sendCommand('Page.captureScreenshot', {
+        format: 'jpeg',
+        quality: 60,
+        fromSurface: true,
+      })) as { data?: string };
+
+      if (result?.data) {
+        return 'data:image/jpeg;base64,' + result.data;
+      }
+    } catch (error) {
+      console.warn(
+        `CDP screenshot failed for webview ${webviewId}, falling back to capturePage:`,
+        error
+      );
+    } finally {
+      if (attachedHere && debuggerApi.isAttached()) {
+        try {
+          debuggerApi.detach();
+        } catch (detachError) {
+          console.warn(
+            `Failed to detach debugger for webview ${webviewId}:`,
+            detachError
+          );
+        }
+      }
+    }
+
+    const image = await targetContents.capturePage();
+    const jpegBuffer = image.toJPEG(60);
+    return 'data:image/jpeg;base64,' + jpegBuffer.toString('base64');
+  }
+
+  public setSize(size: Size) {
+    this.size = size;
+    this.webViews.forEach((webview) => {
+      if (webview.isActive && webview.isShow) {
+        this.changeViewSize(webview.id, size);
+      }
+    });
+  }
+
+  public getActiveWebview() {
+    const activeWebviews = Array.from(this.webViews.values()).filter(
+      (webview) => webview.isActive
+    );
+
+    return activeWebviews.map((webview) => webview.id);
+  }
+
+  /**
+   * Return exact Eigent-owned targets that are still unused. Brain owns the
+   * atomic Run/session allocation and keys reservations by the unique target
+   * URL rather than by Electron's shared CDP port.
+   */
+  public listAvailableBrowserToolkitTargets() {
+    return Array.from(this.webViews.values())
+      .map((webview) => {
+        const contents = webview.view.webContents;
+        if (
+          contents.isDestroyed() ||
+          !contents.getURL().startsWith(EIGENT_EMBEDDED_BROWSER_TARGET_PREFIX)
+        ) {
+          return null;
+        }
+        webview.browserToolkitAdvertised = true;
+        return {
+          url: contents.getURL(),
+          webContentsId: contents.id,
+        };
+      })
+      .filter(
+        (target): target is { url: string; webContentsId: number } =>
+          target !== null
+      );
+  }
+
+  public async createWebview(id: string = '1', url?: string) {
+    try {
+      const initialUrl = url ?? embeddedBrowserTargetUrl(id);
+      // If webview with this id already exists, return error
+      if (this.webViews.has(id)) {
+        return {
+          success: false,
+          error: `Webview with id ${id} already exists`,
+        };
+      }
+      const view = new WebContentsView({
+        webPreferences: {
+          // Use a separate session partition for webviews to isolate storage from main window
+          // This ensures clearing webview storage won't affect main window's auth data
+          partition: 'persist:user_login',
+          nodeIntegration: false,
+          contextIsolation: true,
+          backgroundThrottling: true,
+          offscreen: false,
+          sandbox: true,
+          disableBlinkFeatures: 'Accelerated2dCanvas,AutomationControlled',
+          enableBlinkFeatures: 'IdleDetection',
+          autoplayPolicy: 'document-user-activation-required',
+        },
+      });
+      view.webContents.on('did-finish-load', () => {
+        // Inject stealth script to avoid bot detection
+        view.webContents.executeJavaScript(`
+          // Save original values before overriding to maintain consistency
+          const originalLanguages = navigator.languages ? [...navigator.languages] : ['en-US', 'en'];
+          const originalHardwareConcurrency = navigator.hardwareConcurrency || 8;
+          const originalDeviceMemory = navigator.deviceMemory || 8;
+
+          // Hide webdriver property
+          Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+            configurable: true
+          });
+
+          // Override plugins with proper PluginArray-like behavior
+          Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+              const plugins = {
+                length: 3,
+                0: { name: 'Chrome PDF Plugin', description: 'Portable Document Format', filename: 'internal-pdf-viewer' },
+                1: { name: 'Chrome PDF Viewer', description: '', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                2: { name: 'Native Client', description: '', filename: 'internal-nacl-plugin' },
+                item: function(index) { return this[index] || null; },
+                namedItem: function(name) {
+                  for (let i = 0; i < this.length; i++) {
+                    if (this[i].name === name) return this[i];
+                  }
+                  return null;
+                },
+                refresh: function() {},
+                [Symbol.iterator]: function* () {
+                  for (let i = 0; i < this.length; i++) {
+                    yield this[i];
+                  }
+                }
+              };
+              return plugins;
+            },
+            configurable: true
+          });
+
+          // Use original system languages for consistency with other browser data
+          Object.defineProperty(navigator, 'languages', {
+            get: () => originalLanguages,
+            configurable: true
+          });
+
+          // Use original hardwareConcurrency, clamped to common range (4-16) to avoid extreme fingerprints
+          Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => Math.min(Math.max(originalHardwareConcurrency, 4), 16),
+            configurable: true
+          });
+
+          // Use original deviceMemory, clamped to common range (4-16) to avoid extreme fingerprints
+          Object.defineProperty(navigator, 'deviceMemory', {
+            get: () => Math.min(Math.max(originalDeviceMemory, 4), 16),
+            configurable: true
+          });
+
+          // Fix WebGL vendor/renderer for both WebGL and WebGL2
+          const getParameter = WebGLRenderingContext.prototype.getParameter;
+          WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.';
+            if (parameter === 37446) return 'Intel(R) Iris(TM) Graphics 6100';
+            return getParameter.call(this, parameter);
+          };
+
+          // Also patch WebGL2RenderingContext
+          if (typeof WebGL2RenderingContext !== 'undefined') {
+            const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+              if (parameter === 37445) return 'Intel Inc.';
+              if (parameter === 37446) return 'Intel(R) Iris(TM) Graphics 6100';
+              return getParameter2.call(this, parameter);
+            };
+          }
+
+          // Override chrome runtime - real Chrome has window.chrome but runtime is undefined
+          if (!window.chrome) {
+            window.chrome = {};
+          }
+          // In real Chrome, runtime exists but is undefined outside extensions
+          // Don't set it to an object, that's detectable
+
+          // Hide automation variables
+          const automationVars = ['__webdriver_evaluate', '__selenium_evaluate', '__webdriver_script_fn',
+            '__driver_evaluate', '__fxdriver_evaluate', '__driver_unwrapped', 'domAutomation', 'domAutomationController'];
+          automationVars.forEach(v => {
+            Object.defineProperty(window, v, {
+              get: () => undefined,
+              set: () => {},
+              configurable: true,
+              enumerable: false
+            });
+          });
+
+          // Mouse event handler
+          window.addEventListener('mousedown', (e) => {
+            if (!(e.target instanceof HTMLButtonElement || e.target instanceof HTMLInputElement)) {
+              e.preventDefault();
+            }
+          }, true);
+        `);
+      });
+
+      // Set to muted state when created
+      view.webContents.audioMuted = true;
+      view.setBounds(this.getHiddenBounds(id));
+      view.setBorderRadius(16);
+
+      await view.webContents.loadURL(initialUrl);
+
+      const webViewInfo: WebViewInfo = {
+        id,
+        view,
+        initialUrl,
+        currentUrl: initialUrl,
+        isActive: false,
+        isShow: false,
+        browserToolkitAdvertised: false,
+        disposeContextMenu: this.win
+          ? this.installContextMenu?.(view.webContents, this.win)
+          : undefined,
+      };
+      // view.webContents.on("did-navigate", (event, url) => {
+      //   const win = BrowserWindow.fromWebContents(event.sender);
+      //   win?.webContents.send("url-updated", url);
+      // });
+
+      view.webContents.on('did-navigate-in-page', (event, url) => {
+        webViewInfo.currentUrl = url;
+        if (
+          webViewInfo.isActive &&
+          webViewInfo.isShow &&
+          !url.startsWith(EIGENT_EMBEDDED_BROWSER_TARGET_PREFIX) &&
+          url !== 'about:blank'
+        ) {
+          console.log('did-navigate-in-page', id, url);
+          this.win?.webContents.send('url-updated', url);
+          return;
+        }
+      });
+      // Listen for URL change events
+      view.webContents.on('did-navigate', (event, navigationUrl) => {
+        webViewInfo.currentUrl = navigationUrl;
+        if (navigationUrl !== webViewInfo.initialUrl) {
+          webViewInfo.isActive = true;
+        }
+        console.log(`Webview ${id} navigated to: ${navigationUrl}`);
+        if (
+          webViewInfo.isActive &&
+          webViewInfo.isShow &&
+          !navigationUrl.startsWith(EIGENT_EMBEDDED_BROWSER_TARGET_PREFIX) &&
+          navigationUrl !== 'about:blank'
+        ) {
+          console.log('did-navigate', id, navigationUrl);
+          this.win?.webContents.send('url-updated', navigationUrl);
+          return;
+        }
+        webViewInfo.view.setBounds(this.getHiddenBounds(id, 1920, 1080));
+        const activeSize = this.getActiveWebview().length;
+        const allSize = Array.from(this.webViews.values()).length;
+        const inactiveSize = allSize - activeSize;
+
+        // Clean up inactive webviews if too many
+        if (
+          inactiveSize > this.maxInactiveWebviews &&
+          Date.now() - this.lastCleanupTime > 30000
+        ) {
+          this.cleanupInactiveWebviews();
+          this.lastCleanupTime = Date.now();
+        }
+
+        // Create new webviews if needed
+        if (inactiveSize <= 2) {
+          const existingKeys = Array.from(this.webViews.keys())
+            .map(Number)
+            .filter((n) => !isNaN(n));
+          const maxId = existingKeys.length > 0 ? Math.max(...existingKeys) : 0;
+          const startId = maxId + 1;
+
+          // Create only 2 new webviews to reduce memory usage
+          for (let i = 0; i < 2; i++) {
+            const nextId = (startId + i).toString();
+            this.createWebview(nextId);
+          }
+        }
+
+        // setTimeout(() => {
+        //   let newId = Number(id)
+        //   view.setBounds({ x: -9999 + newId * 100, y: -9999 + newId * 100, width: 100, height: 100 })
+        // }, 500)
+        // Notify frontend when URL changes
+        if (this.win && !this.win.isDestroyed()) {
+          this.win.webContents.send('webview-navigated', id, navigationUrl);
+        }
+      });
+
+      view.webContents.setWindowOpenHandler(({ url }) => {
+        view.webContents.loadURL(url);
+
+        return { action: 'deny' };
+      });
+      // Store in Map
+      this.webViews.set(id, webViewInfo);
+
+      this.win?.contentView.addChildView(view);
+      return { success: true, id, hidden: true };
+    } catch (error: any) {
+      console.error(`Failed to create hidden webview ${id}:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  public changeViewSize(id: string, size: Size) {
+    try {
+      const webViewInfo = this.webViews.get(id);
+      if (!webViewInfo) {
+        return { success: false, error: `Webview with id ${id} not found` };
+      }
+
+      const { x, y, width, height } = size;
+      if (webViewInfo.isActive && webViewInfo.isShow) {
+        webViewInfo.view.setBounds({
+          x,
+          y,
+          width: Math.max(width, 100),
+          height: Math.max(height, 100),
+        });
+      } else {
+        webViewInfo.view.setBounds(this.getHiddenBounds(id, width, height));
+      }
+
+      return { success: true };
+    } catch (error: any) {
+      console.error(`Failed to resize all webviews:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  public hideWebview(id: string) {
+    const webViewInfo = this.webViews.get(id);
+    if (!webViewInfo) {
+      return { success: false, error: `Webview with id ${id} not found` };
+    }
+    webViewInfo.view.setBounds(this.getHiddenBounds(id));
+    webViewInfo.isShow = false;
+
+    if (
+      webViewInfo.view.webContents &&
+      !webViewInfo.view.webContents.isDestroyed()
+    ) {
+      webViewInfo.view.webContents.setBackgroundThrottling(true);
+    }
+
+    return { success: true };
+  }
+  public hideAllWebview() {
+    this.webViews.forEach((webview) => {
+      webview.view.setBounds(this.getHiddenBounds(webview.id));
+      webview.isShow = false;
+
+      if (webview.view.webContents && !webview.view.webContents.isDestroyed()) {
+        webview.view.webContents.setBackgroundThrottling(true);
+      }
+    });
+  }
+
+  public async showWebview(id: string) {
+    let webViewInfo = this.webViews.get(id);
+
+    // If webview doesn't exist, create it
+    if (!webViewInfo) {
+      console.log(`Webview ${id} not found, creating new one`);
+      const createResult = await this.createWebview(id);
+      if (!createResult.success) {
+        return { success: false, error: `Failed to create webview ${id}` };
+      }
+      webViewInfo = this.webViews.get(id)!;
+    }
+
+    const currentUrl = webViewInfo.view.webContents.getURL();
+    this.win?.webContents.send('url-updated', currentUrl);
+    webViewInfo.isShow = true;
+    this.changeViewSize(id, this.size);
+    console.log('showWebview', id, this.size);
+
+    if (
+      webViewInfo.view.webContents &&
+      !webViewInfo.view.webContents.isDestroyed()
+    ) {
+      webViewInfo.view.webContents.setBackgroundThrottling(false);
+    }
+
+    if (this.win && !this.win.isDestroyed()) {
+      this.win.webContents.send('webview-show', id);
+    }
+
+    return { success: true };
+  }
+  public getShowWebview() {
+    return JSON.parse(
+      JSON.stringify(
+        Array.from(this.webViews.values())
+          .filter((webview) => webview.isShow)
+          .map((webview) => webview.id)
+      )
+    );
+  }
+
+  public destroyWebview(id: string) {
+    try {
+      const webViewInfo = this.webViews.get(id);
+      if (!webViewInfo) {
+        return { success: false, error: `Webview with id ${id} not found` };
+      }
+
+      webViewInfo.disposeContextMenu?.();
+      if (!webViewInfo.view.webContents.isDestroyed()) {
+        webViewInfo.view.webContents.removeAllListeners();
+        // DO NOT clear storage data here!
+        // Multiple webviews share the same partition 'persist:user_login'
+        // Clearing storage would affect ALL webviews and remove login cookies
+        // Only clear cache which is per-webContents
+        webViewInfo.view.webContents.session.clearCache();
+      }
+
+      // remove webview from parent container
+      if (this.win?.contentView) {
+        this.win.contentView.removeChildView(webViewInfo.view);
+      }
+
+      // destroy webview
+      webViewInfo.view.webContents.close();
+
+      // remove from Map
+      this.webViews.delete(id);
+
+      console.log(`Webview ${id} destroyed successfully`);
+      return { success: true };
+    } catch (error: any) {
+      console.error(`Failed to destroy webview ${id}:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  public destroy() {
+    // Destroy all webviews
+    Array.from(this.webViews.keys()).forEach((id) => {
+      this.destroyWebview(id);
+    });
+    this.webViews.clear();
+  }
+
+  private cleanupInactiveWebviews() {
+    const inactiveWebviews = Array.from(this.webViews.entries())
+      .filter(
+        ([_id, info]) =>
+          !info.isActive &&
+          !info.isShow &&
+          !info.browserToolkitAdvertised &&
+          info.currentUrl.startsWith(EIGENT_EMBEDDED_BROWSER_TARGET_PREFIX)
+      )
+      .sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
+
+    const toRemove = inactiveWebviews.slice(this.maxInactiveWebviews);
+
+    toRemove.forEach(([id, _]) => {
+      console.log(`Cleaning up inactive webview: ${id}`);
+      this.destroyWebview(id);
+    });
+  }
+}

@@ -1,0 +1,108 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+'use client';
+
+import { cn } from '@/lib/utils';
+import { isMotionComponent, motion, type HTMLMotionProps } from 'motion/react';
+import * as React from 'react';
+
+type AnyProps = Record<string, unknown>;
+
+type DOMMotionProps<T extends HTMLElement = HTMLElement> = Omit<
+  HTMLMotionProps<'div'>,
+  'ref'
+> & { ref?: React.Ref<T> };
+
+type WithAsChild<Base extends object> =
+  | (Base & { asChild: true; children: React.ReactElement })
+  | (Base & { asChild?: false | undefined });
+
+type SlotProps<T extends HTMLElement = HTMLElement> = {
+  children?: any;
+} & DOMMotionProps<T>;
+
+function mergeRefs<T>(
+  ...refs: (React.Ref<T> | undefined)[]
+): React.RefCallback<T> {
+  return (node) => {
+    refs.forEach((ref) => {
+      if (!ref) return;
+      if (typeof ref === 'function') {
+        ref(node);
+      } else if ('current' in ref) {
+        // Use type assertion to safely assign to mutable ref
+        (ref as React.MutableRefObject<T | null>).current = node;
+      }
+    });
+  };
+}
+
+function mergeProps<T extends HTMLElement>(
+  childProps: AnyProps,
+  slotProps: DOMMotionProps<T>
+): AnyProps {
+  const merged: AnyProps = { ...childProps, ...slotProps };
+
+  if (childProps.className || slotProps.className) {
+    merged.className = cn(
+      childProps.className as string,
+      slotProps.className as string
+    );
+  }
+
+  if (childProps.style || slotProps.style) {
+    merged.style = {
+      ...(childProps.style as React.CSSProperties),
+      ...(slotProps.style as React.CSSProperties),
+    };
+  }
+
+  return merged;
+}
+
+const Slot = React.forwardRef<HTMLElement, SlotProps>(function Slot<
+  T extends HTMLElement = HTMLElement,
+>({ children, ...props }: Omit<SlotProps<T>, 'ref'>, ref: React.Ref<T>) {
+  const isAlreadyMotion =
+    typeof children.type === 'object' &&
+    children.type !== null &&
+    isMotionComponent(children.type);
+
+  const Base = React.useMemo(
+    () =>
+      isAlreadyMotion
+        ? (children.type as React.ElementType)
+        : motion.create(children.type as React.ElementType),
+    [isAlreadyMotion, children.type]
+  );
+
+  if (!React.isValidElement(children)) return null;
+
+  const childProps = children.props as AnyProps;
+
+  const mergedProps = mergeProps(childProps, props);
+
+  return <Base {...mergedProps} ref={ref} />;
+}) as <T extends HTMLElement = HTMLElement>(
+  props: SlotProps<T> & { ref?: React.Ref<T> }
+) => React.ReactElement | null;
+
+export {
+  Slot,
+  type AnyProps,
+  type DOMMotionProps,
+  type SlotProps,
+  type WithAsChild,
+};

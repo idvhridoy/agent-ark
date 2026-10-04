@@ -1,0 +1,207 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+import { proxyFetchGet } from '@/api/http';
+import { getAuthEnvironmentKey } from '@/lib/authEnvironment';
+import { HistoryTask, ProjectGroup } from '@/types/history';
+
+const groupedHistoryRequests = new Map<
+  string,
+  Promise<ProjectGroup[] | null>
+>();
+
+export const fetchGroupedHistoryProjects = async (options?: {
+  spaceId?: string | null;
+  includeTasks?: boolean;
+}): Promise<ProjectGroup[] | null> => {
+  const params = new URLSearchParams({
+    include_tasks: String(options?.includeTasks ?? true),
+  });
+  if (options?.spaceId) params.set('space_id', options.spaceId);
+  const query = params.toString();
+  const requestKey = `${getAuthEnvironmentKey()}::${query}`;
+  const inFlight = groupedHistoryRequests.get(requestKey);
+  if (inFlight) return inFlight;
+
+  const request = (async () => {
+    const res = await proxyFetchGet(`/api/v1/chat/histories/grouped?${query}`);
+    return res?.projects ?? null;
+  })();
+  groupedHistoryRequests.set(requestKey, request);
+  try {
+    return await request;
+  } finally {
+    if (groupedHistoryRequests.get(requestKey) === request) {
+      groupedHistoryRequests.delete(requestKey);
+    }
+  }
+};
+
+// Group tasks by project_id and add project-level metadata
+const groupTasksByProject = (tasks: HistoryTask[]): ProjectGroup[] => {
+  const projectMap = new Map<string, ProjectGroup>();
+
+  tasks.forEach((task) => {
+    const projectId = task.project_id;
+
+    if (!projectMap.has(projectId)) {
+      projectMap.set(projectId, {
+        project_id: projectId,
+        space_id: task.space_id,
+        project_name: task.project_name || `Project ${projectId}`,
+        total_tokens: 0,
+        task_count: 0,
+        total_triggers: 0,
+        latest_task_date: task.created_at || new Date().toISOString(),
+        tasks: [],
+        total_completed_tasks: 0,
+        total_ongoing_tasks: 0,
+        average_tokens_per_task: 0,
+        last_prompt: task.question || '',
+      });
+    }
+
+    const project = projectMap.get(projectId)!;
+    project.tasks.push(task);
+    project.task_count++;
+    project.total_tokens += task.tokens || 0;
+
+    // ChatStatus enum: ongoing = 1, done = 2
+    if (task.status === 2) {
+      // ChatStatus.done (completed)
+      project.total_completed_tasks++;
+    } else if (task.status === 1) {
+      // ChatStatus.ongoing (pending/running etc..)
+      project.total_ongoing_tasks++;
+    }
+
+    // Update latest task date
+    if (task.created_at && task.created_at > project.latest_task_date) {
+      project.latest_task_date = task.created_at;
+    }
+  });
+
+  // Calculate averages and sort tasks within each project
+  projectMap.forEach((project) => {
+    project.average_tokens_per_task =
+      project.task_count > 0
+        ? Math.round(project.total_tokens / project.task_count)
+        : 0;
+
+    // Sort tasks by creation date (newest first)
+    project.tasks.sort((a, b) => {
+      const dateA = new Date(a.created_at || 0).getTime();
+      const dateB = new Date(b.created_at || 0).getTime();
+      return dateB - dateA;
+    });
+  });
+
+  // Convert to array and sort by latest task date (newest first)
+  return Array.from(projectMap.values()).sort((a, b) => {
+    const dateA = new Date(a.latest_task_date).getTime();
+    const dateB = new Date(b.latest_task_date).getTime();
+    return dateB - dateA;
+  });
+};
+
+export const fetchHistoryTasks = async (
+  setTasks: React.Dispatch<React.SetStateAction<any[]>>
+) => {
+  try {
+    const res = await proxyFetchGet(`/api/v1/chat/histories`);
+    setTasks(res.items);
+  } catch (error) {
+    console.error('Failed to fetch history tasks:', error);
+    setTasks([]);
+  }
+};
+
+// New function to fetch grouped history tasks from the backend endpoint
+export const fetchGroupedHistoryTasks = async (
+  setProjects: React.Dispatch<React.SetStateAction<ProjectGroup[]>>,
+  options?: { spaceId?: string | null }
+) => {
+  try {
+    const projects = await fetchGroupedHistoryProjects({
+      spaceId: options?.spaceId,
+      includeTasks: true,
+    });
+    // If the response doesn't have projects field, fall back to legacy grouping
+    if (!projects) {
+      await fetchGroupedHistoryTasksLegacy(setProjects, options);
+    } else {
+      setProjects(projects);
+    }
+  } catch (error) {
+    console.error(
+      'Failed to fetch grouped history tasks, falling back to legacy:',
+      error
+    );
+    // Fall back to legacy grouping if the new endpoint fails
+    await fetchGroupedHistoryTasksLegacy(setProjects, options);
+  }
+};
+
+// Function to fetch grouped history summaries only (without individual tasks for better performance)
+export const fetchGroupedHistorySummaries = async (
+  setProjects: React.Dispatch<React.SetStateAction<ProjectGroup[]>>,
+  options?: { spaceId?: string | null }
+) => {
+  try {
+    const projects = await fetchGroupedHistoryProjects({
+      spaceId: options?.spaceId,
+      includeTasks: false,
+    });
+    // If the response doesn't have projects field, fall back to legacy grouping
+    if (!projects) {
+      await fetchGroupedHistoryTasksLegacy(setProjects, options);
+    } else {
+      setProjects(projects);
+    }
+  } catch (error) {
+    console.error(
+      'Failed to fetch grouped history summaries, falling back to legacy:',
+      error
+    );
+    // Fall back to legacy grouping if the new endpoint fails
+    await fetchGroupedHistoryTasksLegacy(setProjects, options);
+  }
+};
+
+// Legacy function for backward compatibility - groups on frontend
+export const fetchGroupedHistoryTasksLegacy = async (
+  setProjects: React.Dispatch<React.SetStateAction<ProjectGroup[]>>,
+  options?: { spaceId?: string | null }
+) => {
+  try {
+    const res = await proxyFetchGet(`/api/v1/chat/histories`);
+    const tasks = options?.spaceId
+      ? res.items.filter(
+          (task: HistoryTask) => task.space_id === options.spaceId
+        )
+      : res.items;
+    const groupedProjects = groupTasksByProject(tasks);
+    setProjects(groupedProjects);
+  } catch (error) {
+    console.error('Failed to fetch grouped history tasks:', error);
+    setProjects([]);
+  }
+};
+
+// Utility function to get all tasks from grouped data (for backward compatibility)
+export const flattenProjectTasks = (
+  projects: ProjectGroup[]
+): HistoryTask[] => {
+  return projects.flatMap((project) => project.tasks);
+};

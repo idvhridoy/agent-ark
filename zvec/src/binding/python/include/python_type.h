@@ -1,0 +1,42 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <pybind11/pybind11.h>
+#include <zvec/ailego/io/io_backend.h>
+#include <zvec/db/status.h>
+#include <zvec/db/type.h>
+
+namespace py = pybind11;
+
+namespace zvec {
+
+class ZVecPyTyping {
+ public:
+  ZVecPyTyping() = delete;
+
+ public:
+  static void Initialize(py::module_ &m);
+
+ private:
+  static void bind_datatypes(py::module_ &m);
+  static void bind_index_types(py::module_ &m);
+  static void bind_metric_types(py::module_ &m);
+  static void bind_quantize_types(py::module_ &m);
+  static void bind_io_backend_types(py::module_ &m);
+  static void bind_status(py::module_ &m);
+};
+
+}  // namespace zvec

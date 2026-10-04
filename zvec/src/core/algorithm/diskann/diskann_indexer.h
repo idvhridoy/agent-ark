@@ -1,0 +1,141 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <cstdint>
+#include <turbo/quantizer/quantizer.h>
+#include <zvec/core/framework/index_framework.h>
+#include "diskann_context.h"
+#include "diskann_file_reader.h"
+#include "diskann_searcher_entity.h"
+#include "diskann_util.h"
+
+namespace zvec {
+namespace core {
+
+class DiskAnnCacheTestPeer;
+
+class DiskAnnIndexer {
+ public:
+  typedef std::shared_ptr<DiskAnnIndexer> Pointer;
+
+ public:
+  DiskAnnIndexer(const IndexMeta &meta);
+  ~DiskAnnIndexer();
+
+ public:
+  //! Initialize with the loaded entity and the quantizer constructed by
+  //! the searcher/streamer (see
+  //! DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer).
+  //! Any turbo::Quantizer works here; PQ is just the current default.
+  int init(DiskAnnSearcherEntity &entity, turbo::Quantizer::Pointer quantizer);
+
+  int configure_cache(uint32_t cache_node_num);
+
+  int cached_beam_search(DiskAnnContext *ctx);
+  int cached_beam_search_by_group(DiskAnnContext *ctx);
+
+  int cached_beam_search_in_mem(DiskAnnContext *ctx);
+
+  int knn_search(DiskAnnContext *ctx);
+  int linear_search(DiskAnnContext *ctx);
+  int keys_search(const std::vector<diskann_key_t> &keys, DiskAnnContext *ctx);
+
+  //! Release lazy per-context reader resources at a public operation boundary.
+  void release_io_ctx(DiskAnnContext *ctx);
+
+  int get_vector(diskann_id_t id, IndexContext::Pointer &context,
+                 std::string &vector);
+
+  bool requires_io_context() const {
+    return reader_ && reader_->requires_io_context();
+  }
+
+  diskann_key_t get_key(diskann_id_t id) const;
+  diskann_id_t get_id(diskann_key_t key) const;
+
+  //! Copy element_size() bytes from src into a new vector value string
+  std::string make_vector_copy(const void *src) const {
+    return std::string(static_cast<const char *>(src), meta_.element_size());
+  }
+
+  std::vector<bool> read_nodes(
+      const std::vector<diskann_id_t> &node_ids,
+      std::vector<void *> &coord_buffers,
+      std::vector<std::pair<uint32_t, diskann_id_t *>> &nbr_buffers);
+
+ protected:
+  int use_medroids_data_as_centroids();
+  void populate_group_topk_heaps(DiskAnnContext *ctx);
+
+ private:
+  struct CacheSlot {
+    diskann_id_t id{0};
+    uint32_t neighbor_count{0};
+    bool loaded{false};
+  };
+
+  struct CacheLoadState {
+    size_t capacity{0};
+    std::vector<CacheSlot> slots;
+  };
+
+  uint32_t effective_cache_node_count(uint32_t requested_nodes) const;
+  int prepare_cache_storage(size_t capacity, CacheLoadState &state);
+  int load_cache_list(CacheLoadState &state);
+  int cache_bfs_levels(uint64_t num_nodes_to_cache, CacheLoadState &state);
+  void reset_cache_storage();
+  int cached_beam_search_impl(DiskAnnContext *ctx);
+
+  DiskAnnEntity::Pointer entity_{};
+  IndexStorage::Pointer storage_{};
+
+  IndexMeta meta_;
+
+  uint32_t max_degree_{0};
+  uint32_t node_per_sector_{0};
+  uint32_t max_node_size_{0};
+  uint64_t quant_code_size_{0};
+  uint64_t disk_bytes_per_point_{0};
+  uint64_t index_segment_offset_{0};
+  uint64_t sector_num_per_node_{0};
+
+  void *centroid_data_{nullptr};
+  size_t centroid_stride_{0};
+
+  diskann_id_t medoid_;
+  std::vector<diskann_id_t> entrypoints_;
+
+  std::shared_ptr<AlignedFileReader> reader_{nullptr};
+
+  turbo::Quantizer::Pointer quantizer_;
+  const uint8_t *quant_codes_{nullptr};
+
+  IOContext init_ctx_{};
+
+  std::vector<diskann_id_t> neighbor_cache_buffer_;
+  void *coord_cache_buf_{nullptr};
+
+  std::map<diskann_id_t, void *> coord_cache_;
+  std::map<diskann_id_t, std::pair<uint32_t, diskann_id_t *>> neighbor_cache_;
+  uint32_t beam_width_{2};
+  uint32_t io_limit_{std::numeric_limits<uint32_t>::max()};
+
+  uint64_t doc_cnt_{0};
+
+  friend class DiskAnnCacheTestPeer;
+};
+
+}  // namespace core
+}  // namespace zvec

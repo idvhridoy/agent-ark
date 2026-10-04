@@ -1,0 +1,76 @@
+---
+title: "Using AI in the builder"
+description: "Chat with the built-in AI assistant in the builder to review proposed resume changes before applying them, and add an optional AI review to the ATS check."
+---
+
+Reactive Resume includes two AI-assisted builder workflows:
+
+- The **AI assistant** opens as a side panel in the builder, scoped to the open resume, so you can chat and apply edits inline.
+- The **ATS Check** section can add an optional AI review of your writing on top of its deterministic report.
+
+<Info>
+  These features require a tested and enabled AI provider in **Dashboard → Settings → Integrations**. For setup, see
+  [Using artificial intelligence](/guides/using-ai).
+</Info>
+
+## Review the writing from the ATS check
+
+The **ATS Check** section in the right sidebar runs without AI: its checks are deterministic and run in your browser. Once a deep check has produced a report, it offers an optional AI review of the writing: weak phrasing, bullets that describe duties rather than outcomes, and where a rewrite would land better.
+
+The review sends the text already extracted from your rendered PDF to the provider you pick, and returns no score. See [Using the ATS checker](/guides/using-the-ats-checker).
+
+## Open the AI assistant
+
+Click the **Sparkle** button in the builder header, next to the resume name, to open the assistant.
+
+The assistant opens as a side panel next to your resume. It uses the same chat interface as the AI Agent workspace, but stays scoped to the resume you are editing. Its edits land in the builder immediately, appear in the preview, and are captured in undo history and version history.
+
+If AI is unavailable, the panel shows a link to **Integrations** so you can configure a provider.
+
+<Tip>
+  The Sparkle button is the in-builder assistant. The chat-bubble icon on the floating dock opens the full **AI Agent**
+  workspace in a new page, which suits longer, standalone conversations that create their own draft. See [Using the AI
+  Agent Workspace](/guides/using-ai-agent).
+</Tip>
+
+## Ask for targeted changes
+
+The assistant works best when you ask for specific, incremental changes.
+
+Good prompts:
+
+- "Rewrite my summary for a senior frontend engineer role."
+- "Tighten the bullets in my most recent job."
+- "Add measurable impact to my project descriptions."
+- "Adapt this resume for the job description below."
+
+Avoid asking it to rewrite everything at once unless you are prepared to review many changes.
+
+## Review proposals before applying them
+
+When the assistant proposes edits, Reactive Resume shows a review card with:
+
+- a proposal title and summary;
+- badges for the proposed operations;
+- before and after previews;
+- the raw JSON Patch for users who want to inspect the exact operations.
+
+You can:
+
+- **Accept** one proposal;
+- **Reject** one proposal;
+- move between proposals with **Prev** and **Next**;
+- **Accept all** or **Reject all** from the split-button menu.
+
+Accepted edits are saved through the normal update path, so they show up in the preview, in undo history, and in version history. If you change your mind, use `Cmd/Ctrl+Z` or restore an earlier snapshot from the clock menu. See [Undoing changes and version history](/guides/undoing-changes-and-version-history).
+
+<Warning>
+  Review AI proposals before accepting them. AI can introduce wording that is inaccurate, too generic, or not aligned
+  with your actual experience.
+</Warning>
+
+## When a proposal cannot be applied
+
+A proposal can fail if the resume changed after the assistant generated it, if the resume is locked, or if the proposed patch no longer matches the current resume data.
+
+If that happens, ask the assistant to regenerate the change from the latest version of the resume.

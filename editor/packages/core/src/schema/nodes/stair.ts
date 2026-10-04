@@ -1,0 +1,196 @@
+import dedent from 'dedent'
+import { z } from 'zod'
+import { BaseNode, nodeType, objectId } from '../base'
+import type { MaterialSchema as MaterialSchemaType } from '../material'
+import { MaterialSchema } from '../material'
+import { StairSegmentNode } from './stair-segment'
+
+export const StairRailingMode = z.enum(['none', 'left', 'right', 'both'])
+/**
+ * How a straight flight's guard is built: 'balusters' — the round baluster
+ * at every nosing with two round rails (the original); 'post-and-rail' —
+ * the way a deck stair is built: 4x4 posts no more than 4 ft apart (two on a
+ * short flight), a top rail and a bottom rail following the flight, 1½ in
+ * pickets between them at a 4 in-sphere gap (IRC R312.1.3); 'cable' — the
+ * same posts as 2 in slim posts, a flat cap rail, and ½ in cables 3 in apart
+ * running with the flight (the modern deck's cable rail).
+ */
+export const StairRailingStyle = z.enum(['balusters', 'post-and-rail', 'cable', 'boards'])
+export const StairType = z.enum(['straight', 'curved', 'spiral'])
+export const StairTopLandingMode = z.enum(['none', 'integrated'])
+export const StairSlabOpeningMode = z.enum(['none', 'destination'])
+
+export type StairRailingMode = z.infer<typeof StairRailingMode>
+export type StairRailingStyle = z.infer<typeof StairRailingStyle>
+export type StairType = z.infer<typeof StairType>
+export type StairTopLandingMode = z.infer<typeof StairTopLandingMode>
+export type StairSlabOpeningMode = z.infer<typeof StairSlabOpeningMode>
+export type StairSurfaceMaterialRole = 'railing' | 'tread' | 'side'
+export type StairSurfaceMaterialSpec = {
+  material?: MaterialSchemaType
+  materialPreset?: string
+}
+
+export const StairNode = BaseNode.extend({
+  id: objectId('stair'),
+  type: nodeType('stair'),
+  material: MaterialSchema.optional(),
+  materialPreset: z.string().optional(),
+  railingMaterial: MaterialSchema.optional(),
+  railingMaterialPreset: z.string().optional(),
+  treadMaterial: MaterialSchema.optional(),
+  treadMaterialPreset: z.string().optional(),
+  sideMaterial: MaterialSchema.optional(),
+  sideMaterialPreset: z.string().optional(),
+  // Unified paint-slot refs (`scene:`/`library:` MaterialRef per slot id),
+  // matching the slot model items/slab/shelf use. Absent = declared default.
+  slots: z.record(z.string(), z.string()).optional(),
+  position: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+  // Rotation around Y axis in radians
+  rotation: z.number().default(0),
+  // Persisted slab-support host — see ItemNode.supportSlabId for the rules.
+  supportSlabId: z.string().optional(),
+  stairType: StairType.default('straight'),
+  fromLevelId: z.string().nullable().default(null),
+  toLevelId: z.string().nullable().default(null),
+  // Destination deck (a slab id). When set, the stair's rise follows that
+  // slab's elevation live. An explicit `totalRise` still wins when BOTH are
+  // set (edge case — the panel clears the custom rise when attaching).
+  deckSlabId: z.string().optional(),
+  slabOpeningMode: StairSlabOpeningMode.default('none'),
+  openingOffset: z.number().default(0),
+  width: z.number().default(1.0),
+  totalRise: z.number().optional(),
+  stepCount: z.number().default(10),
+  thickness: z.number().default(0.25),
+  fillToFloor: z.boolean().default(true),
+  innerRadius: z.number().default(0.9),
+  sweepAngle: z.number().default(Math.PI / 2),
+  topLandingMode: StairTopLandingMode.default('none'),
+  topLandingDepth: z.number().default(0.9),
+  showCenterColumn: z.boolean().default(true),
+  showStepSupports: z.boolean().default(true),
+  railingMode: StairRailingMode.default('none'),
+  railingHeight: z.number().default(0.92),
+  railingStyle: StairRailingStyle.optional(),
+  // 'post-and-rail' only: false leaves the TOP post out so the rail dies
+  // into a post that already stands there (a porch's 6x6 beside the flight).
+  railingTopPost: z.boolean().optional(),
+  // Guard styles: how far past the top nosing, along the slope, the rails run
+  // to die into the post standing there (a porch post set back from the edge).
+  railingTopReach: z.number().min(0).optional(),
+  railingPostThrough: z.boolean().optional(),
+  // Child stair segment IDs
+  children: z.array(StairSegmentNode.shape.id).default([]),
+}).describe(
+  dedent`
+  Stair node - a container for stair segments.
+  Acts as a group that either holds one or more StairSegmentNodes (straight stairs)
+  or stores stair-level geometry properties for curved stairs.
+  - position: center position of the stair group
+  - rotation: rotation around Y axis
+  - stairType: straight (segment-based), curved (arc-based), or spiral
+  - fromLevelId / toLevelId: source and destination levels used for auto slab cutouts
+  - deckSlabId: destination deck (slab) — the rise derives from its elevation while set
+  - slabOpeningMode: whether a destination-level slab opening is generated for this stair
+  - openingOffset: extra opening expansion applied after the cutout polygon is computed
+  - width: stair width
+  - totalRise: total stair height
+  - stepCount: number of visible steps
+  - thickness: stair slab / tread thickness
+  - fillToFloor: whether the stair mass fills down to the floor or uses tread thickness only
+  - innerRadius: inner curve radius for curved stairs
+  - sweepAngle: total curved stair sweep in radians
+  - topLandingMode: optional integrated top landing for spiral stairs
+  - topLandingDepth: depth used to size the integrated spiral top landing
+  - showCenterColumn: whether spiral stairs render a center column
+  - showStepSupports: whether spiral stairs render step support brackets
+  - railingMode: whether to render railings and on which side(s)
+  - railingHeight: top height of the railing above the stair surface
+  - railingStyle: 'balusters' (round balusters at every nosing, two round rails) | the DCA 6 deck-stair guard — 4x4 posts ≤ 4 ft apart, a 2x6 cap rail with a 2x4 top rail under it, and the infill: 'post-and-rail' (2x2 balusters on a 2x4 bottom rail, 4 in gap), 'cable' (½ in cables 3 in apart, straight with the flight), 'boards' (1x6 boards with the flight); 'balusters' when absent
+  - railingTopPost: guard styles only — false leaves the top post out so the rails die into a post already standing there (a porch post); railingTopReach runs the rails that far past the top nosing along the slope to reach it (top post on, reach 0 when absent)
+  - railingPostThrough: guard styles — the posts run past the cap rail and get a cap of their own (off when absent)
+  - children: array of StairSegmentNode IDs for straight stairs
+  `,
+)
+
+export type StairNode = z.infer<typeof StairNode>
+
+function getLegacyStairSurfaceMaterial(node: StairNode): StairSurfaceMaterialSpec {
+  return {
+    material: node.material,
+    materialPreset: node.materialPreset,
+  }
+}
+
+export function getEffectiveStairSurfaceMaterial(
+  node: StairNode,
+  role: StairSurfaceMaterialRole,
+): StairSurfaceMaterialSpec {
+  if (role === 'railing') {
+    if (node.railingMaterial !== undefined || typeof node.railingMaterialPreset === 'string') {
+      return {
+        material: node.railingMaterial,
+        materialPreset:
+          typeof node.railingMaterialPreset === 'string' ? node.railingMaterialPreset : undefined,
+      }
+    }
+  }
+
+  if (role === 'tread') {
+    if (node.treadMaterial !== undefined || typeof node.treadMaterialPreset === 'string') {
+      return {
+        material: node.treadMaterial,
+        materialPreset:
+          typeof node.treadMaterialPreset === 'string' ? node.treadMaterialPreset : undefined,
+      }
+    }
+  }
+
+  if (role === 'side') {
+    if (node.sideMaterial !== undefined || typeof node.sideMaterialPreset === 'string') {
+      return {
+        material: node.sideMaterial,
+        materialPreset:
+          typeof node.sideMaterialPreset === 'string' ? node.sideMaterialPreset : undefined,
+      }
+    }
+  }
+
+  const treadFallback = {
+    material: node.treadMaterial,
+    materialPreset:
+      typeof node.treadMaterialPreset === 'string' ? node.treadMaterialPreset : undefined,
+  }
+  const sideFallback = {
+    material: node.sideMaterial,
+    materialPreset:
+      typeof node.sideMaterialPreset === 'string' ? node.sideMaterialPreset : undefined,
+  }
+
+  if (
+    role === 'tread' &&
+    (sideFallback.material !== undefined || sideFallback.materialPreset !== undefined)
+  ) {
+    return sideFallback
+  }
+
+  if (
+    role === 'side' &&
+    (treadFallback.material !== undefined || treadFallback.materialPreset !== undefined)
+  ) {
+    return treadFallback
+  }
+
+  if (role === 'railing') {
+    if (treadFallback.material !== undefined || treadFallback.materialPreset !== undefined) {
+      return treadFallback
+    }
+
+    if (sideFallback.material !== undefined || sideFallback.materialPreset !== undefined) {
+      return sideFallback
+    }
+  }
+
+  return getLegacyStairSurfaceMaterial(node)
+}

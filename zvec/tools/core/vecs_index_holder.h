@@ -1,0 +1,443 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <string>
+#include <unordered_map>
+#include <zvec/ailego/container/params.h>
+#include "zvec/core/framework/index_error.h"
+#include "zvec/core/framework/index_holder.h"
+#include "zvec/core/framework/index_provider.h"
+#include "zvec/core/framework/index_storage.h"
+#include "vecs_reader.h"
+
+namespace zvec {
+namespace core {
+
+/*!
+ * Vecs Index Holder
+ *  framwork will use IndexHolder in this way:
+ *  for (iter = create_iterator(); iter->is_valid(); iter->next()) {
+ *      key = iter->key();
+ *      data = iter->data();
+ *  }
+ */
+class VecsIndexHolder : public IndexProvider {
+ public:
+  typedef std::shared_ptr<VecsIndexHolder> Pointer;
+
+  bool load(const std::string &file_path) {
+    if (!vecs_reader_.load(file_path)) {
+      return false;
+    }
+    build_key_index_map();
+    return true;
+  }
+
+  const IndexMeta &index_meta() const {
+    return vecs_reader_.index_meta();
+  }
+
+  void set_metric(const std::string &name, const ailego::Params &params) {
+    vecs_reader_.set_metric(name, params);
+  }
+
+  /*!
+   * Index Holder Iterator
+   */
+  class Iterator : public IndexHybridHolder::Iterator {
+   public:
+    //! Constructor
+    Iterator(const VecsIndexHolder &holder, uint32_t cursor)
+        : cursor_(cursor),
+          start_cursor_(cursor),
+          end_cursor_(holder.end_cursor()),
+          vecs_reader_(holder.vecs_reader_),
+          stop_(holder.stop_) {}
+
+    //! Test if the iterator is valid
+    bool is_valid() const override {
+      return !stop_ && cursor_ < end_cursor_;
+    }
+
+    //! Retrieve primary key
+    uint64_t key() const override {
+      return vecs_reader_.get_key(cursor_);
+    }
+
+    //! Retrieve pointer of data
+    const void *data() const override {
+      return vecs_reader_.get_vector(cursor_);
+    }
+
+    //! Retrieve primary key
+    uint32_t sparse_count() const override {
+      return vecs_reader_.get_sparse_count(cursor_);
+    }
+
+    //! Retrieve primary key
+    const uint32_t *sparse_indices() const override {
+      return vecs_reader_.get_sparse_indices(cursor_);
+    }
+
+    //! Retrieve primary key
+    const void *sparse_data() const override {
+      return vecs_reader_.get_sparse_data(cursor_);
+    }
+
+    //! Next iterator
+    void next() override {
+      ++cursor_;
+    }
+
+    //! Reset the iterator
+    virtual void reset() {
+      cursor_ = start_cursor_;
+    }
+
+   private:
+    size_t cursor_;
+    const size_t start_cursor_;
+    const size_t end_cursor_;
+    const VecsReader &vecs_reader_;
+    const bool &stop_;
+  };
+
+  IndexHolder::Iterator::Pointer create_iterator() override {
+    // make sure iter has value whenn create_iterator finished
+    IndexHolder::Iterator::Pointer iter(
+        new VecsIndexHolder::Iterator(*this, start_cursor_));
+    return iter;
+  }
+
+  IndexHybridHolder::Iterator::Pointer create_hybrid_iterator() {
+    // make sure iter has value whenn create_iterator finished
+    IndexHybridHolder::Iterator::Pointer iter(
+        new VecsIndexHolder::Iterator(*this, start_cursor_));
+    return iter;
+  }
+
+  //! Number of records in the selected iterator range.
+  size_t count() const override {
+    const size_t end = end_cursor();
+    return end > start_cursor_ ? end - start_cursor_ : 0;
+  }
+
+  //! Exclusive file offset after applying MaxDocs. Random-access methods and
+  //! the streaming benchmark use original file offsets, not selected offsets.
+  size_t end_cursor() const {
+    return max_doc_count_ != 0
+               ? std::min(max_doc_count_, vecs_reader_.num_vecs())
+               : vecs_reader_.num_vecs();
+  }
+
+  //! Retrieve dimension
+  size_t dimension() const override {
+    return vecs_reader_.index_meta().dimension();
+  }
+
+  //! Retrieve type information
+  IndexMeta::DataType data_type() const override {
+    return vecs_reader_.index_meta().data_type();
+  }
+
+  //! Retrieve element size in bytes
+  size_t element_size() const override {
+    return vecs_reader_.index_meta().element_size();
+  }
+
+  //! Retrieve if it can multi-pass
+  bool multipass() const override {
+    return true;
+  }
+
+  void stop() {
+    stop_ = true;
+  }
+
+  uint64_t get_num_vecs() const {
+    return vecs_reader_.num_vecs();
+  }
+
+  uint64_t get_key(size_t idx) const {
+    return vecs_reader_.get_key(idx);
+  }
+
+  uint32_t get_sparse_count(size_t idx) const {
+    return vecs_reader_.get_sparse_count(idx);
+  }
+
+  const uint32_t *get_sparse_indices(size_t idx) const {
+    return vecs_reader_.get_sparse_indices(idx);
+  }
+
+  const void *get_sparse_data(size_t idx) const {
+    return vecs_reader_.get_sparse_data(idx);
+  }
+
+  void set_start_cursor(uint32_t index) {
+    start_cursor_ = index;
+  }
+
+  void set_max_doc_count(size_t value) {
+    max_doc_count_ = value;
+  }
+
+  uint32_t start_cursor() const {
+    return start_cursor_;
+  }
+
+  size_t total_sparse_count() const {
+    return vecs_reader_.get_total_sparse_count();
+  }
+
+  bool has_taglist() const {
+    return vecs_reader_.has_taglist();
+  }
+
+  uint64_t get_taglist_count(size_t index) const {
+    return vecs_reader_.get_taglist_count(index);
+  }
+
+  const void *get_taglist(size_t index) const {
+    return vecs_reader_.get_taglist(index);
+  }
+
+  const void *get_taglist_data(size_t &size) const {
+    return vecs_reader_.get_taglist_data(size);
+  }
+
+  const void *get_key_base() const {
+    return vecs_reader_.key_base();
+  }
+
+  const void *get_vector_by_index(size_t idx) const {
+    return vecs_reader_.get_vector(idx);
+  }
+
+ public:  // IndexProvider interface implementation
+  //! Retrieve a vector using a primary key
+  const void *get_vector(const uint64_t key) const override {
+    auto it = key_to_index_map_.find(key);
+    if (it == key_to_index_map_.end()) {
+      return nullptr;
+    }
+    return vecs_reader_.get_vector(it->second);
+  }
+
+  //! Retrieve a vector using a primary key
+  int get_vector(const uint64_t key,
+                 IndexStorage::MemoryBlock &block) const override {
+    const void *vector = get_vector(key);
+    if (vector == nullptr) {
+      return IndexError_NoExist;
+    }
+    block.reset((void *)vector);
+    return 0;
+  }
+
+  //! Retrieve the owner class
+  const std::string &owner_class() const override {
+    static std::string owner_class_name = "VecsIndexHolder";
+    return owner_class_name;
+  }
+
+ private:
+  //! Build key to index mapping
+  void build_key_index_map() {
+    key_to_index_map_.clear();
+    size_t num_vecs = vecs_reader_.num_vecs();
+    for (size_t i = 0; i < num_vecs; ++i) {
+      uint64_t key = vecs_reader_.get_key(i);
+      key_to_index_map_[key] = i;
+    }
+  }
+
+  bool stop_{false};
+  uint32_t start_cursor_{0};
+  VecsReader vecs_reader_;
+  size_t max_doc_count_{0};
+  std::unordered_map<uint64_t, size_t> key_to_index_map_;
+};
+
+/*!
+ * Vecs Index Sparse Holder
+ *  framwork will use IndexHolder in this way:
+ *  for (iter = create_iterator(); iter->is_valid(); iter->next()) {
+ *      key = iter->key();
+ *      data = iter->sparse_data();
+ *  }
+ */
+class VecsIndexSparseHolder : public IndexSparseHolder {
+ public:
+  typedef std::shared_ptr<VecsIndexSparseHolder> Pointer;
+
+  bool load(const std::string &file_path) {
+    return vecs_reader_.load(file_path);
+  }
+
+  const IndexMeta &index_meta() const {
+    return vecs_reader_.index_meta();
+  }
+
+  void set_metric(const std::string &name, const ailego::Params &params) {
+    vecs_reader_.set_metric(name, params);
+  }
+
+  /*!
+   * Index Holder Iterator
+   */
+  class Iterator : public IndexSparseHolder::Iterator {
+   public:
+    //! Constructor
+    Iterator(const VecsIndexSparseHolder &holder, uint32_t cursor)
+        : cursor_(cursor),
+          vecs_reader_(holder.vecs_reader_),
+          stop_(holder.stop_) {}
+
+    //! Test if the iterator is valid
+    bool is_valid() const override {
+      return !stop_ && cursor_ < vecs_reader_.num_vecs();
+    }
+
+    //! Retrieve primary key
+    uint64_t key() const override {
+      return vecs_reader_.get_key(cursor_);
+    }
+
+    //! Retrieve primary key
+    uint32_t sparse_count() const override {
+      return vecs_reader_.get_sparse_count(cursor_);
+    }
+
+    //! Retrieve primary key
+    const uint32_t *sparse_indices() const override {
+      return vecs_reader_.get_sparse_indices(cursor_);
+    }
+
+    //! Retrieve primary key
+    const void *sparse_data() const override {
+      return vecs_reader_.get_sparse_data(cursor_);
+    }
+
+    //! Next iterator
+    void next() override {
+      ++cursor_;
+    }
+
+    //! Reset the iterator
+    virtual void reset() {
+      cursor_ = 0;
+    }
+
+   private:
+    size_t cursor_;
+    const SparseVecsReader &vecs_reader_;
+    const bool &stop_;
+  };
+
+  IndexSparseHolder::Iterator::Pointer create_iterator() override {
+    // make sure iter has value whenn create_iterator finished
+    IndexSparseHolder::Iterator::Pointer iter(
+        new VecsIndexSparseHolder::Iterator(*this, start_cursor_));
+    return iter;
+  }
+
+  //! Retrieve count of elements in holder
+  size_t count() const override {
+    return max_doc_count_ != 0
+               ? std::min(max_doc_count_, vecs_reader_.num_vecs())
+               : vecs_reader_.num_vecs();
+  }
+
+  //! Retrieve type information
+  IndexMeta::DataType data_type() const override {
+    return vecs_reader_.index_meta().data_type();
+  }
+
+  //! Retrieve if it can multi-pass
+  bool multipass() const override {
+    return true;
+  }
+
+  void stop() {
+    stop_ = true;
+  }
+
+  uint64_t get_key(size_t idx) const {
+    return vecs_reader_.get_key(idx);
+  }
+
+  uint32_t get_sparse_count(size_t idx) const {
+    return vecs_reader_.get_sparse_count(idx);
+  }
+
+  const uint32_t *get_sparse_indices(size_t idx) const {
+    return vecs_reader_.get_sparse_indices(idx);
+  }
+
+  const void *get_sparse_data(size_t idx) const {
+    return vecs_reader_.get_sparse_data(idx);
+  }
+
+  void set_start_cursor(uint32_t index) {
+    start_cursor_ = index;
+  }
+
+  void set_max_doc_count(size_t value) {
+    max_doc_count_ = value;
+  }
+
+  uint64_t get_num_vecs() const {
+    return vecs_reader_.num_vecs();
+  }
+
+  uint32_t start_cursor() const {
+    return start_cursor_;
+  }
+
+  size_t total_sparse_count() const override {
+    return vecs_reader_.get_total_sparse_count();
+  }
+
+  bool has_taglist() const {
+    return vecs_reader_.has_taglist();
+  }
+
+  uint64_t get_taglist_count(size_t index) const {
+    return vecs_reader_.get_taglist_count(index);
+  }
+
+  const void *get_taglist(size_t index) const {
+    return vecs_reader_.get_taglist(index);
+  }
+
+  const void *get_taglist_data(size_t &size) const {
+    return vecs_reader_.get_taglist_data(size);
+  }
+
+  const void *get_key_base() const {
+    return vecs_reader_.key_base();
+  }
+
+ private:
+  bool stop_{false};
+  uint32_t start_cursor_{0};
+  SparseVecsReader vecs_reader_;
+  size_t max_doc_count_{0};
+};
+
+}  // namespace core
+}  // namespace zvec

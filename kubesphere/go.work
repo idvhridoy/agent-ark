@@ -1,0 +1,10 @@
+go 1.24.3
+
+godebug default=go1.24
+
+use (
+	.
+	./staging/src/kubesphere.io/api
+	./staging/src/kubesphere.io/client-go
+	./staging/src/kubesphere.io/utils
+)

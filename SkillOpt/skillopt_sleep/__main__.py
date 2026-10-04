@@ -1,0 +1,932 @@
+"""SkillOpt-Sleep — command-line interface.
+
+    python -m skillopt_sleep run        # full cycle: harvest->mine->replay->gate->stage
+    python -m skillopt_sleep dry-run    # same but report only, no staging/adopt
+    python -m skillopt_sleep status     # show state + latest staged proposal
+    python -m skillopt_sleep adopt      # apply the latest staged proposal (with backup)
+    python -m skillopt_sleep adopt --skill NAME   # adopt one staged skill (repeatable)
+    python -m skillopt_sleep harvest    # just print what would be mined (debug)
+
+Common flags:
+    --project PATH      project to evolve (default: cwd)
+    --scope all|invoked harvest scope (default: invoked)
+    --max-sessions N    cap transcript sessions per run
+    --max-tasks N       cap mined tasks per run
+    --target-skill-path PATH explicit live SKILL.md to stage/adopt
+    --tasks-file PATH   reviewed TaskRecord JSON file to replay instead of harvesting
+    --backend mock|claude|codex|copilot|cursor|pi|opencode|handoff|azure_openai
+    --source claude|codex|copilot|copilot_cli|cursor|pi|opencode|auto
+    --vscode-workspace-storage PATH
+    --copilot-cli-session-store PATH
+    --opencode-db PATH
+    --model NAME
+    --lookback-hours N
+    --auto-adopt
+    --json              machine-readable output
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from typing import Any, Dict
+
+from skillopt_sleep.backend import CursorBackendError
+from skillopt_sleep.config import load_config
+from skillopt_sleep.cycle import _one_line_display_text, run_sleep_cycle
+from skillopt_sleep.harvest_sources import harvest_for_config
+from skillopt_sleep.mine import mine
+from skillopt_sleep.staging import (
+    StagingError,
+    adopt_skills,
+    has_pending_staged_managed,
+    json_safe,
+    latest_staging,
+    pending_staged_skills,
+    staged_skills,
+)
+from skillopt_sleep.staging import adopt as adopt_staging
+from skillopt_sleep.state import SleepState
+from skillopt_sleep.tasks_file import load_tasks_file, make_tasks_payload, write_tasks_file
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _report_payload(rep, outcome) -> Dict[str, Any]:
+    staged_names = []
+    if outcome.staging_dir:
+        try:
+            staged_names = [
+                row.get("skill_name", "")
+                for row in pending_staged_skills(outcome.staging_dir)
+            ]
+        except Exception:
+            staged_names = []
+    return json_safe({
+        "night": rep.night,
+        "accepted": rep.accepted,
+        "gate_action": rep.gate_action,
+        "no_edits_reason": getattr(rep, "no_edits_reason", ""),
+        "baseline": rep.baseline_score,
+        "candidate": rep.candidate_score,
+        "n_tasks": rep.n_tasks,
+        "n_sessions": rep.n_sessions,
+        "n_accepted_edits": len(rep.edits),
+        "n_rejected_edits": len(rep.rejected_edits),
+        "edits": [e.__dict__ for e in rep.edits],
+        "rejected_edits": [e.__dict__ for e in rep.rejected_edits],
+        "gate_no_regression": bool(getattr(rep, "gate_no_regression", False)),
+        "gate_trials": _redact_deep(getattr(rep, "gate_trials", [])),
+        "skill_groups": [
+            group.to_dict() for group in getattr(rep, "skill_groups", [])
+        ],
+        "notes": rep.notes,
+        "staging_dir": outcome.staging_dir,
+        "staged_skills": staged_names,
+        "adopted": outcome.adopted,
+    })
+
+
+def _add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--project", default="")
+    p.add_argument("--scope", default="", choices=["", "all", "invoked"])
+    p.add_argument("--backend", default="",
+                   choices=["", "mock", "claude", "codex", "copilot", "cursor", "pi",
+                            "opencode", "handoff", "azure_openai"])
+    p.add_argument("--model", default="")
+    p.add_argument("--codex-path", default="", help="path to the real @openai/codex binary")
+    p.add_argument("--cursor-path", default="", help="path to the Cursor Agent CLI")
+    p.add_argument("--pi-path", default="", help="path to the Pi coding-agent CLI")
+    p.add_argument("--opencode-path", default="", help="path to the OpenCode CLI")
+    p.add_argument(
+        "--opencode-tool-replay",
+        action="store_true",
+        help="allow controlled synthetic tools for OpenCode tool-aware replay",
+    )
+    p.add_argument("--claude-home", default="", help="override ~/.claude (also isolates state)")
+    p.add_argument("--codex-home", default="", help="override ~/.codex for archived session harvest")
+    p.add_argument("--cursor-home", default="", help="override ~/.cursor for Cursor session harvest")
+    p.add_argument("--pi-home", default="", help="override ~/.pi for Pi session harvest")
+    p.add_argument("--source", default="",
+                   choices=["", "claude", "codex", "copilot", "copilot_cli", "cursor", "pi", "opencode", "auto"],
+                   help="session transcript source")
+    p.add_argument("--vscode-workspace-storage", default="",
+                   help="override VS Code User/workspaceStorage root for copilot source")
+    p.add_argument("--copilot-cli-session-store", default="",
+                   help="override ~/.copilot/session-store.db for copilot_cli source")
+    p.add_argument("--opencode-db", default="",
+                   help="override the local OpenCode transcript database")
+    p.add_argument("--lookback-hours", type=int, default=None,
+                   help="harvest window in hours; 0 = scan full history")
+    p.add_argument("--edit-budget", type=int, default=0)
+    p.add_argument("--max-sessions", type=int, default=0,
+                   help="cap harvested sessions before mining; default derives from max tasks")
+    p.add_argument("--max-tasks", type=int, default=0,
+                   help="cap mined tasks for this run")
+    p.add_argument("--target-skill-path", default="",
+                   help="explicit live SKILL.md path to evolve/stage/adopt")
+    p.add_argument(
+        "--skill-root",
+        dest="skill_roots",
+        action="append",
+        default=[],
+        help="additional root containing <skill-name>/SKILL.md (repeatable)",
+    )
+    p.add_argument("--tasks-file", default="",
+                   help="reviewed TaskRecord JSON file to replay instead of harvesting")
+    p.add_argument("--progress", action="store_true",
+                   help="print phase progress to stderr")
+    p.add_argument("--auto-adopt", action="store_true")
+    p.add_argument("--preferences", default="",
+                   help="free-text house rules injected into the optimizer's reflect step")
+    p.add_argument("--json", action="store_true")
+
+
+def _cfg_from_args(args, task_meta: Dict[str, Any] | None = None) -> Any:
+    overrides: Dict[str, Any] = {}
+    if args.project:
+        overrides["invoked_project"] = os.path.abspath(args.project)
+        overrides["projects"] = "invoked"
+    if args.scope:
+        overrides["projects"] = args.scope
+    if args.backend:
+        overrides["backend"] = args.backend
+    if args.model:
+        overrides["model"] = args.model
+    if getattr(args, "codex_path", ""):
+        overrides["codex_path"] = os.path.abspath(args.codex_path)
+    if getattr(args, "pi_path", ""):
+        overrides["pi_path"] = os.path.abspath(os.path.expanduser(args.pi_path))
+    if getattr(args, "cursor_path", ""):
+        overrides["cursor_path"] = os.path.abspath(os.path.expanduser(args.cursor_path))
+    if getattr(args, "opencode_path", ""):
+        overrides["opencode_path"] = os.path.abspath(os.path.expanduser(args.opencode_path))
+    if getattr(args, "opencode_tool_replay", False):
+        overrides["opencode_tool_replay"] = True
+    if getattr(args, "claude_home", ""):
+        overrides["claude_home"] = os.path.abspath(args.claude_home)
+    if getattr(args, "codex_home", ""):
+        overrides["codex_home"] = os.path.abspath(args.codex_home)
+    if getattr(args, "pi_home", ""):
+        overrides["pi_home"] = os.path.abspath(os.path.expanduser(args.pi_home))
+    if getattr(args, "cursor_home", ""):
+        overrides["cursor_home"] = os.path.abspath(os.path.expanduser(args.cursor_home))
+    if getattr(args, "source", ""):
+        overrides["transcript_source"] = args.source
+    if getattr(args, "vscode_workspace_storage", ""):
+        overrides["vscode_workspace_storage"] = os.path.abspath(
+            os.path.expanduser(args.vscode_workspace_storage)
+        )
+    if getattr(args, "copilot_cli_session_store", ""):
+        overrides["copilot_cli_session_store"] = os.path.abspath(
+            os.path.expanduser(args.copilot_cli_session_store)
+        )
+    if getattr(args, "opencode_db", ""):
+        overrides["opencode_db"] = (
+            ":memory:"
+            if args.opencode_db == ":memory:"
+            else os.path.abspath(os.path.expanduser(args.opencode_db))
+        )
+    lh = getattr(args, "lookback_hours", None)
+    if lh is not None:  # --lookback-hours was explicitly passed (0 = full history)
+        overrides["lookback_hours"] = lh
+    if getattr(args, "edit_budget", 0):
+        overrides["edit_budget"] = args.edit_budget
+    if getattr(args, "preferences", ""):
+        overrides["preferences"] = args.preferences
+    if getattr(args, "max_sessions", 0):
+        overrides["max_sessions_per_night"] = args.max_sessions
+    if getattr(args, "max_tasks", 0):
+        overrides["max_tasks_per_night"] = args.max_tasks
+    target_skill_path = getattr(args, "target_skill_path", "")
+    if not target_skill_path and task_meta:
+        target_skill_path = str(task_meta.get("target_skill_path") or "")
+    if target_skill_path:
+        path = os.path.expanduser(target_skill_path)
+        if args.project and not os.path.isabs(path):
+            path = os.path.join(os.path.abspath(args.project), path)
+        overrides["target_skill_path"] = os.path.abspath(path)
+    if getattr(args, "skill_roots", None):
+        project = os.path.abspath(args.project) if args.project else os.getcwd()
+        overrides["skill_roots"] = [
+            os.path.abspath(
+                os.path.join(project, os.path.expanduser(root))
+                if not os.path.isabs(os.path.expanduser(root))
+                else os.path.expanduser(root)
+            )
+            for root in args.skill_roots
+        ]
+    if getattr(args, "progress", False):
+        overrides["progress"] = True
+    if getattr(args, "auto_adopt", False):
+        overrides["auto_adopt"] = True
+    return load_config(**overrides)
+
+
+def cmd_run(args, dry: bool = False) -> int:
+    task_meta: Dict[str, Any] = {}
+    tasks = None
+    if getattr(args, "tasks_file", ""):
+        # Load once before config so target_skill_path can default from metadata.
+        tasks, task_meta = load_tasks_file(args.tasks_file)
+    cfg = _cfg_from_args(args, task_meta=task_meta)
+    if getattr(args, "tasks_file", ""):
+        tasks, task_meta = load_tasks_file(
+            args.tasks_file,
+            holdout_fraction=cfg.get("holdout_fraction", 0.34),
+            seed=cfg.get("seed", 42),
+        )
+        if cfg.get("backend", "mock") != "mock" and task_meta.get("reviewed") is not True:
+            print(
+                "[sleep] refusing real-backend replay from an unreviewed tasks file; "
+                "inspect/redact it and set \"reviewed\": true first",
+                file=sys.stderr,
+            )
+            return 2
+    try:
+        if cfg.get("backend", "mock") == "handoff":
+            return _run_handoff(
+                cfg,
+                args,
+                seed_tasks=tasks,
+                task_meta=task_meta,
+                dry=dry,
+            )
+        outcome = run_sleep_cycle(cfg, seed_tasks=tasks, dry_run=dry)
+    except CursorBackendError as exc:
+        _print_run_failure(args, "backend_failed", exc)
+        return 1
+    except StagingError as exc:
+        _print_run_failure(args, "staging_refused", exc)
+        return 1
+    _print_run_report(outcome, args, task_meta)
+    return 0
+
+
+def _print_run_report(outcome, args, task_meta: Dict[str, Any]) -> None:
+    rep = outcome.report
+    if args.json:
+        payload = _report_payload(rep, outcome)
+        if task_meta:
+            payload["tasks_file"] = task_meta.get("tasks_file", "")
+            payload["tasks_reviewed"] = task_meta.get("reviewed", False)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"[sleep] night {rep.night}: {rep.n_sessions} sessions -> {rep.n_tasks} tasks")
+        print(f"[sleep] held-out {rep.baseline_score:.3f} -> {rep.candidate_score:.3f} "
+              f"=> {rep.gate_action} (accepted={rep.accepted})")
+        for e in rep.edits:
+            print(
+                f"   + [{_display_value(e.target)}/{_display_value(e.op)}] "
+                f"{_display_value(e.content)}"
+            )
+        if rep.rejected_edits:
+            print("[sleep] rejected by gate:")
+            for e in rep.rejected_edits:
+                print(
+                    f"   - [{_display_value(e.target)}/{_display_value(e.op)}] "
+                    f"{_display_value(e.content)}"
+                )
+        if outcome.staging_dir:
+            print(f"[sleep] staged: {_display_value(outcome.staging_dir)}")
+            names = []
+            try:
+                names = [
+                    r["skill_name"]
+                    for r in pending_staged_skills(outcome.staging_dir)
+                ]
+            except Exception:
+                names = []
+            if names:
+                print("[sleep] review the pending per-skill proposals:")
+                print("[sleep] staged skills:")
+                for name in names:
+                    print(f"   - {name!r}")
+                # Names are safe path segments but may still contain spaces
+                # or shell metacharacters. Keep untrusted names out of a
+                # copy/paste command instead of pretending one quoting
+                # convention works in every supported shell.
+                print("        python -m skillopt_sleep adopt --skill NAME")
+                print("        (repeat --skill NAME to adopt more than one)")
+                print("        python -m skillopt_sleep adopt --all-skills")
+                if has_pending_staged_managed(outcome.staging_dir):
+                    print("        python -m skillopt_sleep adopt --legacy")
+            elif not outcome.adopted:
+                print("[sleep] review it, then: python -m skillopt_sleep adopt")
+        if outcome.adopted:
+            adopted = ", ".join(_display_value(path) for path in outcome.adopted_paths)
+            print(f"[sleep] auto-adopted: {adopted}")
+
+
+def _handoff_dir_for(cfg) -> str:
+    project = cfg.get("invoked_project") or os.getcwd()
+    return os.environ.get("SKILLOPT_SLEEP_HANDOFF_DIR", "") or os.path.join(
+        project, ".skillopt-sleep-handoff"
+    )
+
+
+def _redact_deep(obj):
+    """Redact secret-looking substrings in every string of a JSON-like tree."""
+    from skillopt_sleep.staging import redact_secrets
+    if isinstance(obj, str):
+        return redact_secrets(obj)
+    if isinstance(obj, list):
+        return [_redact_deep(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _redact_deep(v) for k, v in obj.items()}
+    return obj
+
+
+def _display_error(exc: object) -> str:
+    """Render an exception without leaking secrets or terminal controls."""
+    return _display_value(exc)
+
+
+def _display_value(value: object) -> str:
+    """Render arbitrary untrusted text safely for a human terminal."""
+    return _one_line_display_text(_redact_deep(str(value)))
+
+
+def _print_run_failure(args, kind: str, exc: object) -> None:
+    """Keep run failures machine-readable under ``--json``."""
+    message = _display_error(exc)
+    if args.json:
+        print(json.dumps({
+            "ok": False,
+            "error": kind,
+            "message": message,
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(f"[sleep] {kind.replace('_', ' ')}: {message}", file=sys.stderr)
+
+
+def _flush_handoff(backend, args) -> int:
+    prompts_path = backend.flush_pending()
+    if args.json:
+        print(json.dumps({
+            "handoff_pending": len(backend.pending),
+            "prompts": prompts_path,
+            "answers_dir": backend.answers_dir,
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(f"[sleep] handoff: {len(backend.pending)} model call(s) need answers")
+        print(f"[sleep] prompts: {prompts_path}")
+        print(f"[sleep] write each raw answer to {backend.answers_dir}/<id>.md, "
+              "then re-run this exact command to resume")
+    return 3
+
+
+def _handoff_mine_and_pin(cfg, args, backend, snapshot: str, dry: bool):
+    """Harvest + mine with the same knobs as run_sleep_cycle (harvest window,
+    target-skill filter, candidate-limit bump, LLM mining — routed through the
+    handoff files like every other model call), then pin the result to
+    ``tasks.json``. Session digests are pinned too, so the sessions created
+    while answering prompts cannot change what gets mined between rounds.
+
+    Returns ``(exit_code, tasks)``; ``tasks is None`` means exit now.
+    """
+    import time
+
+    from skillopt_sleep.handoff_backend import PendingCalls
+    from skillopt_sleep.state import SleepState, _now_iso
+    from skillopt_sleep.types import SessionDigest
+
+    project = cfg.get("invoked_project") or os.getcwd()
+    state = SleepState.load(cfg.state_path)
+    started = _now_iso()
+
+    digests_path = os.path.join(backend.handoff_dir, "digests.json")
+    digests = None
+    if os.path.exists(digests_path):
+        try:
+            with open(digests_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            known = set(SessionDigest.__dataclass_fields__)
+            digests = [SessionDigest(**{k: v for k, v in d.items() if k in known})
+                       for d in raw]
+        except Exception:
+            # Corrupted/truncated pin (e.g. an interrupted earlier round):
+            # fall back to a fresh harvest instead of crashing the run.
+            print("[sleep] handoff: digests.json unreadable — re-harvesting",
+                  file=sys.stderr)
+            digests = None
+    if digests is None:
+        since = state.last_harvest_for(project)
+        lookback_hours = cfg.get("lookback_hours", 72)
+        if since is None and lookback_hours and lookback_hours > 0:
+            since = _now_iso(time.time() - lookback_hours * 3600)
+        max_tasks = cfg.get("max_tasks_per_night", 40)
+        session_limit = cfg.get("max_sessions_per_night", 0) or max_tasks * 3
+        digests = harvest_for_config(cfg, since_iso=since, limit=session_limit)
+        os.makedirs(backend.handoff_dir, exist_ok=True)
+        with open(digests_path, "w", encoding="utf-8") as f:
+            json.dump(_redact_deep([d.to_dict() for d in digests]), f,
+                      ensure_ascii=False, indent=2)
+
+    max_tasks = cfg.get("max_tasks_per_night", 40)
+    session_limit = cfg.get("max_sessions_per_night", 0) or max_tasks * 3
+    target_skill_path = cfg.managed_skill_path() if cfg.get("target_skill_path", "") else ""
+    target_skill_text = _read_text(target_skill_path) if target_skill_path else ""
+    candidate_limit = max_tasks
+    if cfg.get("target_task_filter", True) and target_skill_text:
+        candidate_limit = max(max_tasks, max_tasks * 3)
+    llm_miner = None
+    if cfg.get("llm_mine", True):
+        try:
+            from skillopt_sleep.llm_miner import make_llm_miner
+            llm_miner = make_llm_miner(
+                backend, max_sessions=session_limit, max_tasks=candidate_limit,
+            )
+        except Exception:
+            llm_miner = None
+    try:
+        tasks = mine(
+            digests,
+            max_tasks=max_tasks,
+            candidate_limit=candidate_limit,
+            holdout_fraction=cfg.get("holdout_fraction", 0.34),
+            seed=cfg.get("seed", 42),
+            llm_miner=llm_miner,
+            target_skill_text=target_skill_text,
+            target_skill_path=target_skill_path,
+        )
+    except PendingCalls:
+        tasks = []
+    if backend.pending:
+        # LLM mining needs answers before the task set can be pinned.
+        return _flush_handoff(backend, args), None
+    if not tasks:
+        print(
+            "[sleep] handoff: no tasks mined — nothing to consolidate",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        if not dry:
+            # Advance the harvest window like run_sleep_cycle's no-tasks
+            # branch, or every later run re-scans the same stale window.
+            state.set_last_harvest(project, started)
+            state.save()
+        return 0, None
+    payload = make_tasks_payload(
+        tasks,
+        project=project,
+        transcript_source=cfg.get("transcript_source", ""),
+        n_sessions=len(digests),
+        target_skill_path=target_skill_path,
+    )
+    # NOT marked reviewed: feeding this snapshot back through --tasks-file
+    # with a real backend must still hit the human-review gate above. The
+    # driver itself loads it directly, with the same trust as in-cycle mining.
+    write_tasks_file(snapshot, _redact_deep(payload))
+    print(
+        f"[sleep] handoff: pinned {len(tasks)} tasks -> {snapshot}",
+        file=sys.stderr if args.json else sys.stdout,
+    )
+    return 0, tasks
+
+
+def _run_handoff(cfg, args, *, seed_tasks, task_meta: Dict[str, Any], dry: bool) -> int:
+    """Drive the handoff backend: run until model calls are needed, then
+    write the prompt batch and exit 3; on a fully-answered run, finish
+    normally. Session digests and mined tasks are pinned under the handoff
+    dir on the first rounds so wall-clock time between rounds (including
+    the very sessions that answer the prompts) cannot change the task set
+    and invalidate earlier answers.
+    """
+    from skillopt_sleep.handoff_backend import HandoffBackend, PendingCalls
+
+    hdir = _handoff_dir_for(cfg)
+    backend = HandoffBackend(model=cfg.get("model", ""), handoff_dir=hdir)
+    tasks = seed_tasks
+    if tasks is None:
+        snapshot = os.path.join(hdir, "tasks.json")
+        if os.path.exists(snapshot):
+            tasks, _meta = load_tasks_file(
+                snapshot,
+                holdout_fraction=cfg.get("holdout_fraction", 0.34),
+                seed=cfg.get("seed", 42),
+            )
+        else:
+            rc, tasks = _handoff_mine_and_pin(cfg, args, backend, snapshot, dry)
+            if tasks is None:
+                return rc
+    outcome = None
+    try:
+        outcome = run_sleep_cycle(cfg, seed_tasks=tasks, dry_run=dry, backend=backend)
+    except PendingCalls:
+        pass
+    if backend.pending:
+        return _flush_handoff(backend, args)
+    # A completed real run ends the night: archive the handoff dir so the
+    # next night re-harvests instead of replaying the pinned snapshot.
+    if not dry and outcome.staging_dir and os.path.isdir(hdir):
+        import time
+        done = f"{hdir}.night{outcome.report.night}.done"
+        if os.path.exists(done):
+            done = f"{done}.{int(time.time())}"
+        try:
+            os.rename(hdir, done)
+        except OSError as exc:
+            raise StagingError(
+                f"handoff completed but its round directory could not be archived; "
+                f"preserved at {hdir!r}: {type(exc).__name__}: {exc}"
+            ) from exc
+        print(
+            f"[sleep] handoff: archived round data -> {done}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+    _print_run_report(outcome, args, task_meta)
+    return 0
+
+
+def cmd_status(args) -> int:
+    cfg = _cfg_from_args(args)
+    state = SleepState.load(cfg.state_path)
+    project = cfg.get("invoked_project") or os.getcwd()
+    latest = latest_staging(project)
+    skills = []
+    all_skills = []
+    has_managed = False
+    staging_error = ""
+    if latest:
+        try:
+            all_skills = staged_skills(latest)
+            skills = pending_staged_skills(latest)
+            has_managed = has_pending_staged_managed(latest)
+        except Exception as exc:
+            staging_error = _display_error(exc)
+            all_skills = []
+            skills = []
+            has_managed = False
+    info = {
+        "night": state.night,
+        "state_path": cfg.state_path,
+        "project": project,
+        "history_tail": state.data.get("history", [])[-5:],
+        "latest_staging": latest,
+        "slow_memory_chars": len(state.slow_memory),
+        "staged_skills": [r.get("skill_name", "") for r in skills],
+        "adopted_skills": [
+            row.get("skill_name", "")
+            for row in all_skills
+            if row not in skills
+        ],
+        "has_managed_proposal": has_managed,
+    }
+    if staging_error:
+        info["staging_error"] = staging_error
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+    else:
+        print(f"[sleep] nights so far: {state.night}")
+        print(f"[sleep] project: {project}")
+        if latest:
+            print(f"[sleep] latest staged proposal: {_display_value(latest)}")
+            if staging_error:
+                print(f"[sleep] cannot read latest staging manifest: {staging_error}")
+            elif skills:
+                print("[sleep] pending staged skills:")
+                for row in skills:
+                    print(
+                        f"   {_display_value(row.get('skill_name', ''))!r} -> "
+                        f"{_display_value(row.get('live_skill_path', ''))!r}"
+                    )
+            adopted_names = [
+                row.get("skill_name", "")
+                for row in all_skills
+                if row not in skills
+            ]
+            if adopted_names:
+                print("[sleep] already adopted from this night:")
+                for name in adopted_names:
+                    print(f"   {_display_value(name)!r}")
+            if has_managed:
+                print("[sleep] managed proposal available via --legacy")
+            rp = os.path.join(latest, "report.md")
+            if (
+                not staging_error
+                and os.path.isfile(rp)
+                and not os.path.islink(rp)
+            ):
+                with open(rp, encoding="utf-8") as f:
+                    print(
+                        "\n" + "\n".join(
+                            _display_value(line) for line in f.read().splitlines()
+                        )
+                    )
+        else:
+            print("[sleep] no staged proposals yet.")
+    return 1 if staging_error else 0
+
+
+def cmd_adopt(args) -> int:
+    cfg = _cfg_from_args(args)
+    project = cfg.get("invoked_project") or os.getcwd()
+    target = args.staging or latest_staging(project)
+
+    def fail(code: int, kind: str, message: str, **extra: Any) -> int:
+        safe_message = _display_value(message)
+        if args.json:
+            payload = {
+                "ok": False,
+                "error": kind,
+                "message": safe_message,
+                "staging_dir": _display_value(target or ""),
+            }
+            payload.update(_redact_deep(extra))
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(safe_message)
+        return code
+
+    if not target or not os.path.isdir(target):
+        return fail(1, "no_staging", "[sleep] nothing to adopt (no staging dir).")
+    raw_selected = list(getattr(args, "skills", None) or [])
+    if any(not str(name).strip() for name in raw_selected):
+        return fail(
+            2,
+            "invalid_selection",
+            "[sleep] --skill names must be non-empty.",
+        )
+    selected = [str(name).strip() for name in raw_selected]
+    adopt_all = bool(getattr(args, "all_skills", False))
+    adopt_legacy = bool(getattr(args, "legacy", False))
+    if sum((bool(selected), adopt_all, adopt_legacy)) > 1:
+        return fail(
+            2,
+            "invalid_selection",
+            "[sleep] use exactly one of --skill, --all-skills, or --legacy.",
+        )
+    try:
+        rows = staged_skills(target)
+        pending_rows = pending_staged_skills(target)
+    except Exception as exc:
+        return fail(
+            1,
+            "invalid_staging",
+            f"[sleep] cannot read staged skills: {exc}",
+        )
+    if adopt_legacy:
+        try:
+            updated = adopt_staging(target)
+        except StagingError as exc:
+            return fail(2, "adoption_refused", f"[sleep] adopt refused: {exc}")
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            return fail(1, "adoption_failed", f"[sleep] adopt failed: {exc}")
+        if args.json:
+            print(json.dumps({
+                "ok": True,
+                "staging_dir": target,
+                "mode": "legacy",
+                "adopted_skills": [],
+                "updated_paths": updated,
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"[sleep] adopted managed proposal from {_display_value(target)}")
+            for path in updated:
+                print(f"   -> {_display_value(path)}")
+            if not updated:
+                print("[sleep] (proposal contained no accepted managed changes)")
+        return 0
+    if selected or adopt_all:
+        if not rows:
+            return fail(
+                2,
+                "no_staged_skills",
+                "[sleep] this night has no per-skill proposals; omit --skill "
+                "to adopt the legacy pair.",
+            )
+        names = (
+            [str(row.get("skill_name", "")) for row in pending_rows]
+            if adopt_all
+            else selected
+        )
+        try:
+            receipts = adopt_skills(target, names)
+        except StagingError as exc:
+            return fail(2, "adoption_refused", f"[sleep] adopt refused: {exc}")
+        except OSError as exc:
+            return fail(1, "adoption_failed", f"[sleep] adopt failed: {exc}")
+        if args.json:
+            print(json.dumps(json_safe({
+                "ok": True,
+                "staging_dir": target,
+                "mode": "skills",
+                "adopted_skills": [receipt.__dict__ for receipt in receipts],
+                "updated_paths": [receipt.live_skill_path for receipt in receipts],
+            }), ensure_ascii=False, indent=2))
+        else:
+            print(f"[sleep] adopted from {_display_value(target)}")
+            for receipt in receipts:
+                print(
+                    f"   -> {_display_value(receipt.skill_name)}: "
+                    f"{_display_value(receipt.live_skill_path)}"
+                )
+            if not receipts:
+                print("[sleep] (no skills in the selection)")
+        return 0
+    if rows:
+        message = (
+            "[sleep] this night staged per-skill proposals; pass --skill NAME "
+            "or --all-skills, or use --legacy for its managed proposal."
+        )
+        if args.json:
+            return fail(
+                2,
+                "selection_required",
+                message,
+                available_skills=[
+                    {
+                        "skill_name": row.get("skill_name", ""),
+                        "live_skill_path": row.get("live_skill_path", ""),
+                    }
+                    for row in rows
+                ],
+            )
+        print(_display_value(message))
+        for row in rows:
+            print(
+                f"   {_display_value(row.get('skill_name', ''))!r} -> "
+                f"{_display_value(row.get('live_skill_path', ''))!r}"
+            )
+        return 2
+    try:
+        updated = adopt_staging(target)
+    except StagingError as exc:
+        return fail(2, "adoption_refused", f"[sleep] adopt refused: {exc}")
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        return fail(1, "adoption_failed", f"[sleep] adopt failed: {exc}")
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "staging_dir": target,
+            "mode": "legacy",
+            "adopted_skills": [],
+            "updated_paths": updated,
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(f"[sleep] adopted from {_display_value(target)}")
+        for path in updated:
+            print(f"   -> {_display_value(path)}")
+        if not updated:
+            print("[sleep] (proposal contained no accepted changes)")
+    return 0
+
+
+def cmd_harvest(args) -> int:
+    cfg = _cfg_from_args(args)
+    session_limit = cfg.get("max_sessions_per_night", 0) or cfg.get("max_tasks_per_night", 40) * 3
+    target_skill_path = cfg.managed_skill_path() if cfg.get("target_skill_path", "") else ""
+    target_skill_text = _read_text(target_skill_path) if target_skill_path else ""
+    max_tasks = cfg.get("max_tasks_per_night", 40)
+    candidate_limit = max_tasks
+    if cfg.get("target_task_filter", True) and target_skill_text:
+        candidate_limit = max(max_tasks, max_tasks * 3)
+    digests = harvest_for_config(cfg, limit=session_limit)
+    tasks = mine(
+        digests,
+        max_tasks=max_tasks,
+        candidate_limit=candidate_limit,
+        holdout_fraction=cfg.get("holdout_fraction", 0.34),
+        seed=cfg.get("seed", 42),
+        target_skill_text=target_skill_text,
+        target_skill_path=target_skill_path,
+    )
+    payload = make_tasks_payload(
+        tasks,
+        project=cfg.get("invoked_project") or os.getcwd(),
+        transcript_source=cfg.get("transcript_source", ""),
+        n_sessions=len(digests),
+        target_skill_path=target_skill_path,
+    )
+    output_path = ""
+    if getattr(args, "output", ""):
+        output_path = write_tasks_file(args.output, payload)
+    if args.json:
+        json_payload = dict(payload)
+        if output_path:
+            json_payload["output"] = output_path
+        print(json.dumps(json_payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"[sleep] {len(digests)} sessions -> {len(tasks)} tasks")
+        if output_path:
+            print(f"[sleep] wrote reviewed-task draft: {output_path}")
+        for t in tasks:
+            print(f"  [{t.split}/{t.outcome}] {t.intent[:90]}")
+    return 0
+
+
+def cmd_schedule(args) -> int:
+    from skillopt_sleep.scheduler import list_scheduled, schedule
+    cfg = _cfg_from_args(args)
+    project = cfg.get("invoked_project") or os.getcwd()
+    ok, msg = schedule(project, backend=cfg.get("backend", "mock"),
+                       hour=args.hour, minute=args.minute,
+                       extra=("--auto-adopt" if getattr(args, "auto_adopt", False) else ""))
+    print("[sleep] " + _display_value(msg))
+    cur = list_scheduled()
+    if cur:
+        print("[sleep] currently scheduled:")
+        for ln in cur:
+            print("   " + _display_value(ln[:140]))
+    return 0 if ok else 1
+
+
+def cmd_unschedule(args) -> int:
+    from skillopt_sleep.scheduler import unschedule
+    cfg = _cfg_from_args(args)
+    project = cfg.get("invoked_project") or os.getcwd()
+    ok, msg = unschedule(project, all_projects=getattr(args, "all", False))
+    print("[sleep] " + _display_value(msg))
+    return 0 if ok else 1
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="skillopt_sleep", description="SkillOpt-Sleep nightly self-evolution")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="run a full sleep cycle")
+    _add_common(p_run)
+    p_dry = sub.add_parser("dry-run", help="harvest+mine+replay, report only")
+    _add_common(p_dry)
+    p_status = sub.add_parser("status", help="show state + latest proposal")
+    _add_common(p_status)
+    p_adopt = sub.add_parser("adopt", help="apply latest staged proposal")
+    _add_common(p_adopt)
+    p_adopt.add_argument("--staging", default="", help="specific staging dir")
+    p_adopt.add_argument(
+        "--skill", action="append", default=[], dest="skills",
+        help="adopt this staged skill (repeatable)",
+    )
+    p_adopt.add_argument(
+        "--all-skills", action="store_true", dest="all_skills",
+        help="adopt every staged per-skill proposal",
+    )
+    p_adopt.add_argument(
+        "--legacy", action="store_true",
+        help="adopt only the staged managed skill/memory proposal",
+    )
+    p_harvest = sub.add_parser("harvest", help="debug: show mined tasks")
+    _add_common(p_harvest)
+    p_harvest.add_argument("--output", default="", help="write mined tasks JSON for review")
+    p_sched = sub.add_parser("schedule", help="install a nightly cron entry for this project")
+    _add_common(p_sched)
+    p_sched.add_argument("--hour", type=int, default=3)
+    p_sched.add_argument("--minute", type=int, default=17)
+    p_unsched = sub.add_parser("unschedule", help="remove the nightly cron entry")
+    _add_common(p_unsched)
+    p_unsched.add_argument("--all", action="store_true", help="remove all managed entries")
+    p_eval = sub.add_parser(
+        "evalkit",
+        help="paired A/B comparison (McNemar + bootstrap CI)",
+    )
+    p_eval.add_argument("--manifest", required=True)
+    p_eval.add_argument("--a", required=True)
+    p_eval.add_argument("--b", default=None, help="required unless --aa")
+    p_eval.add_argument("--aa", action="store_true", help="mutually exclusive with --b")
+    p_eval.add_argument("--alpha", type=float, default=0.05)
+    p_eval.add_argument("--boot", type=int, default=10000)
+    p_eval.add_argument("--seed", type=int, default=42)
+    p_eval.add_argument("--allow-graded", action="store_true")
+    p_eval.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "run":
+        return cmd_run(args, dry=False)
+    if args.cmd == "dry-run":
+        return cmd_run(args, dry=True)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "adopt":
+        return cmd_adopt(args)
+    if args.cmd == "harvest":
+        return cmd_harvest(args)
+    if args.cmd == "schedule":
+        return cmd_schedule(args)
+    if args.cmd == "unschedule":
+        return cmd_unschedule(args)
+    if args.cmd == "evalkit":
+        from skillopt_sleep.evalkit import main as evalkit_main
+        argv = ["--manifest", args.manifest, "--a", args.a]
+        if args.b is not None:
+            argv.extend(["--b", args.b])
+        if args.aa:
+            argv.append("--aa")
+        argv.extend(["--alpha", str(args.alpha), "--boot", str(args.boot), "--seed", str(args.seed)])
+        if args.allow_graded:
+            argv.append("--allow-graded")
+        if args.json:
+            argv.append("--json")
+        return evalkit_main(argv)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

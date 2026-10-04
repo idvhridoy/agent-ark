@@ -1,0 +1,80 @@
+from uuid import UUID
+
+from sqlalchemy import insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.future import select
+
+from cognee.infrastructure.databases.exceptions import EntityAlreadyExistsError
+from cognee.infrastructure.databases.relational import get_relational_engine
+from cognee.modules.users.exceptions import (
+    PermissionDeniedError,
+    RoleNotFoundError,
+    TenantNotFoundError,
+    UserNotFoundError,
+)
+from cognee.modules.users.models import (
+    Role,
+    Tenant,
+    User,
+    UserRole,
+)
+
+
+async def add_user_to_role(user_id: UUID, role_id: UUID, owner_id: UUID):
+    """
+        Add a user with the given id to the role with the given id.
+    Args:
+        user_id: Id of the user.
+        role_id: Id of the role.
+        owner_id: Id of the request owner.
+
+    Returns:
+        None
+
+    """
+    db_engine = get_relational_engine()
+    async with db_engine.get_async_session() as session:
+        # Each lookup is checked before anything reads off it. Previously the
+        # tenant query dereferenced `role.tenant_id` and the membership load
+        # dereferenced `user`, both above their own guards, so an unknown role
+        # or user id raised AttributeError on None instead of the
+        # RoleNotFoundError / UserNotFoundError the caller (and the permissions
+        # router) expects.
+        user = (await session.execute(select(User).where(User.id == user_id))).scalars().first()
+
+        if not user:
+            raise UserNotFoundError
+
+        role = (await session.execute(select(Role).where(Role.id == role_id))).scalars().first()
+
+        if not role:
+            raise RoleNotFoundError
+
+        tenant = (
+            (await session.execute(select(Tenant).where(Tenant.id == role.tenant_id)))
+            .scalars()
+            .first()
+        )
+
+        user_tenants = await user.awaitable_attrs.tenants
+
+        # Membership is checked first, and passing it means a tenant row with
+        # this id exists (user_tenants are loaded Tenant rows), so the
+        # `tenant.owner_id` read below cannot hit None.
+        if role.tenant_id not in [user_tenant.id for user_tenant in user_tenants]:
+            raise TenantNotFoundError(
+                message="User tenant does not match role tenant. User cannot be added to role."
+            )
+        elif tenant.owner_id != owner_id:
+            raise PermissionDeniedError(
+                message="User submitting request does not have permission to add user to role."
+            )
+
+        try:
+            # Add association directly to the association table
+            create_user_role_statement = insert(UserRole).values(user_id=user_id, role_id=role_id)
+            await session.execute(create_user_role_statement)
+        except IntegrityError:
+            raise EntityAlreadyExistsError(message="User is already part of group.")
+
+        await session.commit()

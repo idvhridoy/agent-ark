@@ -1,0 +1,806 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <cstring>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <ailego/parallel/lock.h>
+#include <ailego/utility/memory_helper.h>
+#include <sparsehash/dense_hash_map>
+#include <zvec/ailego/container/heap.h>
+#include <zvec/core/framework/index_framework.h>
+#include "algorithm/hnsw/hnsw_chunk.h"
+#include "algorithm/hnsw/hnsw_entity.h"  // MmapMemoryBlock, BufferPoolMemoryBlock, NeighborsT
+#include "vamana_entity.h"
+#include "vamana_params.h"
+
+namespace zvec {
+namespace core {
+
+
+// Storage mode for VamanaStreamerEntity
+enum class VamanaStorageMode { kMmap = 0, kBufferPool = 1, kContiguous = 2 };
+
+// VamanaStreamerEntity manages vector data, primary keys, and neighbors
+// for a single-layer Vamana graph in streaming (incremental) mode.
+// Unlike HNSW, Vamana has no upper-level neighbors — only a single
+// neighbor list per node. Node layout in chunk:
+//   [vector_data (vector_size) | key (sizeof(key_t)) | NeighborsHeader +
+//   neighbors (neighbors_size)]
+class VamanaStreamerEntity : public VamanaEntity {
+ public:
+  // Virtual interface implementation
+  int cleanup() override;
+  const VamanaEntity::Pointer clone() const override;
+  key_t get_key(node_id_t id) const override;
+  const void *get_vector(node_id_t id) const override;
+  const void *get_extra_values(node_id_t id) const override;
+  int get_vector(const node_id_t id,
+                 IndexStorage::MemoryBlock &block) const override;
+  int get_vector(const node_id_t *ids, uint32_t count,
+                 const void **vecs) const override;
+  int get_vector(
+      const node_id_t *ids, uint32_t count,
+      std::vector<IndexStorage::MemoryBlock> &vec_blocks) const override;
+  const Neighbors get_neighbors(node_id_t id) const override;
+
+  int add_vector(key_t key, const void *vec, node_id_t *id) override;
+  int add_vector_with_id(node_id_t id, const void *vec) override;
+  int update_neighbors(
+      node_id_t id,
+      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+  void add_neighbor(node_id_t id, uint32_t size,
+                    node_id_t neighbor_id) override;
+  int dump(const IndexDumper::Pointer &dumper) override;
+  void update_entry_point(node_id_t ep) override;
+
+  // Calculate medoid: find the data point closest to the centroid
+  // of all vectors (DiskANN standard entry point selection).
+  node_id_t calculate_medoid(uint32_t dimension, uint32_t data_type,
+                             bool packed_uint4 = false) override;
+
+  // --- Neighbor distance storage ---
+  int ensure_dist_storage() override;
+  bool dist_storage_loaded() const override {
+    return dist_loaded_;
+  }
+  const dist_t *get_neighbor_dists(node_id_t id) const override;
+  void update_neighbor_dists(
+      node_id_t id,
+      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+  void set_neighbor_dist(node_id_t id, uint32_t idx, dist_t dist) override;
+
+  virtual VamanaStorageMode storage_mode() const {
+    return VamanaStorageMode::kMmap;
+  }
+
+  void set_use_key_info_map(bool use_id_map) {
+    use_key_info_map_ = use_id_map;
+  }
+
+ public:
+  VamanaStreamerEntity(IndexStreamer::Stats &stats);
+  ~VamanaStreamerEntity() override;
+
+  const void *get_vector_by_key(key_t key) const override {
+    auto id = get_id(key);
+    return id == kInvalidNodeId ? nullptr : get_vector(id);
+  }
+
+  int get_vector_by_key(const key_t key,
+                        IndexStorage::MemoryBlock &block) const override {
+    auto id = get_id(key);
+    if (id != kInvalidNodeId) {
+      return get_vector(id, block);
+    }
+    return IndexError_InvalidArgument;
+  }
+
+  int init(size_t max_doc_cnt);
+  int flush(uint64_t checkpoint);
+  int open(IndexStorage::Pointer stg, uint64_t max_index_size, bool check_crc);
+  int close();
+
+  int set_index_meta(const IndexMeta &meta) const {
+    return IndexHelper::SerializeToStorage(meta, broker_->storage().get());
+  }
+
+  int get_index_meta(IndexMeta *meta) const {
+    return IndexHelper::DeserializeFromStorage(broker_->storage().get(), meta);
+  }
+
+  inline void set_chunk_size(size_t val) {
+    chunk_size_ = val;
+  }
+  inline void set_get_vector(bool val) {
+    get_vector_enabled_ = val;
+  }
+
+  inline node_id_t get_id(key_t key) const {
+    if (use_key_info_map_) {
+      keys_map_lock_->lock_shared();
+      auto it = keys_map_->find(key);
+      node_id_t id = it == keys_map_->end() ? kInvalidNodeId : it->second;
+      keys_map_lock_->unlock_shared();
+      return id;
+    }
+    return key;
+  }
+
+  // --- Typed access methods for hot-path optimization ---
+  // These are templated on MemBlock type to avoid runtime branching.
+
+  template <typename MemBlock>
+  inline NeighborsT<MemBlock> get_neighbors_typed(node_id_t id) const;
+
+  template <typename MemBlock>
+  inline int get_vector_typed(const node_id_t *ids, uint32_t count,
+                              std::vector<MemBlock> &vec_blocks) const;
+
+  ailego_force_inline const void *get_extra_values_from_vector(
+      const void *vector) const {
+    return extra_values_size() == 0
+               ? nullptr
+               : static_cast<const char *>(vector) + vector_data_size();
+  }
+
+  ailego_force_inline const void *get_extra_values_ptr(
+      node_id_t /*id*/, const void *vector) const {
+    return get_extra_values_from_vector(vector);
+  }
+
+  template <typename MemBlock>
+  inline key_t get_key_typed(node_id_t id) const;
+
+ protected:
+  inline void sync_node_chunks(size_t idx) const {
+    sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, idx, &node_chunks_);
+  }
+
+ protected:
+  template <class Key, class T>
+  using HashMap = google::dense_hash_map<Key, T, std::hash<Key>>;
+  template <class Key, class T>
+  using HashMapPointer = std::shared_ptr<HashMap<Key, T>>;
+
+  //! Clone constructor, used by clone method in subclasses
+  VamanaStreamerEntity(IndexStreamer::Stats &stats, const VamanaHeader &hd,
+                       size_t chunk_size, uint32_t node_index_mask_bits,
+                       bool get_vector_enabled, bool use_key_info_map,
+                       std::shared_ptr<ailego::SharedMutex> &keys_map_lock,
+                       const HashMapPointer<key_t, node_id_t> &keys_map,
+                       std::vector<Chunk::Pointer> &&node_chunks,
+                       const ChunkBroker::Pointer &broker)
+      : stats_(stats),
+        chunk_size_(chunk_size),
+        node_index_mask_bits_(node_index_mask_bits),
+        node_cnt_per_chunk_(1UL << node_index_mask_bits_),
+        node_index_mask_(node_cnt_per_chunk_ - 1),
+        get_vector_enabled_(get_vector_enabled),
+        use_key_info_map_(use_key_info_map),
+        keys_map_lock_(keys_map_lock),
+        keys_map_(keys_map),
+        broker_(broker),
+        node_chunks_(std::move(node_chunks)) {
+    *mutable_header() = hd;
+    neighbor_size_ = neighbors_size();
+  }
+
+  //! Lazy chunk synchronization: fetches chunks from broker when needed.
+  //! Protected by node_chunks_mutex_ to synchronize with add_vector's
+  //! emplace_back during concurrent build.
+  void sync_chunks(ChunkBroker::ChunkType type, size_t idx,
+                   std::vector<Chunk::Pointer> *chunks) const {
+    if (ailego_likely(idx < chunks->size())) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(node_chunks_mutex_);
+    // Double-check after acquiring lock
+    if (idx < chunks->size()) {
+      return;
+    }
+    for (size_t i = chunks->size(); i <= idx; ++i) {
+      auto chunk = broker_->get_chunk(type, i);
+      ailego_assert_with(!!chunk, "get chunk failed");
+      chunks->emplace_back(std::move(chunk));
+    }
+  }
+
+  inline std::pair<uint32_t, uint32_t> get_vector_chunk_loc(
+      node_id_t id) const {
+    uint32_t chunk_idx = id >> node_index_mask_bits_;
+    uint32_t offset = (id & node_index_mask_) * node_size();
+    sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_idx, &node_chunks_);
+    return std::make_pair(chunk_idx, offset);
+  }
+
+  inline std::pair<uint32_t, uint32_t> get_key_chunk_loc(node_id_t id) const {
+    uint32_t chunk_idx = id >> node_index_mask_bits_;
+    uint32_t offset = (id & node_index_mask_) * node_size() + vector_size();
+    sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_idx, &node_chunks_);
+    return std::make_pair(chunk_idx, offset);
+  }
+
+  inline std::pair<Chunk *, size_t> get_neighbor_chunk_loc(node_id_t id) const {
+    uint32_t chunk_idx = id >> node_index_mask_bits_;
+    uint32_t offset =
+        (id & node_index_mask_) * node_size() + vector_size() + sizeof(key_t);
+    sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_idx, &node_chunks_);
+    ailego_assert_abort(chunk_idx < node_chunks_.size(), "invalid chunk idx");
+    return std::make_pair(node_chunks_[chunk_idx].get(), offset);
+  }
+
+  // Get chunk location for neighbor distance data.
+  // Uses the same chunk indexing as node chunks but with dist_entry_size_.
+  inline std::pair<uint32_t, uint32_t> get_dist_chunk_loc(node_id_t id) const {
+    uint32_t chunk_idx = id >> node_index_mask_bits_;
+    uint32_t offset = (id & node_index_mask_) * dist_entry_size_;
+    return std::make_pair(chunk_idx, offset);
+  }
+
+  void sync_dist_chunks(size_t idx) const {
+    sync_chunks(ChunkBroker::CHUNK_TYPE_NEIGHBOR_DIST, idx, &dist_chunks_);
+  }
+
+  int ensure_dist_chunk_for(uint32_t chunk_index);
+
+  int alloc_dist_chunks_for_existing_nodes();
+
+  size_t estimate_doc_capacity() const {
+    return node_chunks_.capacity() * node_cnt_per_chunk_;
+  }
+
+  int init_chunk_params(size_t max_index_size, bool huge_page) {
+    node_cnt_per_chunk_ = std::max<uint32_t>(1, chunk_size_ / node_size());
+    node_index_mask_bits_ = std::ceil(std::log2(node_cnt_per_chunk_));
+    node_cnt_per_chunk_ = 1UL << node_index_mask_bits_;
+    if (huge_page) {
+      chunk_size_ = AlignHugePageSize(node_cnt_per_chunk_ * node_size());
+    } else {
+      chunk_size_ = AlignPageSize(node_cnt_per_chunk_ * node_size());
+    }
+    node_index_mask_ = node_cnt_per_chunk_ - 1;
+
+    if (max_index_size == 0UL) {
+      max_index_size_ = chunk_size_ * kDefaultMaxChunkCnt;
+    } else {
+      max_index_size_ = max_index_size;
+    }
+
+    size_t max_node_chunk_cnt =
+        std::ceil(static_cast<double>(max_index_size_) / chunk_size_);
+    node_chunks_.reserve(max_node_chunk_cnt);
+
+    LOG_DEBUG(
+        "VamanaSettings: nodeSize=%zu chunkSize=%u nodeCntPerChunk=%u "
+        "maxChunkCnt=%zu maxIndexSize=%zu",
+        node_size(), chunk_size_, node_cnt_per_chunk_, max_node_chunk_cnt,
+        max_index_size_);
+
+    return 0;
+  }
+
+  int init_chunks(const Chunk::Pointer &header_chunk);
+
+  int flush_header() {
+    if (!broker_->dirty()) {
+      return 0;
+    }
+    auto header_chunk = broker_->get_chunk(ChunkBroker::CHUNK_TYPE_HEADER,
+                                           ChunkBroker::kDefaultChunkSeqId);
+    if (ailego_unlikely(!header_chunk)) {
+      LOG_ERROR("get header chunk failed");
+      return IndexError_Runtime;
+    }
+    size_t size = header_chunk->write(0UL, &header(), header_size());
+    if (ailego_unlikely(size != header_size())) {
+      LOG_ERROR("Write header chunk failed");
+      return IndexError_WriteData;
+    }
+    return 0;
+  }
+
+ protected:
+  IndexStreamer::Stats &stats_;
+  std::mutex mutex_{};
+  size_t max_index_size_{0UL};
+  uint32_t chunk_size_{kDefaultChunkSize};
+  uint32_t node_index_mask_bits_{0U};
+  uint32_t node_cnt_per_chunk_{0U};
+  uint32_t node_index_mask_{0U};
+  uint32_t neighbor_size_{0U};
+  bool get_vector_enabled_{false};
+  bool use_key_info_map_{true};
+
+  mutable std::shared_ptr<ailego::SharedMutex> keys_map_lock_;
+  HashMapPointer<key_t, node_id_t> keys_map_;
+
+  ChunkBroker::Pointer broker_;
+
+  //! Protects node_chunks_ against concurrent emplace_back from add_vector
+  //! (writer) and sync_chunks from greedy_search (reader threads during build).
+  mutable std::mutex node_chunks_mutex_{};
+  mutable std::vector<Chunk::Pointer> node_chunks_{};
+
+ private:
+  mutable std::vector<Chunk::Pointer> dist_chunks_{};
+  bool dist_loaded_{false};
+  uint32_t dist_entry_size_{0};  // max_degree * sizeof(dist_t)
+};
+
+// --- Template specializations for typed MemoryBlock access ---
+
+template <>
+inline NeighborsT<MmapMemoryBlock>
+VamanaStreamerEntity::get_neighbors_typed<MmapMemoryBlock>(node_id_t id) const {
+  uint32_t chunk_idx = id >> node_index_mask_bits_;
+  uint32_t offset =
+      (id & node_index_mask_) * node_size() + vector_size() + sizeof(key_t);
+  sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_idx, &node_chunks_);
+  ailego_assert_with(chunk_idx < node_chunks_.size(), "invalid chunk idx");
+  ailego_assert_with(offset < node_chunks_[chunk_idx]->data_size(),
+                     "invalid chunk offset");
+  const void *ptr = nullptr;
+  size_t ret = node_chunks_[chunk_idx]->read(offset, &ptr, neighbor_size_);
+  if (ailego_unlikely(ret != neighbor_size_)) {
+    LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
+    return NeighborsT<MmapMemoryBlock>();
+  }
+  MmapMemoryBlock block(const_cast<void *>(ptr));
+  return NeighborsT<MmapMemoryBlock>(std::move(block));
+}
+
+template <>
+inline NeighborsT<BufferPoolMemoryBlock>
+VamanaStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
+    node_id_t id) const {
+  uint32_t chunk_idx = id >> node_index_mask_bits_;
+  uint32_t offset =
+      (id & node_index_mask_) * node_size() + vector_size() + sizeof(key_t);
+  sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_idx, &node_chunks_);
+  ailego_assert_with(chunk_idx < node_chunks_.size(), "invalid chunk idx");
+  IndexStorage::MemoryBlock mem_block;
+  size_t ret =
+      node_chunks_[chunk_idx]->read_borrowed(offset, mem_block, neighbor_size_);
+  if (ailego_unlikely(ret != neighbor_size_)) {
+    LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
+    return NeighborsT<BufferPoolMemoryBlock>();
+  }
+  return NeighborsT<BufferPoolMemoryBlock>(std::move(mem_block));
+}
+
+template <>
+inline int VamanaStreamerEntity::get_vector_typed<MmapMemoryBlock>(
+    const node_id_t *ids, uint32_t count,
+    std::vector<MmapMemoryBlock> &vec_blocks) const {
+  vec_blocks.resize(count);
+  for (auto i = 0U; i < count; ++i) {
+    auto loc = get_vector_chunk_loc(ids[i]);
+    ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+    const void *ptr = nullptr;
+    size_t ret = node_chunks_[loc.first]->read(loc.second, &ptr, vector_size());
+    if (ailego_unlikely(ret != vector_size())) {
+      LOG_ERROR("Read vector failed, ret=%zu", ret);
+      return IndexError_ReadData;
+    }
+    vec_blocks[i].reset(const_cast<void *>(ptr));
+  }
+  return 0;
+}
+
+template <>
+inline int VamanaStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
+    const node_id_t *ids, uint32_t count,
+    std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
+  vec_blocks.resize(count);
+  for (auto i = 0U; i < count; ++i) {
+    auto loc = get_vector_chunk_loc(ids[i]);
+    ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+    IndexStorage::MemoryBlock mem_block;
+    size_t ret = node_chunks_[loc.first]->read_borrowed(loc.second, mem_block,
+                                                        vector_size());
+    if (ailego_unlikely(ret != vector_size())) {
+      LOG_ERROR("Read vector failed, ret=%zu", ret);
+      return IndexError_ReadData;
+    }
+    vec_blocks[i] = std::move(mem_block);
+  }
+  return 0;
+}
+
+template <>
+inline key_t VamanaStreamerEntity::get_key_typed<MmapMemoryBlock>(
+    node_id_t id) const {
+  if (!use_key_info_map_) return id;
+  auto loc = get_key_chunk_loc(id);
+  ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+  const void *ptr = nullptr;
+  size_t ret = node_chunks_[loc.first]->read(loc.second, &ptr, sizeof(key_t));
+  if (ailego_unlikely(ret != sizeof(key_t))) {
+    LOG_ERROR("Read key failed, ret=%zu", ret);
+    return kInvalidKey;
+  }
+  return *reinterpret_cast<const key_t *>(ptr);
+}
+
+template <>
+inline key_t VamanaStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(
+    node_id_t id) const {
+  if (!use_key_info_map_) return id;
+  auto loc = get_key_chunk_loc(id);
+  ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+  IndexStorage::MemoryBlock key_block;
+  size_t ret = node_chunks_[loc.first]->read_borrowed(loc.second, key_block,
+                                                      sizeof(key_t));
+  if (ailego_unlikely(ret != sizeof(key_t))) {
+    LOG_ERROR("Read key failed, ret=%zu", ret);
+    return kInvalidKey;
+  }
+  return *reinterpret_cast<const key_t *>(key_block.data());
+}
+
+// --- Typed entity subclass for mmap mode ---
+// Caches chunk base addresses to eliminate virtual function calls on the
+// search hot path. For mmap mode, chunk data is memory-mapped at init time,
+// so we can directly compute pointers via base_addr + offset.
+class VamanaMmapStreamerEntity : public VamanaStreamerEntity {
+ public:
+  using MemoryBlock = MmapMemoryBlock;
+  using TypedNeighbors = NeighborsT<MmapMemoryBlock>;
+
+  using VamanaStreamerEntity::VamanaStreamerEntity;
+
+  VamanaStorageMode storage_mode() const override {
+    return VamanaStorageMode::kMmap;
+  }
+
+  //! Override clone to return correct subclass type, so that
+  //! static_cast<const VamanaMmapStreamerEntity&> in the algorithm is safe.
+  const VamanaEntity::Pointer clone() const override;
+
+  ailego_force_inline TypedNeighbors get_neighbors_typed(node_id_t id) const {
+    uint32_t chunk_idx = id >> node_index_mask_bits_;
+    uint32_t offset =
+        (id & node_index_mask_) * node_size() + vector_size() + sizeof(key_t);
+    const char *base = get_node_chunk_base(chunk_idx);
+    MmapMemoryBlock block(const_cast<char *>(base + offset));
+    return TypedNeighbors(std::move(block));
+  }
+
+  ailego_force_inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      std::vector<MmapMemoryBlock> &vec_blocks) const {
+    vec_blocks.resize(count);
+    for (auto i = 0U; i < count; ++i) {
+      uint32_t chunk_idx = ids[i] >> node_index_mask_bits_;
+      uint32_t offset = (ids[i] & node_index_mask_) * node_size();
+      const char *base = get_node_chunk_base(chunk_idx);
+      vec_blocks[i].reset(const_cast<char *>(base + offset));
+    }
+    return 0;
+  }
+
+  ailego_force_inline key_t get_key_typed(node_id_t id) const {
+    if (!use_key_info_map_) return id;
+    uint32_t chunk_idx = id >> node_index_mask_bits_;
+    uint32_t offset = (id & node_index_mask_) * node_size() + vector_size();
+    const char *base = get_node_chunk_base(chunk_idx);
+    return *reinterpret_cast<const key_t *>(base + offset);
+  }
+
+  //! Direct vector pointer access (no MemoryBlock wrapper).
+  //! For use in the merged search loop to avoid intermediate allocations.
+  ailego_force_inline const void *get_vector_ptr(node_id_t id) const {
+    uint32_t chunk_idx = id >> node_index_mask_bits_;
+    uint32_t offset = (id & node_index_mask_) * node_size();
+    return get_node_chunk_base(chunk_idx) + offset;
+  }
+
+  ailego_force_inline const void *get_extra_values_ptr(node_id_t id) const {
+    if (extra_values_size() == 0) return nullptr;
+    return static_cast<const char *>(get_vector_ptr(id)) + vector_data_size();
+  }
+
+  ailego_force_inline const void *get_extra_values_ptr(
+      node_id_t /*id*/, const void *vector) const {
+    return get_extra_values_from_vector(vector);
+  }
+
+ private:
+  ailego_force_inline const char *get_node_chunk_base(
+      uint32_t chunk_idx) const {
+    if (ailego_unlikely(chunk_idx >= node_chunk_bases_.size())) {
+      sync_node_chunk_bases(chunk_idx);
+    }
+    return node_chunk_bases_[chunk_idx];
+  }
+
+  void sync_node_chunk_bases(uint32_t chunk_idx) const {
+    std::lock_guard<std::mutex> lock(chunk_bases_mutex_);
+    // Double-check after acquiring lock to avoid redundant sync
+    if (chunk_idx < node_chunk_bases_.size()) {
+      return;
+    }
+    // Pre-reserve to match node_chunks_ capacity so that subsequent
+    // push_back never triggers reallocation — the lock-free fast path in
+    // get_node_chunk_base reads existing elements without holding the mutex.
+    if (node_chunk_bases_.capacity() < node_chunks_.capacity()) {
+      node_chunk_bases_.reserve(node_chunks_.capacity());
+    }
+    sync_node_chunks(chunk_idx);
+    const auto &chunks = node_chunks_;
+    for (size_t i = node_chunk_bases_.size(); i <= chunk_idx; ++i) {
+      const void *ptr = nullptr;
+      chunks[i]->read(0, &ptr, 1);
+      node_chunk_bases_.push_back(static_cast<const char *>(ptr));
+    }
+  }
+
+  mutable std::mutex chunk_bases_mutex_{};
+  mutable std::vector<const char *> node_chunk_bases_{};
+};
+
+// --- Typed entity subclass for buffer pool mode ---
+class VamanaBufferPoolStreamerEntity : public VamanaStreamerEntity {
+ public:
+  using MemoryBlock = BufferPoolMemoryBlock;
+  using TypedNeighbors = NeighborsT<BufferPoolMemoryBlock>;
+
+  using VamanaStreamerEntity::VamanaStreamerEntity;
+
+  VamanaStorageMode storage_mode() const override {
+    return VamanaStorageMode::kBufferPool;
+  }
+
+  inline TypedNeighbors get_neighbors_typed(node_id_t id) const {
+    return VamanaStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(id);
+  }
+
+  inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      std::vector<BufferPoolMemoryBlock> &vec_blocks) const {
+    return VamanaStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
+        ids, count, vec_blocks);
+  }
+
+  inline key_t get_key_typed(node_id_t id) const {
+    return VamanaStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(id);
+  }
+};
+
+// --- Typed entity subclass for contiguous memory mode ---
+// Splits node data into three independent contiguous regions during open:
+//   1. vector_base_: cache-line-aligned vector bodies
+//   2. extra_values_base_: optional packed trailing metadata
+//   3. graph_base_: packed per-node [key | degree | adjacency] rows
+class VamanaContiguousStreamerEntity : public VamanaMmapStreamerEntity {
+ public:
+  using VamanaMmapStreamerEntity::VamanaMmapStreamerEntity;
+
+  VamanaStorageMode storage_mode() const override {
+    return VamanaStorageMode::kContiguous;
+  }
+
+  //! Override clone to return correct subclass type.
+  //! Cloned entity shares contiguous memory via shared_ptr.
+  const VamanaEntity::Pointer clone() const override;
+
+  ~VamanaContiguousStreamerEntity() override = default;
+
+  // Build contiguous memory from chunks after open.
+  int build_contiguous_memory();
+
+  //! Degrade to mmap mode by releasing contiguous memory and falling back
+  //! to chunk-based access.
+  void degrade_to_mmap() {
+    vector_memory_.reset();
+    vector_base_ = nullptr;
+    vector_stride_ = 0;
+    graph_memory_.reset();
+    graph_base_ = nullptr;
+    graph_stride_ = 0;
+    graph_capacity_ = 0;
+    extra_values_memory_.reset();
+    extra_values_base_ = nullptr;
+    extra_values_stride_ = 0;
+    LOG_INFO("Vamana contiguous entity degraded to mmap mode for insertion");
+  }
+
+  bool is_contiguous() const {
+    return vector_base_ != nullptr;
+  }
+
+  //! Per-entry stride of the flat vector array (0 if no contiguous build).
+  //! Padded up to kVectorAlignment (64B), so it is also the amount that
+  //! should be prefetched per vector.
+  size_t vector_stride() const {
+    return vector_stride_;
+  }
+
+  int add_vector(key_t key, const void *vec, node_id_t *id) override {
+    if (ailego_unlikely(is_contiguous())) degrade_to_mmap();
+    return VamanaMmapStreamerEntity::add_vector(key, vec, id);
+  }
+
+  int add_vector_with_id(node_id_t id, const void *vec) override {
+    if (ailego_unlikely(is_contiguous())) degrade_to_mmap();
+    return VamanaMmapStreamerEntity::add_vector_with_id(id, vec);
+  }
+
+  key_t get_key(node_id_t id) const override {
+    if (ailego_likely(graph_base_ != nullptr && id < graph_capacity_)) {
+      return use_key_info_map_ ? packed_key(id) : id;
+    }
+    return VamanaMmapStreamerEntity::get_key(id);
+  }
+
+  const Neighbors get_neighbors(node_id_t id) const override {
+    if (ailego_likely(graph_base_ != nullptr && id < graph_capacity_)) {
+      return Neighbors(*packed_degree(id), packed_adjacency(id));
+    }
+    return VamanaMmapStreamerEntity::get_neighbors(id);
+  }
+
+  int update_neighbors(
+      node_id_t id,
+      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+
+  void add_neighbor(node_id_t id, uint32_t size,
+                    node_id_t neighbor_id) override;
+
+  ailego_force_inline TypedNeighbors get_neighbors_typed(node_id_t id) const {
+    if (ailego_likely(graph_base_ != nullptr && id < graph_capacity_)) {
+      return TypedNeighbors(*packed_degree(id), packed_adjacency(id));
+    }
+    return VamanaMmapStreamerEntity::get_neighbors_typed(id);
+  }
+
+  ailego_force_inline int get_vector_typed(
+      const node_id_t *ids, uint32_t count,
+      std::vector<MmapMemoryBlock> &vec_blocks) const {
+    if (ailego_likely(vector_base_ != nullptr)) {
+      vec_blocks.resize(count);
+      for (auto i = 0U; i < count; ++i) {
+        const char *ptr =
+            vector_base_ + static_cast<size_t>(ids[i]) * vector_stride_;
+        vec_blocks[i].reset(const_cast<char *>(ptr));
+      }
+      return 0;
+    }
+    return VamanaMmapStreamerEntity::get_vector_typed(ids, count, vec_blocks);
+  }
+
+  ailego_force_inline key_t get_key_typed(node_id_t id) const {
+    if (ailego_likely(graph_base_ != nullptr && id < graph_capacity_)) {
+      return use_key_info_map_ ? packed_key(id) : id;
+    }
+    return VamanaMmapStreamerEntity::get_key_typed(id);
+  }
+
+  //! Prefetch the complete packed graph record, including key and degree, so
+  //! the degree is resident before get_neighbors_typed() consumes it.
+  ailego_force_inline const char *graph_prefetch_data(node_id_t id) const {
+    if (ailego_likely(graph_base_ != nullptr && id < graph_capacity_)) {
+      return packed_graph_row(id);
+    }
+    return nullptr;
+  }
+
+  ailego_force_inline size_t graph_prefetch_size() const {
+    return sizeof(key_t) + sizeof(uint32_t) + max_degree() * sizeof(node_id_t);
+  }
+
+  //! Direct vector pointer from flat vector array.
+  //! Stride is padded up to kVectorAlignment (64B) to preserve cache-line
+  //! alignment even when vector_size is not a multiple of 64.  The padding is
+  //! purely in-memory and does NOT affect the on-disk index file layout.
+  ailego_force_inline const void *get_vector_ptr(node_id_t id) const {
+    if (ailego_likely(vector_base_ != nullptr && id < graph_capacity_)) {
+      return vector_base_ + static_cast<size_t>(id) * vector_stride_;
+    }
+    return VamanaMmapStreamerEntity::get_vector_ptr(id);
+  }
+
+  const void *get_extra_values(node_id_t id) const override {
+    return get_extra_values_ptr(id);
+  }
+
+  ailego_force_inline const void *get_extra_values_ptr(node_id_t id) const {
+    if (extra_values_size() == 0) return nullptr;
+    if (ailego_likely(extra_values_base_ != nullptr && id < graph_capacity_)) {
+      return extra_values_base_ +
+             static_cast<size_t>(id) * extra_values_stride_;
+    }
+    return VamanaMmapStreamerEntity::get_extra_values_ptr(id);
+  }
+
+  ailego_force_inline const void *get_extra_values_ptr(
+      node_id_t id, const void * /*vector*/) const {
+    return get_extra_values_ptr(id);
+  }
+
+ protected:
+  //! Custom deleter for contiguous memory allocated via
+  //! MemoryHelper::AllocateHugePage. `size` is the (already huge-page-aligned)
+  //! length passed at allocation time, required by the mmap/munmap path.
+  struct ContiguousDeleter {
+    size_t size;
+    void operator()(char *ptr) const {
+      ailego::MemoryHelper::FreeHugePage(ptr, size);
+    }
+  };
+
+  //! Flat vector array: vector bodies stored with per-vector stride
+  //! padded up to kVectorAlignment (64B) to keep each vector's starting
+  //! address cache-line aligned. Base is page-aligned by the allocator.
+  std::shared_ptr<char> vector_memory_{};
+  char *vector_base_{nullptr};
+  //! Per-vector stride = AlignUp(vector_data_size(), kVectorAlignment).
+  size_t vector_stride_{0};
+
+  //! Packed graph rows: [key | degree | adjacency[max_degree]]. Rows are not
+  //! padded, so odd rows may contain an unaligned key; packed_key() uses
+  //! memcpy to avoid undefined behavior.
+  std::shared_ptr<char> graph_memory_{};
+  char *graph_base_{nullptr};
+  size_t graph_stride_{0};
+  uint32_t graph_capacity_{0};
+
+  //! Optional packed trailing record metadata, such as UniformUint8's norm.
+  std::shared_ptr<char> extra_values_memory_{};
+  char *extra_values_base_{nullptr};
+  size_t extra_values_stride_{0};
+
+  //! Cache-line alignment used for per-vector stride in the flat array.
+  static constexpr size_t kVectorAlignment = 64;
+
+ private:
+  static char *allocate_contiguous(size_t size);
+
+  ailego_force_inline const char *packed_graph_row(node_id_t id) const {
+    return graph_base_ + static_cast<size_t>(id) * graph_stride_;
+  }
+
+  ailego_force_inline key_t packed_key(node_id_t id) const {
+    key_t key;
+    std::memcpy(&key, packed_graph_row(id), sizeof(key));
+    return key;
+  }
+
+  ailego_force_inline const uint32_t *packed_degree(node_id_t id) const {
+    return reinterpret_cast<const uint32_t *>(packed_graph_row(id) +
+                                              sizeof(key_t));
+  }
+
+  ailego_force_inline uint32_t *mutable_packed_degree(node_id_t id) {
+    return reinterpret_cast<uint32_t *>(
+        graph_base_ + static_cast<size_t>(id) * graph_stride_ + sizeof(key_t));
+  }
+
+  ailego_force_inline const node_id_t *packed_adjacency(node_id_t id) const {
+    return reinterpret_cast<const node_id_t *>(
+        packed_graph_row(id) + sizeof(key_t) + sizeof(uint32_t));
+  }
+
+  ailego_force_inline node_id_t *mutable_packed_adjacency(node_id_t id) {
+    return reinterpret_cast<node_id_t *>(
+        graph_base_ + static_cast<size_t>(id) * graph_stride_ + sizeof(key_t) +
+        sizeof(uint32_t));
+  }
+};
+
+}  // namespace core
+}  // namespace zvec

@@ -1,0 +1,16 @@
+approvers:
+    - zheng1 #oncall
+    - rayzhou2017
+    - wansir
+    - benjaminhuo
+
+reviewers:
+    - rayzhou2017
+    - benjaminhuo
+    - calvinyv
+    - pixiake
+    - wansir
+    - zheng1
+    - stoneshi-yunify
+    - wanjunlei
+    - junotx

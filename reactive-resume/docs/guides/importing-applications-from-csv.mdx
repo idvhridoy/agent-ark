@@ -1,0 +1,128 @@
+---
+title: "Importing applications from CSV"
+description: "Move existing job applications into the Reactive Resume Application Tracker by uploading a CSV file or pasting spreadsheet rows with headers."
+---
+
+Use CSV import when you already track applications in a spreadsheet and want to move them into Reactive Resume.
+
+## Open CSV import
+
+<Steps>
+  <Step title="Go to Applications">
+    In the dashboard sidebar, click **Applications**.
+  </Step>
+
+  <Step title="Click Import CSV">
+    If you have no applications yet, click **Import from CSV** in the empty state. Otherwise, click **Import CSV** in the
+    page header.
+  </Step>
+</Steps>
+
+<Frame caption="CSV import sheet with a recognized preview">
+  <img
+    src="/images/guides/importing-applications-from-csv/screenshot-1.webp"
+    alt="CSV import sheet showing upload, pasted CSV rows, recognized fields, and one application ready to import"
+  />
+</Frame>
+
+## Prepare your CSV
+
+The importer uses the first row as headers. Each imported row must include a company and role.
+
+Supported headers include:
+
+| Field | Recognized headers |
+| --- | --- |
+| **Company** | `Company`, `Employer`, `Organization` |
+| **Role** | `Role`, `Title`, `Position`, `Job Title` |
+| **Stage** | `Stage`, `Status` |
+| **Location** | `Location` |
+| **Salary** | `Salary`, `Salary Range`, `Compensation` |
+| **Source** | `Source` |
+| **Notes** | `Notes`, `Note` |
+| **Job posting URL** | `URL`, `Link`, `Job URL`, `Job Posting` |
+| **Tags** | `Tags` |
+| **Contact name** | `Contact Name` |
+| **Contact role** | `Contact Role` |
+| **Contact label** | `Contact Type` |
+| **Contact email** | `Contact Email` |
+| **Contact phone** | `Contact Phone` |
+
+Tags can be separated with commas, semicolons, or vertical bars.
+
+Each row can carry one contact. A contact needs a `Contact Name`, and `Contact Email` must be a valid email address — if
+either is wrong, the contact is dropped and the application still imports.
+
+```csv
+Company,Role,Stage,Location,Salary,Source,Tags,Contact Name,Contact Email,Contact Phone
+Stripe,Frontend Engineer,applied,Remote,$180k,LinkedIn,remote;react,Jane Doe,jane@example.com,+1 555 0100
+```
+
+## Import applications
+
+<Steps>
+  <Step title="Upload or paste rows">
+    Upload a `.csv` file, or paste CSV rows directly into the **CSV data** field.
+  </Step>
+
+  <Step title="Review the preview">
+    Reactive Resume shows how many rows are ready to import, which columns it recognized, and how many rows were skipped.
+  </Step>
+
+  <Step title="Fix skipped rows">
+    Rows without a company or role are skipped. Add the missing values before importing if you want those rows included.
+    The preview also counts skipped contacts — those rows still import, just without the contact.
+  </Step>
+
+  <Step title="Import">
+    Click **Import**. Imported applications are added to your Application Tracker.
+  </Step>
+</Steps>
+
+## Use valid stages
+
+The **Stage** column is optional. If you include it, use one of these values:
+
+- `saved`
+- `applied`
+- `screening`
+- `interview`
+- `offer`
+- `rejected`
+
+If a row has an unrecognized stage, the importer ignores that stage value and uses the default application stage.
+
+## Import large files
+
+Reactive Resume imports up to 500 applications at a time. If your CSV has more than 500 valid rows, split it into smaller files and import each file separately.
+
+<Tip>
+  Import first, then use the table view to select multiple applications and apply tags, move stages, archive rows, or delete rows in bulk.
+</Tip>
+
+<Tip>
+  MCP clients can also import application rows directly with `import_applications`. See [Managing applications with MCP](/guides/managing-applications-with-mcp) for agent prompt examples.
+</Tip>
+
+## Troubleshooting
+
+### Some rows were skipped
+
+Make sure every row has both a company and a role. These fields are required.
+
+### A contact did not import
+
+The contact needs a `Contact Name`, and `Contact Email` must be a valid address. The application imports either way — fix
+the contact columns and import that row again if you want the contact.
+
+### A column was not recognized
+
+Rename the header to one of the recognized names in the table above, then import again.
+
+### Tags did not split correctly
+
+Separate tags with commas, semicolons, or vertical bars, such as `remote;react` or `frontend|senior`.
+
+### A stage did not import
+
+Use lowercase stage values such as `applied` or `interview`. Custom stages are not supported.

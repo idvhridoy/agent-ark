@@ -1,0 +1,19 @@
+{
+  "extends": "@pascal/typescript-config/react-library.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "noEmit": false,
+    "composite": true,
+    "incremental": true,
+    "types": ["bun"]
+  },
+  "include": ["src"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "src/contracts/metadata-scan.ts"
+  ]
+}

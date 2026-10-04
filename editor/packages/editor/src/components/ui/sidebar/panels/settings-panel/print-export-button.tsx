@@ -1,0 +1,128 @@
+import { AlertTriangle, Printer } from 'lucide-react'
+import { useState } from 'react'
+import { Button } from '../../../../../components/ui/primitives/button'
+import {
+  isPrintLevelBundleReport,
+  type PrintLevelBundleReport,
+} from '../../../../../lib/level-print-export'
+import type {
+  ModelExport,
+  ModelExportArtifact,
+  ModelExportFormat,
+} from '../../../../../lib/model-export'
+import {
+  isPrintExportReport,
+  type PrintExportReport,
+} from '../../../../../lib/print-export'
+import useEditor from '../../../../../store/use-editor'
+
+type PreparedPrintExport = {
+  artifact: ModelExportArtifact
+  report: PrintExportReport | PrintLevelBundleReport
+}
+
+type PrintModelExportFormat = Extract<ModelExportFormat, 'print-3mf' | 'print-stl'>
+
+function downloadArtifact(artifact: ModelExportArtifact) {
+  const url = URL.createObjectURL(artifact.blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = artifact.filename
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+function firstBlockingMessage(report: PrintExportReport | PrintLevelBundleReport) {
+  const bundleDiagnostic = report.diagnostics.find((item) => item.severity === 'error')
+  if (bundleDiagnostic || !isPrintLevelBundleReport(report)) return bundleDiagnostic?.message
+
+  for (const part of report.parts) {
+    const partDiagnostic = part.report.diagnostics.find((item) => item.severity === 'error')
+    if (partDiagnostic) return partDiagnostic.message
+  }
+}
+
+export async function preparePrintExport(
+  modelExport: ModelExport,
+  onlyVisible: boolean,
+  format: PrintModelExportFormat,
+): Promise<PreparedPrintExport> {
+  const artifact = await modelExport(format, {
+    onlyVisible,
+    download: false,
+    printScale: 100,
+    printScope: 'levels',
+    printContent: 'structure',
+    printBase: 'none',
+  })
+
+  if (
+    !artifact ||
+    (!isPrintExportReport(artifact.metadata) && !isPrintLevelBundleReport(artifact.metadata))
+  ) {
+    throw new Error('The 3D print exporter did not return a valid file.')
+  }
+
+  if (artifact.metadata.status === 'blocked') {
+    throw new Error(
+      firstBlockingMessage(artifact.metadata) ??
+        'This project cannot be exported as printable parts.',
+    )
+  }
+
+  return { artifact, report: artifact.metadata }
+}
+
+export function PrintExportButton({ onlyVisible }: { onlyVisible: boolean }) {
+  const modelExport = useEditor((state) => state.modelExport)
+  const [exportingFormat, setExportingFormat] = useState<PrintModelExportFormat | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleExport = async (format: PrintModelExportFormat) => {
+    if (!modelExport) return
+
+    setExportingFormat(format)
+    setError(null)
+    try {
+      const prepared = await preparePrintExport(modelExport, onlyVisible, format)
+      downloadArtifact(prepared.artifact)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '3D print export failed.')
+    } finally {
+      setExportingFormat(null)
+    }
+  }
+
+  const isExporting = exportingFormat !== null
+
+  return (
+    <>
+      <Button
+        aria-busy={exportingFormat === 'print-3mf'}
+        className="w-full justify-start gap-2"
+        disabled={isExporting || !modelExport}
+        onClick={() => void handleExport('print-3mf')}
+        variant="outline"
+      >
+        <Printer className="size-4" />
+        Export 3D print 3MF
+      </Button>
+      <Button
+        aria-busy={exportingFormat === 'print-stl'}
+        className="w-full justify-start gap-2"
+        disabled={isExporting || !modelExport}
+        onClick={() => void handleExport('print-stl')}
+        variant="outline"
+      >
+        <Printer className="size-4" />
+        Export 3D print STL
+      </Button>
+      {error && (
+        <div className="col-span-full flex gap-2 text-destructive text-xs">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+    </>
+  )
+}

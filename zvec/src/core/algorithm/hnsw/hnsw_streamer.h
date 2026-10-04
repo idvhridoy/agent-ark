@@ -1,0 +1,325 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <ailego/parallel/lock.h>
+#include <zvec/core/framework/index_framework.h>
+#include <zvec/core/framework/index_provider.h>
+#include "hnsw_algorithm.h"
+#include "hnsw_streamer_entity.h"
+
+namespace zvec {
+namespace core {
+
+class HnswStreamer : public IndexStreamer {
+ public:
+  using ContextPointer = IndexStreamer::Context::Pointer;
+
+  HnswStreamer();
+  ~HnswStreamer() override;
+
+  HnswStreamer(const HnswStreamer &streamer) = delete;
+  HnswStreamer &operator=(const HnswStreamer &streamer) = delete;
+
+  void merge_trained_meta(const IndexMeta &meta) override;
+
+  //! Bind a provider which supplies the original vectors, so the graph is
+  //! built from them instead of the vectors stored in index. It must be
+  //! called before open, where the build distance is derived from the
+  //! provider meta; binding it afterwards would compute wrong distances
+  int set_provider(IndexProvider::Pointer provider,
+                   const IndexMeta &provider_meta) override {
+    if (ailego_unlikely(state_ == STATE_OPENED)) {
+      LOG_ERROR("Provider must be set before opening the streamer");
+      return IndexError_Unsupported;
+    }
+    if (ailego_unlikely(!provider)) {
+      LOG_ERROR("Provider is null");
+      return IndexError_InvalidArgument;
+    }
+    //! the provider meta must describe a usable vector layout
+    if (ailego_unlikely(provider_meta.data_type() ==
+                            IndexMeta::DataType::DT_UNDEFINED ||
+                        provider_meta.dimension() == 0U ||
+                        provider_meta.element_size() == 0U)) {
+      LOG_ERROR(
+          "Invalid provider meta: dataType=%d dimension=%u elementSize=%u",
+          static_cast<int>(provider_meta.data_type()),
+          provider_meta.dimension(), provider_meta.element_size());
+      return IndexError_InvalidArgument;
+    }
+    //! the layout reported by the provider must match the provider meta,
+    //! otherwise the vectors it supplies would be misinterpreted
+    if (ailego_unlikely(provider->data_type() != provider_meta.data_type() ||
+                        provider->dimension() != provider_meta.dimension() ||
+                        provider->element_size() !=
+                            provider_meta.element_size())) {
+      LOG_ERROR(
+          "Provider layout mismatches provider meta: "
+          "dataType=%d/%d dimension=%zu/%u elementSize=%zu/%u",
+          static_cast<int>(provider->data_type()),
+          static_cast<int>(provider_meta.data_type()), provider->dimension(),
+          provider_meta.dimension(), provider->element_size(),
+          provider_meta.element_size());
+      return IndexError_Mismatch;
+    }
+    provider_ = std::move(provider);
+    provider_meta_ = provider_meta;
+    return 0;
+  }
+
+ public:
+  //! Retrieve the storage mode of the underlying entity. Returns
+  //! HnswStorageMode::kMmap when the entity has not been initialized yet.
+  //! Intended for introspection and debug/testing usage.
+  HnswStorageMode storage_mode() const {
+    if (!entity_) {
+      return HnswStorageMode::kMmap;
+    }
+    return entity_->storage_mode();
+  }
+
+  //! Whether the active search distance path is backed by a turbo quantizer.
+  bool uses_turbo_distance() const {
+    return quantizer_ != nullptr;
+  }
+
+  //! Whether graph construction is backed by a turbo quantizer. Compatible
+  //! FP32 providers use a dedicated quantizer; other providers use a metric.
+  bool uses_turbo_build_distance() const {
+    return quantizer_ != nullptr &&
+           (provider_ == nullptr || provider_quantizer_ != nullptr);
+  }
+
+ protected:
+  //! Initialize Streamer
+  int init(const IndexMeta &imeta, const ailego::Params &params) override;
+
+  //! Initialize Streamer with a turbo quantizer for distance computation
+  int init(const IndexMeta &imeta, const ailego::Params &params,
+           const std::shared_ptr<zvec::turbo::Quantizer> &quantizer) override;
+
+  //! Cleanup Streamer
+  int cleanup() override;
+
+  //! Create a context
+  Context::Pointer create_context() const override;
+
+  //! Create a new iterator
+  IndexProvider::Pointer create_provider() const override;
+
+  //! Add a vector into index
+  int add_impl(uint64_t pkey, const void *query, const IndexQueryMeta &qmeta,
+               Context::Pointer &context) override;
+
+  //! Add a vector with id into index
+  int add_with_id_impl(uint32_t id, const void *query,
+                       const IndexQueryMeta &qmeta,
+                       Context::Pointer &context) override;
+
+  //! Similarity search
+  int search_impl(const void *query, const IndexQueryMeta &qmeta,
+                  Context::Pointer &context) const override;
+
+  //! Similarity search
+  int search_impl(const void *query, const IndexQueryMeta &qmeta,
+                  uint32_t count, Context::Pointer &context) const override;
+
+  int search_candidates_impl(const void *query, const IndexQueryMeta &qmeta,
+                             std::vector<uint64_t> &keys,
+                             Context::Pointer &context) const override;
+
+  //! Similarity brute force search
+  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                     Context::Pointer &context) const override;
+
+  //! Similarity brute force search
+  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                     uint32_t count, Context::Pointer &context) const override;
+
+  //! Linear search by primary keys
+  int search_bf_by_p_keys_impl(const void *query,
+                               const std::vector<std::vector<uint64_t>> &p_keys,
+                               const IndexQueryMeta &qmeta,
+                               ContextPointer &context) const override {
+    return search_bf_by_p_keys_impl(query, p_keys, qmeta, 1, context);
+  }
+
+  //! Linear search by primary keys
+  int search_bf_by_p_keys_impl(const void *query,
+                               const std::vector<std::vector<uint64_t>> &p_keys,
+                               const IndexQueryMeta &qmeta, uint32_t count,
+                               ContextPointer &context) const override;
+
+  //! Fetch vector by key
+  const void *get_vector(uint64_t key) const override {
+    return entity_->get_vector_by_key(key);
+  }
+
+  int get_vector(const uint64_t key,
+                 IndexStorage::MemoryBlock &block) const override {
+    return entity_->get_vector_by_key(key, block);
+  }
+
+  //! Fetch vector by id
+  const void *get_vector_by_id(uint32_t id) const override {
+    return entity_->get_vector(id);
+  }
+
+  int get_vector_by_id(const uint32_t id,
+                       IndexStorage::MemoryBlock &block) const override {
+    return entity_->get_vector(id, block);
+  }
+
+  //! Open index from file path
+  int open(IndexStorage::Pointer stg) override;
+
+  //! Close file
+  int close() override;
+
+  //! flush file
+  int flush(uint64_t checkpoint) override;
+
+  //! Dump index into storage
+  int dump(const IndexDumper::Pointer &dumper) override;
+
+  //! Retrieve statistics
+  const Stats &stats() const override {
+    return stats_;
+  }
+
+  //! Retrieve meta of index
+  const IndexMeta &meta() const override {
+    return meta_;
+  }
+
+  void print_debug_info() override;
+
+ private:
+  inline int check_params(const void *query,
+                          const IndexQueryMeta &qmeta) const {
+    if (ailego_unlikely(!query)) {
+      LOG_ERROR("null query");
+      return IndexError_InvalidArgument;
+    }
+    if (ailego_unlikely(qmeta.dimension() != meta_.dimension() ||
+                        qmeta.data_type() != meta_.data_type() ||
+                        qmeta.element_size() != meta_.element_size())) {
+      LOG_ERROR("Unsupported query meta");
+      return IndexError_Mismatch;
+    }
+    return 0;
+  }
+
+  inline int check_sparse_count_is_zero(const uint32_t *sparse_count,
+                                        uint32_t count) const {
+    for (uint32_t i = 0; i < count; ++i) {
+      if (sparse_count[i] != 0)
+        LOG_ERROR("Sparse cout is not empty. Index: %u, Sparse Count: %u", i,
+                  sparse_count[i]);
+      return IndexError_InvalidArgument;
+    }
+
+    return 0;
+  }
+
+ private:
+  //! Configure and initialize the entity with saved parameters
+  int setup_entity();
+
+  //! To share ctx across streamer/searcher, we need to update the context for
+  //! current streamer/searcher
+  int update_context(HnswContext *ctx) const;
+
+  //! Bind the distance functions and inline record layout used for graph build
+  void bind_add_dist_space(HnswContext *ctx) const;
+
+  //! Bind the distance functions and inline record layout used for search
+  void bind_search_dist_space(HnswContext *ctx) const;
+
+ private:
+  enum State { STATE_INIT = 0, STATE_INITED = 1, STATE_OPENED = 2 };
+  class Stats : public IndexStreamer::Stats {
+   public:
+    void clear() {
+      set_revision_id(0u);
+      set_loaded_count(0u);
+      set_added_count(0u);
+      set_discarded_count(0u);
+      set_index_size(0u);
+      set_dumped_size(0u);
+      set_check_point(0u);
+      set_create_time(0u);
+      set_update_time(0u);
+      clear_attributes();
+    }
+  };
+
+  std::unique_ptr<HnswStreamerEntity> entity_;
+  HnswAlgorithmBase::UPointer alg_;
+  IndexMeta meta_{};
+  IndexMetric::Pointer metric_{};
+
+  IndexMetric::MatrixDistance add_distance_{};
+  IndexMetric::MatrixDistance search_distance_{};
+
+  IndexMetric::MatrixBatchDistance add_batch_distance_{};
+  IndexMetric::MatrixBatchDistance search_batch_distance_{};
+  std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};
+
+  Stats stats_{};
+  std::mutex mutex_{};
+
+  // provider of the original vectors used to build graph
+  IndexProvider::Pointer provider_{};
+  IndexMeta provider_meta_{};
+  IndexMetric::Pointer provider_metric_{};  // legacy provider distance path
+  std::shared_ptr<zvec::turbo::Quantizer> provider_quantizer_{};
+
+  size_t max_index_size_{0UL};
+  size_t chunk_size_{HnswEntity::kDefaultChunkSize};
+  size_t docs_hard_limit_{HnswEntity::kDefaultDocsHardLimit};
+  size_t docs_soft_limit_{0UL};
+  uint32_t min_neighbor_cnt_{0u};
+  uint32_t prune_cnt_{0u};
+  uint32_t upper_max_neighbor_cnt_{HnswEntity::kDefaultUpperMaxNeighborCnt};
+  uint32_t l0_max_neighbor_cnt_{HnswEntity::kDefaultL0MaxNeighborCnt};
+  uint32_t ef_{HnswEntity::kDefaultEf};
+  uint32_t po_{8};
+  uint32_t pl_{0};
+  uint32_t ef_construction_{HnswEntity::kDefaultEfConstruction};
+  uint32_t scaling_factor_{HnswEntity::kDefaultScalingFactor};
+  size_t bruteforce_threshold_{HnswEntity::kDefaultBruteForceThreshold};
+  size_t max_scan_limit_{HnswEntity::kDefaultMaxScanLimit};
+  size_t min_scan_limit_{HnswEntity::kDefaultMinScanLimit};
+  float bf_negative_prob_{HnswEntity::kDefaultBFNegativeProbability};
+  float max_scan_ratio_{HnswEntity::kDefaultScanRatio};
+
+  uint32_t magic_{0U};
+  State state_{STATE_INIT};
+  bool bf_enabled_{false};
+  bool check_crc_enabled_{false};
+  bool filter_same_key_{false};
+  bool get_vector_enabled_{false};
+  bool force_padding_topk_enabled_{false};
+  bool use_id_map_{true};
+  bool use_contiguous_memory_{false};
+  bool use_external_vector_{false};
+
+  //! avoid add vector while dumping index
+  ailego::SharedMutex shared_mutex_{};
+};
+
+}  // namespace core
+}  // namespace zvec

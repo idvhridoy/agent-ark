@@ -1,0 +1,6 @@
+{
+    global:
+        PyInit_*;  # export only python related functions
+    local:
+        *;
+};

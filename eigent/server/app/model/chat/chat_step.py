@@ -1,0 +1,78 @@
+# ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+import json
+from datetime import datetime
+from typing import Any, Optional
+
+from pydantic import BaseModel, field_validator
+from sqlmodel import JSON, Field
+
+from app.model.abstract.model import AbstractModel, DefaultTimes
+
+
+class ChatStep(AbstractModel, DefaultTimes, table=True):
+    id: int = Field(default=None, primary_key=True)
+    task_id: str = Field(index=True)
+    run_id: str | None = Field(default=None, index=True)
+    step: str
+    data: str = Field(sa_type=JSON)
+    timestamp: float | None = Field(default=None, nullable=True)
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def serialize_data(cls, v):
+        if isinstance(v, (dict, list)):
+            return json.dumps(v, ensure_ascii=False)
+        return v
+
+    @field_validator("data", mode="after")
+    @classmethod
+    def deserialize_data(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
+
+class ChatStepIn(BaseModel):
+    task_id: str
+    run_id: str | None = None
+    step: str
+    data: Any
+    timestamp: float | None = None
+
+
+class ChatStepOut(BaseModel):
+    id: int
+    task_id: str
+    run_id: str | None = None
+    step: str
+    data: Any
+    timestamp: Optional[float] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChatStepUpdate(BaseModel):
+    step: Optional[str] = None
+    data: Optional[Any] = None
+    timestamp: Optional[float] = None
+    run_id: str | None = None

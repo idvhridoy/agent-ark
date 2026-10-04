@@ -1,0 +1,17 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { SkillsCatalog } from "../components/brand/SkillsCatalog";
+import { skills, searchIndex } from "../lib/site-data";
+
+---
+
+<BaseLayout
+  title="Skills | Awesome GitHub Copilot"
+  description="Browse community-contributed agent skills for GitHub Copilot."
+>
+  <SkillsCatalog
+    client:load
+    skills={skills as any}
+    searchIndex={searchIndex}
+  />
+</BaseLayout>

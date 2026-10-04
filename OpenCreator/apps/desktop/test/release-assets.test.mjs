@@ -1,0 +1,174 @@
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  finalizeReleaseAssets,
+  krillinReleaseAssetNames,
+  releaseAssetNames,
+  stageReleaseAssets
+} from '../scripts/release-assets.mjs';
+
+const version = '3.0.0';
+const directories = [];
+
+afterEach(() => {
+  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+function fixture(platform = 'darwin', arch = 'arm64') {
+  const directory = mkdtempSync(join(tmpdir(), 'opencreator-release-assets-'));
+  directories.push(directory);
+  const assetsDir = join(directory, 'publish');
+  const names = releaseAssetNames(version, platform, arch);
+  const artifacts = names.map(name => {
+    const path = join(directory, name);
+    const content = Buffer.from(`verified content for ${name}`);
+    writeFileSync(path, content);
+    return { path, bytes: content.length, sha256: createHash('sha256').update(content).digest('hex') };
+  });
+  return { directory, assetsDir, manifest: { platform, arch, artifacts } };
+}
+
+describe('Desktop release assets', () => {
+  it('publishes only verified installers and required updater files, without stale assets', () => {
+    const data = fixture();
+    const extraNames = [
+      'krillinai-cli-darwin-arm64', 'krillinai-build-manifest-darwin-arm64.json',
+      'builder-effective-config.yaml', 'OpenCreator-3.0.0-mac-arm64.dmg.blockmap'
+    ];
+    for (const name of extraNames) {
+      const path = join(data.directory, name);
+      writeFileSync(path, 'internal');
+      data.manifest.artifacts.push({ path });
+    }
+    mkdirSync(data.assetsDir);
+    writeFileSync(join(data.assetsDir, 'old-version.dmg'), 'stale');
+    stageReleaseAssets({ ...data, version });
+    expect(readdirSync(data.assetsDir).sort()).toEqual([
+      ...releaseAssetNames(version, 'darwin', 'arm64'), 'SHA256SUMS.txt'
+    ].sort());
+    expect(readFileSync(join(data.assetsDir, 'SHA256SUMS.txt'), 'utf8')).not.toMatch(/internal|manifest|old-version/);
+  });
+
+  it('rejects missing updater artifacts and modified package files before altering staged output', () => {
+    const data = fixture('win32', 'x64');
+    mkdirSync(data.assetsDir);
+    writeFileSync(join(data.assetsDir, 'previous.exe'), 'preserved');
+    const complete = [...data.manifest.artifacts];
+    data.manifest.artifacts.pop();
+    expect(() => stageReleaseAssets({ ...data, version })).toThrow('latest.yml');
+    data.manifest.artifacts = complete;
+    writeFileSync(complete[0].path, 'modified');
+    expect(() => stageReleaseAssets({ ...data, version })).toThrow('changed after package verification');
+    expect(readFileSync(join(data.assetsDir, 'previous.exe'), 'utf8')).toBe('preserved');
+  });
+
+  it('isolates macOS architectures and rejects unsupported targets or unsafe versions', () => {
+    expect(releaseAssetNames(version, 'darwin', 'x64')).toContain('latest-x64-mac.yml');
+    expect(releaseAssetNames(version, 'darwin', 'arm64')).toContain('latest-mac.yml');
+    expect(() => releaseAssetNames(version, 'linux', 'x64')).toThrow('Unsupported');
+    expect(() => releaseAssetNames('../3.0.0', 'win32', 'x64')).toThrow('Invalid release version');
+    expect(krillinReleaseAssetNames(version, 'linux', 'arm64')).toEqual([
+      'KrillinAI-Server-3.0.0-linux-arm64.tar.gz',
+      'KrillinAI-CLI-3.0.0-linux-arm64.tar.gz'
+    ]);
+    expect(krillinReleaseAssetNames(version, 'win32', 'x64')).toEqual([
+      'KrillinAI-Server-3.0.0-win-x64.zip',
+      'KrillinAI-CLI-3.0.0-win-x64.zip'
+    ]);
+    expect(() => krillinReleaseAssetNames(version, 'win32', 'arm64')).toThrow('Unsupported');
+  });
+
+  it('finalizes desktop, server, and CLI assets with download links and checksums', () => {
+    const data = fixture();
+    for (const [platform, arch] of [['darwin', 'x64'], ['win32', 'x64']]) {
+      for (const name of releaseAssetNames(version, platform, arch)) writeFileSync(join(data.directory, name), name);
+    }
+    for (const [platform, arch] of [
+      ['darwin', 'arm64'],
+      ['darwin', 'x64'],
+      ['win32', 'x64'],
+      ['linux', 'x64'],
+      ['linux', 'arm64']
+    ]) {
+      for (const name of krillinReleaseAssetNames(version, platform, arch)) {
+        writeFileSync(join(data.directory, name), name);
+      }
+    }
+    const notes = finalizeReleaseAssets({
+      directory: data.directory,
+      version,
+      repository: 'krillinai/OpenCreator',
+      highlights: '## What\'s New\n\n- Added Creator workflows.'
+    });
+    expect(readdirSync(data.directory)).toHaveLength(21);
+    expect(readFileSync(join(data.directory, 'SHA256SUMS.txt'), 'utf8').trim().split('\n')).toHaveLength(20);
+    expect(notes).toContain('https://github.com/krillinai/OpenCreator/releases/download/v3.0.0/OpenCreator-3.0.0-win-x64.exe');
+    expect(notes).toContain('KrillinAI-Server-3.0.0-linux-x64.tar.gz');
+    expect(notes).toContain('KrillinAI-CLI-3.0.0-mac-arm64.tar.gz');
+    expect(notes).toContain('macOS Apple Silicon');
+    expect(notes).toContain('Authenticode');
+    expect(notes).toContain('## What\'s New\n\n- Added Creator workflows.');
+    expect(notes).toContain('## OpenCreator Desktop');
+    expect(notes).toContain('| Platform | Installer |');
+    expect(notes).toContain('[SHA-256 Checksums]');
+    expect(notes).toContain('<summary>Automatic Update Assets</summary>');
+    expect(notes).not.toMatch(/[\u3400-\u9fff]/u);
+    writeFileSync(join(data.directory, 'builder-debug.yml'), 'private diagnostic');
+    expect(() => finalizeReleaseAssets({
+      directory: data.directory,
+      version,
+      repository: 'krillinai/OpenCreator'
+    })).toThrow('Unexpected public release asset');
+    rmSync(join(data.directory, 'builder-debug.yml'));
+    rmSync(join(data.directory, 'latest.yml'));
+    expect(() => finalizeReleaseAssets({
+      directory: data.directory,
+      version,
+      repository: 'krillinai/OpenCreator'
+    })).toThrow('Missing release asset');
+  });
+
+  it('uses versioned platform filenames and the new repository for automatic updates', () => {
+    const config = readFileSync(resolve(process.cwd(), 'electron-builder.yml'), 'utf8');
+    expect(config).toContain('artifactName: OpenCreator-${version}-${os}-${arch}.${ext}');
+    expect(config).toContain('repo: OpenCreator');
+    expect(config).not.toContain('repo: KrillinAI');
+  });
+
+  it('runs the release finalizer through the same CLI used by the promotion workflow', () => {
+    const data = fixture();
+    for (const [platform, arch] of [['darwin', 'x64'], ['win32', 'x64']]) {
+      for (const name of releaseAssetNames(version, platform, arch)) {
+        writeFileSync(join(data.directory, name), name);
+      }
+    }
+    for (const [platform, arch] of [
+      ['darwin', 'arm64'],
+      ['darwin', 'x64'],
+      ['win32', 'x64'],
+      ['linux', 'x64'],
+      ['linux', 'arm64']
+    ]) {
+      for (const name of krillinReleaseAssetNames(version, platform, arch)) {
+        writeFileSync(join(data.directory, name), name);
+      }
+    }
+    const notesPath = join(data.directory, '..', 'release-notes.md');
+    const result = spawnSync(process.execPath, [
+      resolve(process.cwd(), 'scripts/release-assets.mjs'),
+      data.directory,
+      `v${version}`,
+      'krillinai/OpenCreator',
+      notesPath
+    ], { encoding: 'utf8' });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`Verified 21 public release assets for v${version}`);
+    expect(readFileSync(notesPath, 'utf8')).toContain(`# OpenCreator v${version}`);
+    rmSync(notesPath);
+  });
+});

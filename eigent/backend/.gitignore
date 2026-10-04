@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+camel_logs/
+build/
+dist/
+wheels/
+*.egg-info
+*.mo
+test.py
+
+# Virtual environments
+.venv
+.env
+
+runtime
+tmp
+img
+
+
+uv_installing.lock
+uv_installed.lock
+benchmark/*_results.csv
+benchmark/harbor/jobs/

@@ -1,0 +1,72 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+site/
+
+data/*
+!data/README.md
+!data/searchqa_id_split/
+!data/searchqa_id_split/**
+!data/livemathematicianbench_id_split/
+!data/livemathematicianbench_id_split/**
+!data/docvqa_id_split/
+!data/docvqa_id_split/**
+!data/officeqa_id_split/
+!data/officeqa_id_split/**
+!data/spreadsheetbench_id_split/
+!data/spreadsheetbench_id_split/**
+!data/alfworld_path_split/
+!data/alfworld_path_split/**
+outputs/
+logs/
+external/
+# SkillOpt-Sleep runtime state (staging proposals, config, diagnostics, cron logs)
+.skillopt-sleep/
+# SkillOpt-Sleep handoff-backend round data (prompts/answers derived from transcripts)
+.skillopt-sleep-handoff/
+.skillopt-sleep-handoff.night*.done/
+
+/BabyVision/
+/MMRB/
+/SpreadsheetBench/
+/dl4ir-searchQA/
+
+configs/local/
+configs/**/*.local.yaml
+*.local.md
+*.secret.md
+*.bak
+
+.env
+.secrets/
+.codex_azure*/
+
+# Local MCP server config — references the machine's GITHUB_PAT, never commit
+.mcp.json
+
+# Internal docs (not for open-source release)
+docs/ablation_plan.md
+docs/ablation_paper_tables.md
+docs/ablation_paper_tables.html
+docs/experiment_commands.md
+docs/slow_update_flowchart.md
+docs/session_memory.md
+docs/harness_fresh_machine_handoff.md
+docs/harness_monitoring_memory.md
+docs/harness_reproduction_secrets.secret.md
+docs/reflact_conda_env_export.yml
+docs/reflact_overview.html
+docs/render_ablation_paper_tables.py
+docs/让*
+.gradio/
+.venv
+
+# Local experiment launchers — contain machine-specific endpoints/identities, never commit
+tests/run_*.sh
+tests/launch_*.py
+*.launch.log
+uv.lock
+# Superpowers smoke runs: raw agent output + local paths, share sanitized excerpts instead
+smoke_results/

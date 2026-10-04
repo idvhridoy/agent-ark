@@ -1,0 +1,1016 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <zvec/core/interface/constants.h>
+#include <zvec/db/status.h>
+#include <zvec/db/type.h>
+#include <zvec/export.h>
+#include "zvec/core/framework/index_provider.h"
+#include "zvec/core/framework/index_reformer.h"
+
+namespace zvec {
+
+namespace detail {
+struct FtsState;
+struct FtsPipelineHelper;
+}  // namespace detail
+
+/*
+ * Column index params
+ */
+class ZVEC_API IndexParams {
+ public:
+  using Ptr = std::shared_ptr<IndexParams>;
+
+  IndexParams(IndexType type) : type_(type) {}
+
+  virtual ~IndexParams() = default;
+
+  virtual Ptr clone() const = 0;
+
+  virtual bool operator==(const IndexParams &other) const = 0;
+
+  virtual std::string to_string() const = 0;
+
+  virtual bool operator!=(const IndexParams &other) const {
+    return !(*this == other);
+  }
+
+  bool is_vector_index_type() const {
+    return type_ == IndexType::FLAT || type_ == IndexType::HNSW ||
+           type_ == IndexType::HNSW_RABITQ || type_ == IndexType::IVF ||
+           type_ == IndexType::IVF_RABITQ || type_ == IndexType::DISKANN ||
+           type_ == IndexType::VAMANA;
+  }
+
+  IndexType type() const {
+    return type_;
+  }
+
+ protected:
+  IndexType type_;
+};
+
+/*
+ * Scalar: Invert index params
+ */
+class ZVEC_API InvertIndexParams : public IndexParams {
+ public:
+  InvertIndexParams(bool enable_range_optimization = true,
+                    bool enable_extended_wildcard = false)
+      : IndexParams(IndexType::INVERT),
+        enable_range_optimization_(enable_range_optimization),
+        enable_extended_wildcard_(enable_extended_wildcard) {}
+
+  using OPtr = std::shared_ptr<InvertIndexParams>;
+
+  Ptr clone() const override {
+    return std::make_shared<InvertIndexParams>(enable_range_optimization_,
+                                               enable_extended_wildcard_);
+  }
+
+  std::string to_string() const override;
+
+  bool operator==(const IndexParams &other) const override {
+    if (type() != other.type()) {
+      return false;
+    }
+    auto &other_invert = dynamic_cast<const InvertIndexParams &>(other);
+    return enable_range_optimization_ ==
+               other_invert.enable_range_optimization_ &&
+           enable_extended_wildcard_ == other_invert.enable_extended_wildcard_;
+  }
+
+  bool enable_range_optimization() const {
+    return enable_range_optimization_;
+  }
+
+  void set_enable_range_optimization(bool enable_range_optimization) {
+    enable_range_optimization_ = enable_range_optimization;
+  }
+
+  bool enable_extended_wildcard() const {
+    return enable_extended_wildcard_;
+  }
+
+  // Enables suffix and infix search.
+  // Note that prefix search is always enabled regardless of this setting.
+  void set_enable_extended_wildcard(bool enable_extended_wildcard) {
+    enable_extended_wildcard_ = enable_extended_wildcard;
+  }
+
+ private:
+  bool enable_range_optimization_{false};
+  bool enable_extended_wildcard_{false};
+};
+
+/*
+ * Quantizer parameters for vector indexes.
+ * Encapsulates quantization-related settings such as enable_rotate.
+ * Designed for future extensibility (e.g., num_bits, calibration_size).
+ */
+class QuantizerParam {
+ public:
+  QuantizerParam() = default;
+  explicit QuantizerParam(bool enable_rotate) : enable_rotate_(enable_rotate) {}
+
+  bool enable_rotate() const {
+    return enable_rotate_;
+  }
+
+  void set_enable_rotate(bool v) {
+    enable_rotate_ = v;
+  }
+
+  bool operator==(const QuantizerParam &other) const {
+    return enable_rotate_ == other.enable_rotate_;
+  }
+
+  bool operator!=(const QuantizerParam &other) const {
+    return !(*this == other);
+  }
+
+ private:
+  // When enabled, vectors are rotated before INT8 quantization to reduce
+  // quantization error. Only effective with quantize_type=INT8.
+  bool enable_rotate_{false};
+};
+
+/*
+ * Column index params
+ */
+class ZVEC_API VectorIndexParams : public IndexParams {
+ public:
+  VectorIndexParams(IndexType type, MetricType metric_type,
+                    QuantizeType quantize_type = QuantizeType::UNDEFINED,
+                    QuantizerParam quantizer_param = {})
+      : IndexParams(type),
+        metric_type_(metric_type),
+        quantize_type_(quantize_type),
+        quantizer_param_(quantizer_param) {}
+
+  ~VectorIndexParams() override = default;
+
+  std::string vector_index_params_to_string(const std::string &class_name,
+                                            MetricType metric_type,
+                                            QuantizeType quantize_type) const;
+
+  MetricType metric_type() const {
+    return metric_type_;
+  }
+
+  void set_metric_type(MetricType metric_type) {
+    metric_type_ = metric_type;
+  }
+
+  QuantizeType quantize_type() const {
+    return quantize_type_;
+  }
+
+  void set_quantize_type(QuantizeType quantize_type) {
+    quantize_type_ = quantize_type;
+  }
+
+  const QuantizerParam &quantizer_param() const {
+    return quantizer_param_;
+  }
+
+  void set_quantizer_param(const QuantizerParam &quantizer_param) {
+    quantizer_param_ = quantizer_param;
+  }
+
+  // Convenience getter for internal use (engine_helper, segment, etc.)
+  bool enable_rotate() const {
+    return quantizer_param_.enable_rotate();
+  }
+
+  // Controls the auxiliary Flat index used to refine graph candidates.
+  virtual bool use_flat_contiguous_memory() const {
+    return false;
+  }
+
+  // Only graph indexes with an auxiliary reference Flat override this.
+  virtual DataType flat_data_type() const {
+    return DataType::UNDEFINED;
+  }
+
+ protected:
+  MetricType metric_type_;
+  QuantizeType quantize_type_;
+  QuantizerParam quantizer_param_;
+};
+
+/*
+ * Vector: Hnsw index params
+ */
+class ZVEC_API HnswIndexParams : public VectorIndexParams {
+ public:
+  HnswIndexParams(
+      MetricType metric_type, int m = core_interface::kDefaultHnswNeighborCnt,
+      int ef_construction = core_interface::kDefaultHnswEfConstruction,
+      QuantizeType quantize_type = QuantizeType::UNDEFINED,
+      bool use_contiguous_memory = false, QuantizerParam quantizer_param = {},
+      bool use_flat_contiguous_memory = false,
+      DataType flat_data_type = DataType::VECTOR_FP32)
+      : VectorIndexParams(IndexType::HNSW, metric_type, quantize_type,
+                          quantizer_param),
+        m_(m),
+        ef_construction_(ef_construction),
+        use_contiguous_memory_(use_contiguous_memory),
+        use_flat_contiguous_memory_(use_flat_contiguous_memory),
+        flat_data_type_(flat_data_type == DataType::UNDEFINED
+                            ? DataType::VECTOR_FP32
+                            : flat_data_type) {}
+
+  using OPtr = std::shared_ptr<HnswIndexParams>;
+
+ public:
+  Ptr clone() const override {
+    return std::make_shared<HnswIndexParams>(
+        metric_type_, m_, ef_construction_, quantize_type_,
+        use_contiguous_memory_, quantizer_param_, use_flat_contiguous_memory_,
+        flat_data_type_);
+  }
+
+  std::string to_string() const override {
+    auto base_str = vector_index_params_to_string("HnswIndexParams",
+                                                  metric_type_, quantize_type_);
+    std::ostringstream oss;
+    oss << base_str << ",m:" << m_ << ",ef_construction:" << ef_construction_
+        << ",use_contiguous_memory:"
+        << (use_contiguous_memory_ ? "true" : "false")
+        << ",use_flat_contiguous_memory:"
+        << (use_flat_contiguous_memory_ ? "true" : "false")
+        << ",flat_data_type:" << static_cast<uint32_t>(flat_data_type_)
+        << ",enable_rotate:"
+        << (quantizer_param_.enable_rotate() ? "true" : "false") << "}";
+    return oss.str();
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    return type() == other.type() &&
+           metric_type() ==
+               static_cast<const HnswIndexParams &>(other).metric_type() &&
+           m_ == static_cast<const HnswIndexParams &>(other).m_ &&
+           ef_construction_ ==
+               static_cast<const HnswIndexParams &>(other).ef_construction_ &&
+           quantize_type() ==
+               static_cast<const HnswIndexParams &>(other).quantize_type() &&
+           use_contiguous_memory_ == static_cast<const HnswIndexParams &>(other)
+                                         .use_contiguous_memory_ &&
+           use_flat_contiguous_memory_ ==
+               static_cast<const HnswIndexParams &>(other)
+                   .use_flat_contiguous_memory_ &&
+           flat_data_type_ ==
+               static_cast<const HnswIndexParams &>(other).flat_data_type_ &&
+           quantizer_param_ ==
+               static_cast<const HnswIndexParams &>(other).quantizer_param_;
+  }
+
+  void set_m(int m) {
+    m_ = m;
+  }
+  int m() const {
+    return m_;
+  }
+  void set_ef_construction(int ef_construction) {
+    ef_construction_ = ef_construction;
+  }
+  int ef_construction() const {
+    return ef_construction_;
+  }
+
+  void set_use_contiguous_memory(bool use_contiguous_memory) {
+    use_contiguous_memory_ = use_contiguous_memory;
+  }
+  bool use_contiguous_memory() const {
+    return use_contiguous_memory_;
+  }
+
+  void set_use_flat_contiguous_memory(bool value) {
+    use_flat_contiguous_memory_ = value;
+  }
+  bool use_flat_contiguous_memory() const override {
+    return use_flat_contiguous_memory_;
+  }
+
+  void set_flat_data_type(DataType value) {
+    flat_data_type_ =
+        value == DataType::UNDEFINED ? DataType::VECTOR_FP32 : value;
+  }
+  DataType flat_data_type() const override {
+    return flat_data_type_;
+  }
+
+ protected:
+  int m_;
+  int ef_construction_;
+  // When enabled, HNSW streamer allocates a single contiguous memory arena
+  // for all graph nodes, improving cache locality and search throughput at
+  // the cost of peak memory usage. Defaults to false for backward
+  // compatibility.
+  bool use_contiguous_memory_{false};
+  bool use_flat_contiguous_memory_{false};
+  DataType flat_data_type_{DataType::VECTOR_FP32};
+};
+
+class ZVEC_API HnswRabitqIndexParams : public VectorIndexParams {
+ public:
+  HnswRabitqIndexParams(
+      MetricType metric_type,
+      int total_bits = core_interface::kDefaultRabitqTotalBits,
+      int num_clusters = core_interface::kDefaultRabitqNumClusters,
+      int m = core_interface::kDefaultHnswNeighborCnt,
+      int ef_construction = core_interface::kDefaultHnswEfConstruction,
+      int sample_count = 0)
+      : VectorIndexParams(IndexType::HNSW_RABITQ, metric_type,
+                          QuantizeType::RABITQ),
+        total_bits_(total_bits),
+        num_clusters_(num_clusters),
+        sample_count_(sample_count),
+        m_(m),
+        ef_construction_(ef_construction) {}
+
+  using OPtr = std::shared_ptr<HnswRabitqIndexParams>;
+
+  Ptr clone() const override {
+    auto obj = std::make_shared<HnswRabitqIndexParams>(
+        metric_type_, total_bits_, num_clusters_, m_, ef_construction_,
+        sample_count_);
+    obj->set_rabitq_reformer(rabitq_reformer_);
+    obj->set_raw_vector_provider(raw_vector_provider_);
+    return obj;
+  }
+
+  std::string to_string() const override {
+    auto base_str = vector_index_params_to_string("HnswRabitqIndexParams",
+                                                  metric_type_, quantize_type_);
+    std::ostringstream oss;
+    oss << base_str << ",total_bits:" << total_bits_
+        << ",num_clusters:" << num_clusters_
+        << ",sample_count:" << sample_count_ << ",m:" << m_
+        << ",ef_construction:" << ef_construction_ << "}";
+    return oss.str();
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    if (type() != other.type()) {
+      return false;
+    }
+    auto &other_rabitq = dynamic_cast<const HnswRabitqIndexParams &>(other);
+    return metric_type() == other_rabitq.metric_type() &&
+           quantize_type_ == other_rabitq.quantize_type_ &&
+           total_bits_ == other_rabitq.total_bits_ &&
+           num_clusters_ == other_rabitq.num_clusters_ &&
+           sample_count_ == other_rabitq.sample_count_ &&
+           m_ == other_rabitq.m_ &&
+           ef_construction_ == other_rabitq.ef_construction_;
+  }
+
+  void set_m(int m) {
+    m_ = m;
+  }
+  int m() const {
+    return m_;
+  }
+  void set_ef_construction(int ef_construction) {
+    ef_construction_ = ef_construction;
+  }
+  int ef_construction() const {
+    return ef_construction_;
+  }
+
+  void set_raw_vector_provider(
+      core::IndexProvider::Pointer raw_vector_provider) {
+    raw_vector_provider_ = std::move(raw_vector_provider);
+  }
+
+  void set_rabitq_reformer(core::IndexReformer::Pointer rabitq_reformer) {
+    rabitq_reformer_ = std::move(rabitq_reformer);
+  }
+  core::IndexReformer::Pointer rabitq_reformer() const {
+    return rabitq_reformer_;
+  }
+  core::IndexProvider::Pointer raw_vector_provider() const {
+    return raw_vector_provider_;
+  }
+
+  void set_total_bits(int total_bits) {
+    total_bits_ = total_bits;
+  }
+  int total_bits() const {
+    return total_bits_;
+  }
+
+  void set_num_clusters(int num_clusters) {
+    num_clusters_ = num_clusters;
+  }
+  int num_clusters() const {
+    return num_clusters_;
+  }
+
+  void set_sample_count(int sample_count) {
+    sample_count_ = sample_count;
+  }
+  int sample_count() const {
+    return sample_count_;
+  }
+
+ private:
+  int total_bits_;
+  int num_clusters_;
+  int sample_count_;
+  int m_;
+  int ef_construction_;
+  core::IndexProvider::Pointer raw_vector_provider_;
+  core::IndexReformer::Pointer rabitq_reformer_;
+};
+
+class ZVEC_API IvfRabitqIndexParams : public VectorIndexParams {
+ public:
+  IvfRabitqIndexParams(MetricType metric_type,
+                       int nlist = core_interface::kDefaultIvfRabitqNlist,
+                       int total_bits = core_interface::kDefaultRabitqTotalBits,
+                       int sample_count = 0)
+      : VectorIndexParams(IndexType::IVF_RABITQ, metric_type,
+                          QuantizeType::RABITQ),
+        nlist_(nlist),
+        total_bits_(total_bits),
+        sample_count_(sample_count) {}
+
+  using OPtr = std::shared_ptr<IvfRabitqIndexParams>;
+
+  Ptr clone() const override {
+    return std::make_shared<IvfRabitqIndexParams>(metric_type_, nlist_,
+                                                  total_bits_, sample_count_);
+  }
+
+  std::string to_string() const override {
+    auto base_str = vector_index_params_to_string("IvfRabitqIndexParams",
+                                                  metric_type_, quantize_type_);
+    std::ostringstream oss;
+    oss << base_str << ",nlist:" << nlist_ << ",total_bits:" << total_bits_
+        << ",sample_count:" << sample_count_ << "}";
+    return oss.str();
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    if (type() != other.type()) {
+      return false;
+    }
+    auto &rhs = dynamic_cast<const IvfRabitqIndexParams &>(other);
+    return metric_type() == rhs.metric_type() &&
+           quantize_type_ == rhs.quantize_type_ && nlist_ == rhs.nlist_ &&
+           total_bits_ == rhs.total_bits_ && sample_count_ == rhs.sample_count_;
+  }
+
+  void set_nlist(int nlist) {
+    nlist_ = nlist;
+  }
+  int nlist() const {
+    return nlist_;
+  }
+
+  void set_total_bits(int total_bits) {
+    total_bits_ = total_bits;
+  }
+  int total_bits() const {
+    return total_bits_;
+  }
+
+  void set_sample_count(int sample_count) {
+    sample_count_ = sample_count;
+  }
+  int sample_count() const {
+    return sample_count_;
+  }
+
+ private:
+  int nlist_;
+  int total_bits_;
+  int sample_count_;
+};
+
+class ZVEC_API FlatIndexParams : public VectorIndexParams {
+ public:
+  FlatIndexParams(MetricType metric_type,
+                  QuantizeType quantize_type = QuantizeType::UNDEFINED,
+                  QuantizerParam quantizer_param = {},
+                  bool use_contiguous_memory = false,
+                  DataType storage_data_type = DataType::UNDEFINED)
+      : VectorIndexParams(IndexType::FLAT, metric_type, quantize_type,
+                          quantizer_param),
+        use_contiguous_memory_(use_contiguous_memory),
+        storage_data_type_(storage_data_type) {}
+
+  using OPtr = std::shared_ptr<FlatIndexParams>;
+
+ public:
+  Ptr clone() const override {
+    return std::make_shared<FlatIndexParams>(
+        metric_type_, quantize_type_, quantizer_param_, use_contiguous_memory_,
+        storage_data_type_);
+  }
+
+  std::string to_string() const override {
+    auto base_str = vector_index_params_to_string("FlatIndexParams",
+                                                  metric_type_, quantize_type_);
+    std::ostringstream oss;
+    oss << base_str << ",use_contiguous_memory:"
+        << (use_contiguous_memory_ ? "true" : "false")
+        << ",storage_data_type:" << static_cast<uint32_t>(storage_data_type_)
+        << ",enable_rotate:"
+        << (quantizer_param_.enable_rotate() ? "true" : "false") << "}";
+    return oss.str();
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    return type() == other.type() &&
+           metric_type() ==
+               static_cast<const VectorIndexParams &>(other).metric_type() &&
+           quantize_type() ==
+               static_cast<const VectorIndexParams &>(other).quantize_type() &&
+           quantizer_param() == static_cast<const VectorIndexParams &>(other)
+                                    .quantizer_param() &&
+           use_contiguous_memory_ == static_cast<const FlatIndexParams &>(other)
+                                         .use_contiguous_memory_ &&
+           storage_data_type_ ==
+               static_cast<const FlatIndexParams &>(other).storage_data_type_;
+  }
+
+  bool use_contiguous_memory() const {
+    return use_contiguous_memory_;
+  }
+
+  DataType storage_data_type() const {
+    return storage_data_type_;
+  }
+
+ private:
+  bool use_contiguous_memory_{false};
+  DataType storage_data_type_{DataType::UNDEFINED};
+};
+
+// define default index params
+const FlatIndexParams DefaultVectorIndexParams(MetricType::IP);
+
+inline FlatIndexParams MakeDefaultVectorIndexParams(
+    MetricType metric_type, bool use_contiguous_memory = false,
+    DataType storage_data_type = DataType::UNDEFINED) {
+  return FlatIndexParams(metric_type, QuantizeType::UNDEFINED, {},
+                         use_contiguous_memory, storage_data_type);
+}
+
+inline FlatIndexParams MakeDefaultQuantVectorIndexParams(
+    MetricType metric_type, QuantizeType quantize_type,
+    QuantizerParam quantizer_param = {}) {
+  return FlatIndexParams(metric_type, quantize_type, quantizer_param);
+}
+
+class ZVEC_API IVFIndexParams : public VectorIndexParams {
+ public:
+  IVFIndexParams(MetricType metric_type, int n_list = 1024, int n_iters = 10,
+                 bool use_soar = false,
+                 QuantizeType quantize_type = QuantizeType::UNDEFINED,
+                 QuantizerParam quantizer_param = {})
+      : VectorIndexParams(IndexType::IVF, metric_type, quantize_type,
+                          quantizer_param),
+        n_list_(n_list),
+        n_iters_(n_iters),
+        use_soar_(use_soar) {}
+
+  using OPtr = std::shared_ptr<IVFIndexParams>;
+
+ public:
+  Ptr clone() const override {
+    return std::make_shared<IVFIndexParams>(metric_type_, n_list_, n_iters_,
+                                            use_soar_, quantize_type_,
+                                            quantizer_param_);
+  }
+
+  std::string to_string() const override {
+    auto base_str = vector_index_params_to_string("IVFIndexParams",
+                                                  metric_type_, quantize_type_);
+    std::ostringstream oss;
+    oss << base_str << ",n_list:" << n_list_ << ",n_iters:" << n_iters_
+        << ",enable_rotate:"
+        << (quantizer_param_.enable_rotate() ? "true" : "false") << "}";
+    return oss.str();
+  }
+
+  int n_list() const {
+    return n_list_;
+  }
+
+  void set_n_list(int n_list) {
+    n_list_ = n_list;
+  }
+
+  int n_iters() const {
+    return n_iters_;
+  }
+
+  void set_n_iters(int n_iters) {
+    n_iters_ = n_iters;
+  }
+
+  bool use_soar() const {
+    return use_soar_;
+  }
+
+  void set_use_soar(bool use_soar) {
+    use_soar_ = use_soar;
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    return type() == other.type() &&
+           metric_type() ==
+               static_cast<const IVFIndexParams &>(other).metric_type() &&
+           n_list_ == static_cast<const IVFIndexParams &>(other).n_list_ &&
+           n_iters_ == static_cast<const IVFIndexParams &>(other).n_iters_ &&
+           use_soar_ == static_cast<const IVFIndexParams &>(other).use_soar_ &&
+           quantize_type() ==
+               static_cast<const IVFIndexParams &>(other).quantize_type() &&
+           quantizer_param_ ==
+               static_cast<const IVFIndexParams &>(other).quantizer_param_;
+  }
+
+ private:
+  int n_list_;
+  int n_iters_;
+  bool use_soar_;
+};
+
+class ZVEC_API DiskAnnIndexParams : public VectorIndexParams {
+ public:
+  DiskAnnIndexParams(MetricType metric_type, int max_degree = 100,
+                     int list_size = 50, int pq_chunk_num = 0,
+                     QuantizeType quantize_type = QuantizeType::UNDEFINED,
+                     QuantizerParam quantizer_param = {})
+      : VectorIndexParams(IndexType::DISKANN, metric_type, quantize_type,
+                          quantizer_param),
+        max_degree_{max_degree},
+        list_size_{list_size},
+        pq_chunk_num_{pq_chunk_num} {}
+
+  using OPtr = std::shared_ptr<DiskAnnIndexParams>;
+
+ public:
+  Ptr clone() const override {
+    return std::make_shared<DiskAnnIndexParams>(
+        metric_type_, max_degree_, list_size_, pq_chunk_num_, quantize_type_,
+        quantizer_param_);
+  }
+
+  std::string to_string() const override {
+    auto base_str = vector_index_params_to_string("DiskAnnIndexParams",
+                                                  metric_type_, quantize_type_);
+    std::ostringstream oss;
+    oss << base_str << ",max_degree:" << max_degree_
+        << ",list_size:" << list_size_ << ", pq_chunk_num:" << pq_chunk_num_
+        << ",enable_rotate:"
+        << (quantizer_param_.enable_rotate() ? "true" : "false") << "}";
+    return oss.str();
+  }
+
+  int max_degree() const {
+    return max_degree_;
+  }
+
+  void set_max_degree(int max_degree) {
+    max_degree_ = max_degree;
+  }
+
+  int list_size() const {
+    return list_size_;
+  }
+
+  void set_list_size(int list_size) {
+    list_size_ = list_size;
+  }
+
+  int pq_chunk_num() const {
+    return pq_chunk_num_;
+  }
+
+  void set_pq_chunk_num(int pq_chunk_num) {
+    pq_chunk_num_ = pq_chunk_num;
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    return type() == other.type() &&
+           metric_type() ==
+               static_cast<const DiskAnnIndexParams &>(other).metric_type() &&
+           max_degree_ ==
+               static_cast<const DiskAnnIndexParams &>(other).max_degree_ &&
+           list_size_ ==
+               static_cast<const DiskAnnIndexParams &>(other).list_size_ &&
+           pq_chunk_num_ ==
+               static_cast<const DiskAnnIndexParams &>(other).pq_chunk_num_ &&
+           quantize_type() ==
+               static_cast<const DiskAnnIndexParams &>(other).quantize_type() &&
+           quantizer_param_ ==
+               static_cast<const DiskAnnIndexParams &>(other).quantizer_param_;
+  }
+
+ private:
+  int max_degree_;
+  int list_size_;
+  int pq_chunk_num_;
+};
+
+/*
+ * Vector: Vamana index params
+ */
+class ZVEC_API VamanaIndexParams : public VectorIndexParams {
+ public:
+  VamanaIndexParams(
+      MetricType metric_type,
+      int max_degree = core_interface::kDefaultVamanaMaxDegree,
+      int search_list_size = core_interface::kDefaultVamanaSearchListSize,
+      float alpha = core_interface::kDefaultVamanaAlpha,
+      bool saturate_graph = core_interface::kDefaultVamanaSaturateGraph,
+      bool use_contiguous_memory = false, bool use_id_map = false,
+      QuantizeType quantize_type = QuantizeType::UNDEFINED,
+      QuantizerParam quantizer_param = {}, bool two_pass_build = false,
+      bool use_flat_contiguous_memory = false,
+      DataType flat_data_type = DataType::VECTOR_FP32)
+      : VectorIndexParams(IndexType::VAMANA, metric_type, quantize_type,
+                          quantizer_param),
+        max_degree_(max_degree),
+        search_list_size_(search_list_size),
+        alpha_(alpha),
+        saturate_graph_(saturate_graph),
+        use_contiguous_memory_(use_contiguous_memory),
+        use_id_map_(use_id_map),
+        two_pass_build_(two_pass_build),
+        use_flat_contiguous_memory_(use_flat_contiguous_memory),
+        flat_data_type_(flat_data_type == DataType::UNDEFINED
+                            ? DataType::VECTOR_FP32
+                            : flat_data_type) {}
+
+  // Convenience overload matching the public feature ordering while keeping
+  // the pre-existing positional constructor source-compatible.
+  VamanaIndexParams(MetricType metric_type, int max_degree,
+                    int search_list_size, float alpha, bool saturate_graph,
+                    bool use_contiguous_memory, bool use_id_map,
+                    bool two_pass_build, QuantizeType quantize_type,
+                    QuantizerParam quantizer_param = {})
+      : VamanaIndexParams(metric_type, max_degree, search_list_size, alpha,
+                          saturate_graph, use_contiguous_memory, use_id_map,
+                          quantize_type, quantizer_param, two_pass_build) {}
+
+  using OPtr = std::shared_ptr<VamanaIndexParams>;
+
+ public:
+  Ptr clone() const override {
+    return std::make_shared<VamanaIndexParams>(
+        metric_type_, max_degree_, search_list_size_, alpha_, saturate_graph_,
+        use_contiguous_memory_, use_id_map_, quantize_type_, quantizer_param_,
+        two_pass_build_, use_flat_contiguous_memory_, flat_data_type_);
+  }
+
+  std::string to_string() const override {
+    auto base_str = vector_index_params_to_string("VamanaIndexParams",
+                                                  metric_type_, quantize_type_);
+    std::ostringstream oss;
+    oss << base_str << ",max_degree:" << max_degree_
+        << ",search_list_size:" << search_list_size_ << ",alpha:" << alpha_
+        << ",saturate_graph:" << (saturate_graph_ ? "true" : "false")
+        << ",use_contiguous_memory:"
+        << (use_contiguous_memory_ ? "true" : "false")
+        << ",use_id_map:" << (use_id_map_ ? "true" : "false")
+        << ",two_pass_build:" << (two_pass_build_ ? "true" : "false")
+        << ",use_flat_contiguous_memory:"
+        << (use_flat_contiguous_memory_ ? "true" : "false")
+        << ",flat_data_type:" << static_cast<uint32_t>(flat_data_type_)
+        << ",enable_rotate:"
+        << (quantizer_param_.enable_rotate() ? "true" : "false") << "}";
+    return oss.str();
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    if (type() != other.type()) {
+      return false;
+    }
+    auto &rhs = static_cast<const VamanaIndexParams &>(other);
+    return metric_type() == rhs.metric_type() &&
+           quantize_type() == rhs.quantize_type() &&
+           max_degree_ == rhs.max_degree_ &&
+           search_list_size_ == rhs.search_list_size_ && alpha_ == rhs.alpha_ &&
+           saturate_graph_ == rhs.saturate_graph_ &&
+           use_contiguous_memory_ == rhs.use_contiguous_memory_ &&
+           use_id_map_ == rhs.use_id_map_ &&
+           two_pass_build_ == rhs.two_pass_build_ &&
+           use_flat_contiguous_memory_ == rhs.use_flat_contiguous_memory_ &&
+           flat_data_type_ == rhs.flat_data_type_ &&
+           quantizer_param_ == rhs.quantizer_param_;
+  }
+
+  int max_degree() const {
+    return max_degree_;
+  }
+
+  void set_max_degree(int max_degree) {
+    max_degree_ = max_degree;
+  }
+
+  int search_list_size() const {
+    return search_list_size_;
+  }
+  void set_search_list_size(int search_list_size) {
+    search_list_size_ = search_list_size;
+  }
+
+  float alpha() const {
+    return alpha_;
+  }
+  void set_alpha(float alpha) {
+    alpha_ = alpha;
+  }
+
+  bool saturate_graph() const {
+    return saturate_graph_;
+  }
+  void set_saturate_graph(bool saturate_graph) {
+    saturate_graph_ = saturate_graph;
+  }
+
+  bool use_contiguous_memory() const {
+    return use_contiguous_memory_;
+  }
+  void set_use_contiguous_memory(bool use_contiguous_memory) {
+    use_contiguous_memory_ = use_contiguous_memory;
+  }
+
+  bool use_id_map() const {
+    return use_id_map_;
+  }
+  void set_use_id_map(bool use_id_map) {
+    use_id_map_ = use_id_map;
+  }
+
+  bool two_pass_build() const {
+    return two_pass_build_;
+  }
+  void set_two_pass_build(bool two_pass_build) {
+    two_pass_build_ = two_pass_build;
+  }
+
+  bool use_flat_contiguous_memory() const override {
+    return use_flat_contiguous_memory_;
+  }
+  void set_use_flat_contiguous_memory(bool value) {
+    use_flat_contiguous_memory_ = value;
+  }
+
+  DataType flat_data_type() const override {
+    return flat_data_type_;
+  }
+  void set_flat_data_type(DataType value) {
+    flat_data_type_ =
+        value == DataType::UNDEFINED ? DataType::VECTOR_FP32 : value;
+  }
+
+ private:
+  int max_degree_;
+  int search_list_size_;
+  float alpha_;
+  bool saturate_graph_;
+  // When enabled, Vamana streamer allocates a single contiguous memory arena
+  // for all graph nodes, improving cache locality and search throughput at
+  // the cost of peak memory usage.
+  bool use_contiguous_memory_;
+  bool use_id_map_;
+  bool two_pass_build_;
+  bool use_flat_contiguous_memory_{false};
+  DataType flat_data_type_{DataType::VECTOR_FP32};
+};
+
+/*
+ * FTS (Full-Text Search) index params
+ * Supported tokenizers: "standard", "ngram", "jieba", "whitespace".
+ * Supported filters: "lowercase", "ascii_folding", "stemmer".
+ *
+ * extra_params must be either empty or a JSON object string. Supported keys are
+ * grouped by tokenizer/filter:
+ *   Tokenizers:
+ *     standard:
+ *       - "max_token_length" (positive integer).
+ *     ngram:
+ *       - "ngram_min" (positive integer, default 2).
+ *       - "ngram_max" (positive integer, default 2).
+ *         ngram_max - ngram_min must not exceed 1.
+ *       - "token_chars" (array of "letter", "digit", "whitespace",
+ *         "punctuation", "symbol"; default [] keeps all valid UTF-8
+ *         characters). custom_token_chars is not supported.
+ *     jieba:
+ *       - "jieba_dict_dir" (directory containing jieba.dict.utf8 and
+ *         hmm_model.utf8).
+ *       - "user_dict_path" (user dictionary path).
+ *       - "cut_mode" ("search", "mix", "full", or "hmm"; default "search").
+ *     whitespace:
+ *       - no extra_params.
+ *   Filters:
+ *     lowercase:
+ *       - no extra_params.
+ *     ascii_folding:
+ *       - no extra_params.
+ *     stemmer:
+ *       - "stemmer_lang" (Snowball language/algorithm; default "english"),
+ *         for example {"stemmer_lang":"porter"} for ES behaviour.
+ *
+ * Not copyable.  Use shared_ptr<FtsIndexParams> for shared ownership.
+ */
+class ZVEC_API FtsIndexParams : public IndexParams {
+ public:
+  FtsIndexParams(std::string tokenizer_name = "standard",
+                 std::vector<std::string> filters = {"lowercase"},
+                 std::string extra_params = "");
+
+  // Not copyable.
+  FtsIndexParams(const FtsIndexParams &) = delete;
+  FtsIndexParams &operator=(const FtsIndexParams &) = delete;
+
+  // Movable.
+  FtsIndexParams(FtsIndexParams &&other) noexcept;
+  FtsIndexParams &operator=(FtsIndexParams &&) = delete;
+
+  ~FtsIndexParams() override;
+
+  Ptr clone() const override {
+    return std::make_shared<FtsIndexParams>(tokenizer_name_, filters_,
+                                            extra_params_);
+  }
+
+  std::string to_string() const override {
+    std::ostringstream oss;
+    oss << "{FtsIndexParams,tokenizer_name:" << tokenizer_name_ << ",filters:[";
+    for (size_t i = 0; i < filters_.size(); ++i) {
+      if (i > 0) {
+        oss << ",";
+      }
+      oss << filters_[i];
+    }
+    oss << "],extra_params:" << extra_params_ << "}";
+    return oss.str();
+  }
+
+  bool operator==(const IndexParams &other) const override {
+    if (type() != other.type()) {
+      return false;
+    }
+    auto &other_fts = static_cast<const FtsIndexParams &>(other);
+    return tokenizer_name_ == other_fts.tokenizer_name_ &&
+           filters_ == other_fts.filters_ &&
+           extra_params_ == other_fts.extra_params_;
+  }
+
+  const std::string &tokenizer_name() const {
+    return tokenizer_name_;
+  }
+  void set_tokenizer_name(std::string tokenizer_name) {
+    tokenizer_name_ = std::move(tokenizer_name);
+  }
+
+  const std::vector<std::string> &filters() const {
+    return filters_;
+  }
+  void set_filters(std::vector<std::string> filters) {
+    filters_ = std::move(filters);
+  }
+
+  const std::string &extra_params() const {
+    return extra_params_;
+  }
+  void set_extra_params(std::string extra_params) {
+    extra_params_ = std::move(extra_params);
+  }
+
+ private:
+  std::string tokenizer_name_;
+  std::vector<std::string> filters_;
+  std::string extra_params_;
+
+  std::unique_ptr<detail::FtsState> state_;
+
+  friend struct detail::FtsPipelineHelper;
+};
+
+}  // namespace zvec

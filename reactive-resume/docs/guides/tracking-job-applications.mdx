@@ -1,0 +1,161 @@
+---
+title: "Tracking job applications"
+description: "Use the Application Tracker to record jobs, link the resume you sent, manage follow-ups, and move applications through your hiring pipeline."
+---
+
+The **Application Tracker** keeps your job search tied to the resumes you build in Reactive Resume. Each application can store the company, role, stage, job posting, resume, cover letter, contacts, notes, and follow-up details.
+
+## Open the Application Tracker
+
+<Steps>
+  <Step title="Sign in">
+    Open Reactive Resume and sign in to your account.
+  </Step>
+
+  <Step title="Go to Applications">
+    In the dashboard sidebar, click **Applications**.
+  </Step>
+</Steps>
+
+<Frame caption="Application Tracker board view">
+  <img
+    src="/images/guides/tracking-job-applications/screenshot-1.webp"
+    alt="Application Tracker showing search, tag filters, board columns, and application cards grouped by stage"
+  />
+</Frame>
+
+<Tip>
+  Press `Cmd/Ctrl+K` from anywhere in the app to open the command palette. Select **Applications** to search your pipeline by company or role, or run **New Application** to jump straight to the add form.
+</Tip>
+
+## Add an application
+
+<Steps>
+  <Step title="Click Add application">
+    If this is your first application, use the button in the empty state. Otherwise, use **Add application** in the page header.
+  </Step>
+
+  <Step title="Fill in the role details">
+    Add the **Company** and **Role / title**. These two fields are required. You can also add the location, salary range,
+    source, tags, notes, and follow-up details.
+  </Step>
+
+  <Step title="Choose a stage">
+    Pick the current stage of the opportunity.
+  </Step>
+
+  <Step title="Link or upload the resume you sent">
+    Pick a Reactive Resume in the **Resume** field to keep a live link to it. You can also upload the exact resume PDF you
+    sent.
+  </Step>
+
+  <Step title="Attach a cover letter">
+    If you sent a cover letter, attach the PDF in the **Cover letter** field.
+  </Step>
+
+  <Step title="Save">
+    Click **Add to pipeline**.
+  </Step>
+</Steps>
+
+<Frame caption="Add application form">
+  <img
+    src="/images/guides/tracking-job-applications/screenshot-2.webp"
+    alt="Add application form with job posting auto-fill, company, role, stage, resume, cover letter, tags, and follow-up fields"
+  />
+</Frame>
+
+<Tip>
+  Linking a Reactive Resume enables AI match scoring and resume tailoring for that application.
+</Tip>
+
+## Use AI to fill a job posting
+
+If you have an AI provider configured, paste a job posting URL at the top of the add form and click **Auto-fill**. Reactive Resume reads the posting and fills in what it can, such as company, role, location, salary, and job description.
+
+If auto-fill fails or the posting is private, paste the job description manually.
+
+For AI setup, see [Using artificial intelligence](/guides/using-ai).
+
+## Understand application stages
+
+Applications move through a fixed set of stages:
+
+| Stage | Use it when |
+| --- | --- |
+| **Saved** | You found a role but have not applied yet. |
+| **Applied** | You submitted the application. |
+| **Screening** | A recruiter, hiring manager, or automated process is reviewing you. |
+| **Interview** | You are in an interview process. |
+| **Offer** | You received an offer. |
+| **Rejected** | The company declined or the opportunity ended. |
+
+You can move applications by dragging cards on the board, using the action menu, using bulk actions in the table, or opening an application and clicking **Move to**.
+
+## Choose a view
+
+The Application Tracker has three views:
+
+| View | Best for |
+| --- | --- |
+| **Board** | Moving applications through stages visually. |
+| **Table** | Reviewing many applications, selecting rows, and making bulk updates. |
+| **Insights** | Understanding your pipeline, response rate, interviews, offers, sources, and application velocity. |
+
+Use search, tag filters, sorting, and the archived toggle to narrow the list.
+
+<Frame caption="Application Tracker insights view">
+  <img
+    src="/images/guides/tracking-job-applications/screenshot-4.webp"
+    alt="Application Tracker insights view showing pipeline metrics, a funnel chart, applications over time, and source counts"
+  />
+</Frame>
+
+## Update an application
+
+Open an application from the board or table to view its detail panel. From there you can:
+
+- edit the application details;
+- move it to the next stage;
+- open the original job posting;
+- attach or replace resume and cover letter PDFs;
+- add contacts;
+- add follow-up information;
+- add notes to the timeline;
+- archive, unarchive, mark rejected, or delete the application.
+
+Stage changes and notes appear in the timeline automatically.
+
+<Frame caption="Application detail panel">
+  <img
+    src="/images/guides/tracking-job-applications/screenshot-3.webp"
+    alt="Application detail panel showing stage progress, linked resume, Application Copilot, contacts, and timeline activity"
+  />
+</Frame>
+
+## Use Application Copilot
+
+Application Copilot appears in the application detail panel. It can:
+
+- score how well the linked resume matches the job description;
+- create a tailored copy of the linked resume;
+- draft a cover letter;
+- draft a follow-up message.
+
+Match scoring and resume tailoring require both a linked Reactive Resume and a job description. Drafting also works from the application and resume context available in the tracker.
+
+<Warning>
+  Review AI-generated content before sending it. You are responsible for the final resume, cover letter, and follow-up message.
+</Warning>
+
+## Manage applications from an MCP client
+
+You can also manage the Application Tracker from an MCP-compatible AI client. This lets an agent list applications, create new records, move stages, add notes, attach the PDFs you sent, and run Application Copilot without opening the web app.
+
+For setup and prompt examples, see [Managing applications with MCP](/guides/managing-applications-with-mcp).
+
+## Archive or delete applications
+
+Archive an application to hide it from the active board without losing its history. Use the **Archived** toggle to see archived applications and unarchive them later.
+
+Delete an application only when you no longer need its record. Deleting an application removes its timeline and cannot be undone.

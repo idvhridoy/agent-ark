@@ -1,0 +1,80 @@
+---
+title: "Accessing the previous version"
+description: "Access the previous version (v4) of Reactive Resume to retrieve old resumes, and export them for import into the latest version."
+---
+
+## Check whether the previous version is available
+
+If you've used Reactive Resume for a while, you may have resumes saved in version 4 (v4). Access depends on whether
+your self-hosted instance or the hosted previous-version service is currently available.
+
+<Info>
+  When the hosted previous version is available, its address is
+  [https://v4.rxresu.me](https://v4.rxresu.me). Availability is not guaranteed.
+</Info>
+
+Self-hosted operators control their own v4 instance and backups. The [v4 to v5 migration
+guide](/self-hosting/migration) applies only to infrastructure they are authorized to operate. It does not authorize
+access to hosted databases or backups.
+
+## When v4 is accessible
+
+Open, export, and securely back up each resume you need. Import the export into v5 as a new resume; keep the v5 version
+until you have compared both copies.
+
+## Accessing your v4 resumes
+
+<Steps>
+  <Step title="Visit the v4 application">
+    Go to [https://v4.rxresu.me](https://v4.rxresu.me) in your browser.
+  </Step>
+
+  <Step title="Sign in with your existing credentials">
+    Use the same account credentials you used when you originally created your resumes in v4.
+
+    <Tip>
+      If you used social sign-in (Google, GitHub, etc.) in v4, use the same method to sign in.
+    </Tip>
+
+  </Step>
+
+  <Step title="Access your resumes">
+    If the dashboard contains your resumes, export each one as JSON before making more changes.
+  </Step>
+</Steps>
+
+## Migrating to the new version
+
+If you'd like to move your resumes to the latest version of Reactive Resume, you can export them from v4 and import them into the new version:
+
+1. In v4, open the resume you want to migrate
+2. Export it as a JSON file
+3. In the new version at [https://rxresu.me](https://rxresu.me), create a new account or sign in
+4. Use the import feature to upload your JSON file (select the "Reactive Resume v4 (JSON)" option)
+
+<Info>
+  Import creates a separate resume. It should not be used to replace a newer v5 copy until you have compared both
+  versions.
+</Info>
+
+## When hosted v4 or a resume is unavailable
+
+Only an authorized hosted service operator can determine whether a source snapshot exists. Open a GitHub issue without
+including resume contents, account credentials, reset links, or other private data. A useful request identifies the
+approximate time of the missing edits, the sign-in method, and whether the resume is missing or merely not visible.
+
+Recovery is handled per owner. Before accessing content, the operator must record a private case with source snapshot
+time, owner verification, source-to-target mapping, target resume ID, content hashes, and proposed outcome. A matching
+email address, username, or resume title alone is not proof of ownership.
+
+Default recovery result is a private JSON export delivered through an approved channel to a verified recipient. Old-only
+or divergent content must remain a separate copy; it must not overwrite a current v5 resume. If no source snapshot is
+available, the factual outcome is that the records cannot be recovered from the service. Local tooling cannot recreate
+missing source data.
+
+An empty workspace with successful create responses or name conflicts can instead be a listing or account-mapping
+problem. That requires a separate session, create, list, and reload diagnosis; a v4 recovery export does not resolve it.
+
+## Questions or issues?
+
+If you run into problems accessing v4, or have questions about migrating your resumes, open an issue on [GitHub](https://github.com/reactive-resume/reactive-resume/issues).

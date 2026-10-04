@@ -1,0 +1,94 @@
+---
+title: "Using artificial intelligence"
+description: "Configure an OpenAI, Anthropic, Gemini, OpenRouter, or Ollama provider to power AI edits, resume reviews, agent drafts, and PDF imports."
+---
+
+Reactive Resume uses AI providers for features such as AI-assisted resume changes, the optional AI review in the ATS checker, AI agent drafts, and PDF or Word imports.
+
+## Open AI provider settings
+
+<Steps>
+  <Step title="Sign in to the dashboard">
+    Head over to [https://rxresu.me](https://rxresu.me) and sign in with your account credentials.
+  </Step>
+
+  <Step title="Navigate to Integrations settings">
+    In the dashboard sidebar, under **Settings**, click **Integrations**.
+
+    <Frame caption="AI provider settings in Integrations">
+      <img
+        src="/images/guides/using-ai/screenshot-1.webp"
+        alt="Integrations settings showing AI provider configuration"
+      />
+    </Frame>
+  </Step>
+</Steps>
+
+## Add a provider
+
+In the **AI Providers** section, fill out the **Add Provider** form. The form is staged: pick a **Provider** and paste an **API Key** first. **Model** and **Base URL** sit behind the **Advanced settings** toggle, and you only need them for gateways, proxies, local providers, or OpenAI-compatible endpoints.
+
+| Field | Description |
+| --- | --- |
+| **Label** | A name that helps you recognize the provider, such as `Work OpenAI` or `Personal OpenRouter`. |
+| **Provider** | The provider type, such as OpenAI, Anthropic Claude, Google Gemini, Vercel AI Gateway, OpenRouter, Ollama, or OpenAI-compatible. |
+| **API Key** | The key Reactive Resume should use when sending AI requests to that provider. |
+| **Model** *(advanced)* | The exact model name expected by that provider. |
+| **Base URL** *(advanced)* | The provider endpoint. Leave the default unless you use a gateway, proxy, local provider, or OpenAI-compatible endpoint. |
+
+Click **Save Provider** when the form is complete. The connection is tested as part of the save, so the success or failure status appears right away.
+
+<Frame caption="Saved AI provider in Integrations">
+  <img
+    src="/images/guides/using-ai/screenshot-2.webp"
+    alt="Integrations settings showing a saved and tested AI provider"
+  />
+</Frame>
+
+<Warning>
+  Treat API keys like passwords. Anyone with a key can use the connected provider account and may incur costs.
+</Warning>
+
+## Test and enable a provider
+
+After saving a provider, test it before using it.
+
+<Steps>
+  <Step title="Click Test">
+    Reactive Resume sends a small request to verify the provider, model, base URL, and key.
+  </Step>
+
+  <Step title="Review the status">
+    A successful provider is marked **Tested**. A failed provider is marked **Failed** and may show an error message.
+  </Step>
+
+  <Step title="Enable the provider">
+    Turn on **Use** for the tested provider you want Reactive Resume to use.
+  </Step>
+</Steps>
+
+<Info>
+  Only tested providers can be used for AI-assisted features.
+</Info>
+
+## How credentials are stored
+
+AI provider credentials are encrypted on the server and are never shown again after saving. The settings page only shows a preview of the saved key.
+
+If provider management is unavailable, your self-hosted deployment may be missing required server configuration.
+
+<Warning>
+  AI provider management requires the server-side services used to encrypt credentials. If the page says provider
+  management is unavailable, check your deployment configuration before using AI features.
+</Warning>
+
+## Where AI is used
+
+After a provider is tested and enabled, you can use AI in:
+
+- the optional **AI review** in the ATS Check section of the builder's right sidebar;
+- **AI-assisted resume changes** from the builder;
+- **Agent** workflows that create isolated AI drafts;
+- **PDF and Microsoft Word imports** from the dashboard import dialog.
+
+For the builder workflow, see [Using AI in the builder](/guides/using-ai-in-the-builder). For the dedicated agent workspace, see [Using the AI Agent workspace](/guides/using-ai-agent) and [AI Agent tools](/guides/ai-agent-tools). For AI-assisted imports, see [Importing resumes](/guides/importing-resumes).

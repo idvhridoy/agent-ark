@@ -1,0 +1,831 @@
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import type {
+  AnyNode,
+  AnyNodeId,
+  FloorplanAffordanceSession,
+  FloorplanGeometry,
+  FloorplanPalette,
+  LiveNodeOverrides,
+} from '@pascal-app/core'
+import { type AnyNodeDefinition, emitter, nodeRegistry, registerNode } from '@pascal-app/core'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { z } from 'zod'
+import {
+  FLOORPLAN_NODE_EXTENSION_KEY,
+  floorplanGeometryMetadata,
+} from '../../../lib/floorplan/floorplan-extension'
+import {
+  buildFloorplanEntryGeometry,
+  cancelFloorplanAffordanceDrag,
+  collectDirectFloorplanScopeNodes,
+  collectFloorplanDependencyNodes,
+  collectFloorplanLinkedLevelNodes,
+  computeAffectedSiblingIds,
+  floorplanAffordanceReshapeScope,
+  floorplanEntryYieldsToTool,
+  floorplanHandleDoubleClickAffordance,
+  InteractiveGeometry,
+  isFloorplanHierarchyVisible,
+  isFloorplanOpeningPlacementState,
+  resolveFloorplanHandleUnitsPerPixel,
+  siteToFloorplanTransform,
+  splitFloorplanOverlay,
+  subscribeFloorplanAffordanceToolCancel,
+} from './floorplan-registry-layer'
+
+describe('site-scoped floorplan discovery', () => {
+  let restoreRegistry: () => void
+
+  beforeEach(() => {
+    restoreRegistry = nodeRegistry._snapshot()
+    nodeRegistry._reset()
+    registerNode({
+      kind: 'test:site-overlay',
+      schemaVersion: 1,
+      schema: z.object({ type: z.literal('test:site-overlay') }) as never,
+      category: 'utility',
+      defaults: () => ({}) as never,
+      capabilities: {},
+      floorplanScope: 'site',
+      floorplan: (node) => {
+        const positioned = node as unknown as {
+          position?: [number, number, number]
+          rotation?: [number, number, number]
+        }
+        if (!(positioned.position && positioned.rotation)) return null
+        return {
+          kind: 'group',
+          children: [{ kind: 'circle', cx: 0, cy: 0, r: 1 }],
+          transform: {
+            translate: [positioned.position[0], positioned.position[2]],
+            rotate: positioned.rotation[1],
+          },
+        }
+      },
+    } as AnyNodeDefinition)
+  })
+
+  afterEach(() => restoreRegistry())
+
+  test('collects only direct children of the active Site', () => {
+    const activeSite = {
+      id: 'site_active',
+      type: 'site',
+      parentId: null,
+      children: ['overlay_declared'],
+    } as unknown as AnyNode
+    const nodes = {
+      [activeSite.id]: activeSite,
+      overlay_declared: {
+        id: 'overlay_declared',
+        type: 'test:site-overlay',
+        parentId: null,
+      } as unknown as AnyNode,
+      overlay_parented: {
+        id: 'overlay_parented',
+        type: 'test:site-overlay',
+        parentId: activeSite.id,
+      } as unknown as AnyNode,
+      overlay_other_site: {
+        id: 'overlay_other_site',
+        type: 'test:site-overlay',
+        parentId: 'site_other',
+      } as unknown as AnyNode,
+    }
+
+    expect(
+      collectDirectFloorplanScopeNodes(nodes, activeSite, 'site').map((node) => String(node.id)),
+    ).toEqual(['overlay_declared', 'overlay_parented'])
+  })
+  test('projects site-local coordinates through the inverse Three.js building transform', () => {
+    const transform = siteToFloorplanTransform([10, 0, 5], Math.PI / 2)
+    const [tx, ty] = transform.translate
+    const sitePoint = [10, 3] as const
+    const cos = Math.cos(transform.rotate)
+    const sin = Math.sin(transform.rotate)
+
+    expect(tx + sitePoint[0] * cos - sitePoint[1] * sin).toBeCloseTo(2)
+
+    expect(ty + sitePoint[0] * sin + sitePoint[1] * cos).toBeCloseTo(0)
+  })
+
+  test('rebuilds site geometry from a live pose and restores the committed pose when cleared', () => {
+    const site = {
+      id: 'site_active',
+      type: 'site',
+      parentId: null,
+      children: ['overlay_pond'],
+      visible: true,
+    } as unknown as AnyNode
+    const overlay = {
+      id: 'overlay_pond',
+      type: 'test:site-overlay',
+      parentId: site.id,
+      children: [],
+      visible: true,
+      position: [1, 0, 2],
+      rotation: [0, 0.25, 0],
+    } as unknown as AnyNode
+    const nodes = {
+      [site.id]: site,
+      [overlay.id]: overlay,
+    }
+    const geometryCache = new Map()
+    const liveOverrides = new Map<string, LiveNodeOverrides>()
+    const siteProjection = siteToFloorplanTransform([10, 0, 5], Math.PI / 2)
+    const common = {
+      automaticDimensions: false,
+      ctxOverrides: {
+        children: [],
+        siblings: [],
+        parent: site,
+        outputTransform: siteProjection,
+        trackAllNodes: true,
+      },
+      geometryCache,
+      highlighted: false,
+      hovered: false,
+      interactiveElevators: {},
+      levelDataCache: new Map(),
+      levelNodeIdsByType: new Map(),
+      liveOverride: undefined,
+      liveOverrides,
+      moving: true,
+      node: overlay,
+      nodeId: overlay.id,
+      nodes,
+      palette: undefined,
+      selected: false,
+      siblingEpoch: 0,
+      unit: 'metric' as const,
+      metricNotation: 'meters' as const,
+      wallDimensionReference: 'finished-faces' as const,
+      visibilityRootId: site.id,
+    }
+    const committedSnapshot = structuredClone(overlay)
+    const livePose = {
+      position: [4, 0, 5] as [number, number, number],
+      rotation: Math.PI / 3,
+    }
+
+    const liveEntry = buildFloorplanEntryGeometry({ ...common, live: livePose })
+
+    expect(liveEntry?.node).toMatchObject({
+      position: livePose.position,
+      rotation: [0, livePose.rotation, 0],
+      parentId: null,
+    })
+    expect(liveEntry?.base).toEqual({
+      kind: 'group',
+      children: [
+        {
+          kind: 'group',
+          children: [{ kind: 'circle', cx: 0, cy: 0, r: 1 }],
+          transform: { translate: [4, 5], rotate: livePose.rotation },
+        },
+      ],
+      transform: siteProjection,
+    })
+    expect(overlay).toEqual(committedSnapshot)
+
+    const committedEntry = buildFloorplanEntryGeometry({ ...common, live: undefined })
+
+    expect(committedEntry).not.toBe(liveEntry)
+    expect(committedEntry?.node).toBe(overlay)
+    expect(committedEntry?.base).toEqual({
+      kind: 'group',
+      children: [
+        {
+          kind: 'group',
+          children: [{ kind: 'circle', cx: 0, cy: 0, r: 1 }],
+          transform: { translate: [1, 2], rotate: 0.25 },
+        },
+      ],
+      transform: siteProjection,
+    })
+    expect(overlay).toEqual(committedSnapshot)
+  })
+})
+
+describe('floorplan selection handle sizing', () => {
+  test('caps visual handle growth at extreme zoom-out', () => {
+    expect(resolveFloorplanHandleUnitsPerPixel(0.01)).toBe(0.01)
+    expect(resolveFloorplanHandleUnitsPerPixel(0.1)).toBe(0.015)
+
+    const palette = {
+      selectedStroke: '#111111',
+      selectedFill: '#ffffff',
+      selectedHatch: '#111111',
+      wallHoverStroke: '#111111',
+      endpointHandleFill: '#ffffff',
+      endpointHandleStroke: '#111111',
+      endpointHandleHoverStroke: '#222222',
+      endpointHandleActiveFill: '#333333',
+      endpointHandleActiveStroke: '#444444',
+      curveHandleFill: '#ffffff',
+      curveHandleStroke: '#008080',
+      curveHandleHoverStroke: '#00aaaa',
+      measurementStroke: '#111111',
+      measurementLabelBackground: '#ffffff',
+      measurementLabelText: '#111111',
+    } satisfies FloorplanPalette
+    const noop = () => {}
+    const markup = renderToStaticMarkup(
+      createElement(
+        'svg',
+        null,
+        createElement(InteractiveGeometry, {
+          activeDragId: null,
+          activeRotateNodeId: null,
+          geometry: {
+            kind: 'endpoint-handle',
+            point: [0, 0],
+            state: 'idle',
+            affordance: 'move-endpoint',
+            payload: { endpoint: 'start' },
+          },
+          hatchPatternId: undefined,
+          hoveredHandleId: null,
+          isMarqueeSelectionActive: false,
+          nodeId: 'wall_test' as AnyNodeId,
+          onHandleDoubleClick: noop,
+          onHandleHoverChange: noop,
+          onHandlePointerDown: noop,
+          onMoveHandlePointerDown: noop,
+          palette,
+          sceneRotationDeg: 0,
+          unitsPerPixel: 0.1,
+        }),
+      ),
+    )
+
+    expect(markup).toContain('r="0.12"')
+    expect(markup).not.toContain('r="0.8"')
+  })
+})
+
+describe('floorplan affordance ownership', () => {
+  test('keeps the wall center curve drag owned by the floorplan dispatcher', () => {
+    expect(floorplanAffordanceReshapeScope('wall-curve', 'wall_1', undefined)).toEqual({
+      kind: 'reshaping',
+      nodeId: 'wall_1',
+      reshape: 'curve',
+      driver: 'floorplan',
+    })
+  })
+})
+
+function cabinetRun(id: string, children: string[] = [], parentId: string | null = 'level_test') {
+  return {
+    id,
+    type: 'cabinet',
+    object: 'node',
+    parentId,
+    visible: true,
+    metadata: {},
+    children,
+    position: [0, 0, 0],
+    rotation: 0,
+    width: 1.2,
+    depth: 0.58,
+    carcassHeight: 0.72,
+    plinthHeight: 0.1,
+    showPlinth: true,
+    withCountertop: true,
+    countertopThickness: 0.02,
+  } as AnyNode
+}
+
+function cabinetModule(id: string, parentId: string, children: string[] = []) {
+  return {
+    id,
+    type: 'cabinet-module',
+    object: 'node',
+    parentId,
+    visible: true,
+    metadata: {},
+    children,
+    position: [0, 0.1, 0],
+    rotation: 0,
+    width: 0.6,
+    depth: 0.58,
+    carcassHeight: 0.72,
+    plinthHeight: 0.1,
+    showPlinth: true,
+    countertopThickness: 0.02,
+  } as AnyNode
+}
+
+function isCabinetNode(node: AnyNode | undefined): boolean {
+  return node?.type === 'cabinet' || node?.type === 'cabinet-module'
+}
+
+function childIdsOf(node: AnyNode | undefined): AnyNodeId[] {
+  return Array.isArray((node as { children?: unknown } | undefined)?.children)
+    ? ((node as { children: AnyNodeId[] }).children ?? [])
+    : []
+}
+
+function cabinetAffectedIds({
+  node,
+  nodes,
+  liveOverrides,
+}: {
+  node: AnyNode
+  nodes: Record<AnyNodeId, AnyNode>
+  liveOverrides: Map<string, Record<string, unknown>>
+}): readonly AnyNodeId[] {
+  const affected = new Set<AnyNodeId>()
+  const visited = new Set<AnyNodeId>()
+  const queue: AnyNodeId[] = [node.id as AnyNodeId]
+
+  while (queue.length > 0) {
+    const id = queue.pop()!
+    if (visited.has(id)) continue
+    visited.add(id)
+    const current = nodes[id]
+    if (!isCabinetNode(current)) continue
+    affected.add(id)
+
+    const parentIds = [
+      current?.parentId as AnyNodeId | undefined,
+      (liveOverrides.get(id) as { parentId?: AnyNodeId } | undefined)?.parentId,
+    ]
+    for (const parentId of parentIds) {
+      const parent = parentId ? nodes[parentId] : undefined
+      if (parentId && isCabinetNode(parent)) queue.push(parentId)
+    }
+    for (const childId of childIdsOf(current)) {
+      if (isCabinetNode(nodes[childId])) queue.push(childId)
+    }
+  }
+
+  return Array.from(affected)
+}
+
+function registerCabinetFloorplanDefinition(kind: 'cabinet' | 'cabinet-module') {
+  registerNode({
+    kind,
+    schemaVersion: 1,
+    schema: z.object({ type: z.literal(kind) }) as never,
+    category: 'utility',
+    defaults: () => ({}) as never,
+    floorplanAffectedIds: cabinetAffectedIds,
+  } as unknown as AnyNodeDefinition)
+}
+
+describe('floorplan affordance cancellation', () => {
+  test('tool:cancel reverts the drag and makes a later pointerup inert', () => {
+    const releasePointerCapture = mock(() => {})
+    const commit = mock(() => {})
+    const session: FloorplanAffordanceSession = {
+      affectedIds: ['wall_a', 'wall_b'],
+      apply: () => {},
+      canCommit: () => true,
+      commit,
+    }
+    const snapshots = [{ id: 'wall_a' as AnyNodeId, data: { width: 1 } }]
+    const drag = {
+      pointerId: 7,
+      captureTarget: {
+        hasPointerCapture: mock(() => true),
+        releasePointerCapture,
+      } as unknown as Element,
+      handleId: 'wall_a:endpoint',
+      session,
+      snapshots,
+      historyPaused: true,
+      lastPlanPoint: [0, 0] as [number, number],
+    }
+    const dragRef = { current: drag }
+    const restoreSnapshots = mock(() => {})
+    const resumeHistory = mock(() => {})
+    const clearPreview = mock(() => {})
+    const clearSnapFeedback = mock(() => {})
+    const endReshapeScope = mock(() => {})
+    const clearDragFeedback = mock(() => {})
+    const consumeToolCancel = mock(() => {})
+
+    const unsubscribe = subscribeFloorplanAffordanceToolCancel(
+      () =>
+        cancelFloorplanAffordanceDrag(dragRef, {
+          restoreSnapshots,
+          resumeHistory,
+          clearPreview,
+          clearSnapFeedback,
+          endReshapeScope,
+          clearDragFeedback,
+        }),
+      consumeToolCancel,
+    )
+
+    try {
+      emitter.emit('tool:cancel')
+      emitter.emit('tool:cancel')
+    } finally {
+      unsubscribe()
+    }
+
+    expect(dragRef.current).toBeNull()
+    expect(releasePointerCapture).toHaveBeenCalledWith(7)
+    expect(restoreSnapshots).toHaveBeenCalledWith(snapshots)
+    expect(resumeHistory).toHaveBeenCalledTimes(1)
+    expect(clearPreview).toHaveBeenCalledTimes(2)
+    expect(clearPreview).toHaveBeenNthCalledWith(1, 'wall_a')
+    expect(clearPreview).toHaveBeenNthCalledWith(2, 'wall_b')
+    expect(clearSnapFeedback).toHaveBeenCalledTimes(1)
+    expect(endReshapeScope).toHaveBeenCalledWith(drag)
+    expect(clearDragFeedback).toHaveBeenCalledTimes(1)
+    expect(consumeToolCancel).toHaveBeenCalledTimes(1)
+    expect(drag.historyPaused).toBe(false)
+
+    const activeDrag = dragRef.current
+    if (activeDrag?.pointerId === 7) activeDrag.session.commit?.()
+    expect(commit).toHaveBeenCalledTimes(0)
+  })
+})
+
+describe('floorplan opening placement interaction routing', () => {
+  test('passes entries through only while an opening tool or moving opening is active', () => {
+    expect(
+      isFloorplanOpeningPlacementState({
+        phase: 'structure',
+        mode: 'build',
+        tool: 'window',
+        movingNodeHasWallOpeningPlacement: false,
+      }),
+    ).toBe(true)
+    expect(
+      isFloorplanOpeningPlacementState({
+        phase: 'structure',
+        mode: 'select',
+        tool: null,
+        movingNodeHasWallOpeningPlacement: true,
+      }),
+    ).toBe(true)
+    expect(
+      isFloorplanOpeningPlacementState({
+        phase: 'structure',
+        mode: 'select',
+        tool: null,
+        movingNodeHasWallOpeningPlacement: false,
+      }),
+    ).toBe(false)
+  })
+})
+
+describe('floorplan vertex double-click routing', () => {
+  test('routes polygon vertex handles to the kind-owned delete affordance', () => {
+    expect(
+      floorplanHandleDoubleClickAffordance({
+        kind: 'endpoint-handle',
+        point: [1, 2],
+        state: 'idle',
+        affordance: 'move-vertex',
+        payload: { vertexIndex: 2 },
+      }),
+    ).toBe('delete-vertex')
+
+    expect(
+      floorplanHandleDoubleClickAffordance({
+        kind: 'endpoint-handle',
+        point: [1, 2],
+        state: 'idle',
+        affordance: 'move-endpoint',
+        payload: { endpoint: 'end' },
+      }),
+    ).toBeNull()
+  })
+})
+
+describe('floorplan annotation overlay routing', () => {
+  test('keeps explicitly layered selection chrome above selected body fills', () => {
+    const selectionHatch = {
+      kind: 'line',
+      x1: 0,
+      y1: 0,
+      x2: 0.2,
+      y2: 0.2,
+      stroke: '#3b82f6',
+      metadata: floorplanGeometryMetadata({ renderPass: 'overlay' }),
+    } satisfies FloorplanGeometry
+
+    expect(splitFloorplanOverlay(selectionHatch)).toEqual({
+      base: null,
+      overlay: selectionHatch,
+    })
+  })
+
+  test('registers upright zone labels for rotation-only presentation updates', () => {
+    const noop = () => {}
+    const markup = renderToStaticMarkup(
+      createElement(
+        'svg',
+        null,
+        createElement(InteractiveGeometry, {
+          activeDragId: null,
+          activeRotateNodeId: null,
+          geometry: {
+            kind: 'text',
+            x: 4,
+            y: 6,
+            text: 'Kitchen',
+            fontSize: 0.2,
+            upright: true,
+          },
+          hatchPatternId: undefined,
+          hoveredHandleId: null,
+          isMarqueeSelectionActive: false,
+          nodeId: 'zone_test' as AnyNodeId,
+          onHandleDoubleClick: noop,
+          onHandleHoverChange: noop,
+          onHandlePointerDown: noop,
+          onMoveHandlePointerDown: noop,
+          palette: undefined,
+          sceneRotationDeg: 180,
+          unitsPerPixel: 0.01,
+        }),
+      ),
+    )
+
+    expect(markup).not.toContain('data-floorplan-annotation-label=""')
+    expect(markup).toContain('data-floorplan-annotation-angle-radians="0"')
+    expect(markup).toContain('data-floorplan-annotation-screen-upright="true"')
+    expect(markup).toContain('data-floorplan-annotation-transform-before-rotation="translate(4 6)"')
+    expect(markup).toContain('transform="translate(4 6) rotate(-180)"')
+  })
+
+  test('keeps automatic dimension strings left-to-right and top-to-bottom after rotation', () => {
+    const noop = () => {}
+    const renderAt180Degrees = (geometry: FloorplanGeometry) =>
+      renderToStaticMarkup(
+        createElement(
+          'svg',
+          null,
+          createElement(InteractiveGeometry, {
+            activeDragId: null,
+            activeRotateNodeId: null,
+            geometry,
+            hatchPatternId: undefined,
+            hoveredHandleId: null,
+            isMarqueeSelectionActive: false,
+            nodeId: 'wall_test' as AnyNodeId,
+            onHandleDoubleClick: noop,
+            onHandleHoverChange: noop,
+            onHandlePointerDown: noop,
+            onMoveHandlePointerDown: noop,
+            palette: undefined,
+            sceneRotationDeg: 180,
+            unitsPerPixel: 0.01,
+          }),
+        ),
+      )
+    const dimensionString = (
+      end: readonly [number, number],
+      offsetNormal: readonly [number, number],
+    ): FloorplanGeometry => ({
+      kind: 'dimension-string',
+      segments: [{ start: [0, 0], end, text: '2m' }],
+      offsetNormal,
+      offsetDistance: 0.55,
+      extensionOvershoot: 0.12,
+      textPosition: 'above',
+    })
+
+    expect(renderAt180Degrees(dimensionString([2, 0], [0, 1]))).toContain('rotate(-180)')
+    expect(renderAt180Degrees(dimensionString([0, 2], [1, 0]))).toContain('rotate(-90)')
+  })
+
+  test('keeps a fixed mark pill together in the overlay pass', () => {
+    const mark = {
+      kind: 'group',
+      metadata: floorplanGeometryMetadata({ annotationRole: 'opening-mark' }),
+      children: [
+        { kind: 'line', x1: 0, y1: 0, x2: 0, y2: 0.4 },
+        { kind: 'rect', x: -0.2, y: 0.4, width: 0.4, height: 0.32 },
+        { kind: 'text', x: 0, y: 0.56, text: '107', fontSize: 0.15, upright: true },
+      ],
+    } satisfies FloorplanGeometry
+
+    expect(splitFloorplanOverlay(mark)).toEqual({ base: null, overlay: mark })
+  })
+
+  test('keeps fixed annotation symbols in the overlay pass for collision layout', () => {
+    const columnCenter = {
+      kind: 'line',
+      x1: 0,
+      y1: 0,
+      x2: 1,
+      y2: 0,
+      metadata: floorplanGeometryMetadata({ annotationRole: 'column-center' }),
+    } satisfies FloorplanGeometry
+
+    expect(splitFloorplanOverlay(columnCenter)).toEqual({ base: null, overlay: columnCenter })
+  })
+})
+
+describe('computeAffectedSiblingIds', () => {
+  // The cabinet fixture definitions have no `capabilities` — leaking them
+  // past this describe crashes any later test FILE that enumerates the
+  // registry (night-8 CI: pointer-support-cap.test.ts, run 32580694134).
+  let restoreRegistry: () => void
+
+  beforeEach(() => {
+    restoreRegistry = nodeRegistry._snapshot()
+    nodeRegistry._reset()
+    registerCabinetFloorplanDefinition('cabinet')
+    registerCabinetFloorplanDefinition('cabinet-module')
+  })
+
+  afterEach(() => restoreRegistry())
+
+  test('propagates cabinet live overrides through the cabinet family', () => {
+    const run = cabinetRun('cabinet_run', ['cabinet-module_main', 'cabinet-module_corner'])
+    const module = cabinetModule('cabinet-module_main', run.id)
+    const cornerModule = cabinetModule('cabinet-module_corner', run.id, ['cabinet_child-run'])
+    const childRun = cabinetRun('cabinet_child-run', ['cabinet-module_child'], cornerModule.id)
+    const childModule = cabinetModule('cabinet-module_child', childRun.id)
+    const nodes = {
+      [run.id]: run,
+      [module.id]: module,
+      [cornerModule.id]: cornerModule,
+      [childRun.id]: childRun,
+      [childModule.id]: childModule,
+    } as Record<string, AnyNode>
+
+    const affected = computeAffectedSiblingIds(
+      [run.id as AnyNodeId],
+      nodes,
+      new Map([[run.id, { position: [2, 0, 3] }]]),
+    )
+
+    expect(affected).toEqual(
+      new Set([run.id, module.id, cornerModule.id, childRun.id, childModule.id] as AnyNodeId[]),
+    )
+  })
+
+  test('propagates a live-moving cabinet module back to its owning run', () => {
+    const run = cabinetRun('cabinet_run', ['cabinet-module_main', 'cabinet-module_child'])
+    const module = cabinetModule('cabinet-module_main', run.id)
+    const sibling = cabinetModule('cabinet-module_child', run.id)
+    const nodes = {
+      [run.id]: run,
+      [module.id]: module,
+      [sibling.id]: sibling,
+    } as Record<string, AnyNode>
+
+    const affected = computeAffectedSiblingIds(
+      [module.id as AnyNodeId],
+      nodes,
+      new Map([[module.id, { position: [1.2, 0.1, 0.3] }]]),
+    )
+
+    expect(affected).toEqual(new Set([module.id, run.id, sibling.id] as AnyNodeId[]))
+  })
+})
+
+describe('collectFloorplanDependencyNodes', () => {
+  test('includes referenced hosts and their transform-owning parents', () => {
+    const level = {
+      id: 'level_test',
+      type: 'level',
+      parentId: null,
+      children: ['roof_test'],
+    } as unknown as AnyNode
+    const roof = {
+      id: 'roof_test',
+      type: 'roof',
+      parentId: level.id,
+      children: [],
+      position: [0, 0, 0],
+      rotation: 0,
+    } as unknown as AnyNode
+    const measurement = {
+      id: 'measurement_test',
+      type: 'measurement',
+      parentId: level.id,
+    } as unknown as AnyNode
+    const definition = {
+      floorplanDependencies: () => [roof.id],
+    } as unknown as AnyNodeDefinition
+
+    expect(
+      collectFloorplanDependencyNodes(
+        definition,
+        measurement,
+        {
+          [level.id]: level,
+          [roof.id]: roof,
+          [measurement.id]: measurement,
+        },
+        new Map<string, LiveNodeOverrides>([
+          [roof.id, { position: [3, 0, 2] }],
+          [level.id, { visible: false }],
+        ]),
+      ),
+    ).toEqual([
+      expect.objectContaining({ id: roof.id, position: [3, 0, 2] }),
+      expect.objectContaining({ id: level.id, visible: false }),
+    ])
+  })
+})
+
+describe('collectFloorplanLinkedLevelNodes', () => {
+  // Same containment as computeAffectedSiblingIds above: the fixture
+  // definition has no `capabilities`, so it must not outlive this describe.
+  let restoreRegistry: () => void
+
+  beforeEach(() => {
+    restoreRegistry = nodeRegistry._snapshot()
+  })
+
+  afterEach(() => restoreRegistry())
+
+  test('projects a node onto a linked destination level with its real children', () => {
+    nodeRegistry._reset()
+    registerNode({
+      kind: 'linked-floorplan-test',
+      schemaVersion: 1,
+      schema: z.object({ type: z.literal('linked-floorplan-test') }) as never,
+      category: 'structure',
+      defaults: () => ({}) as never,
+      floorplan: () => null,
+      extensions: {
+        [FLOORPLAN_NODE_EXTENSION_KEY]: {
+          linkedLevelIds: () => ['level_upper' as AnyNodeId],
+        },
+      },
+    } as unknown as AnyNodeDefinition)
+    const child = {
+      id: 'linked_child',
+      type: 'linked-child',
+      parentId: 'linked_parent',
+    } as unknown as AnyNode
+    const parent = {
+      id: 'linked_parent',
+      type: 'linked-floorplan-test',
+      parentId: 'level_lower',
+      children: [child.id],
+    } as unknown as AnyNode
+    const nodes = { [parent.id]: parent, [child.id]: child }
+
+    expect(collectFloorplanLinkedLevelNodes(nodes, 'level_upper' as AnyNodeId)).toEqual([
+      { id: parent.id, node: parent, children: [child] },
+    ])
+    expect(
+      collectFloorplanLinkedLevelNodes(
+        nodes,
+        'level_upper' as AnyNodeId,
+        new Set([parent.id as AnyNodeId]),
+      ),
+    ).toEqual([])
+  })
+})
+
+describe('floorplan entry routing while a tool is active', () => {
+  test('build tools get presses on entries, as in 3D; select and delete keep selecting', () => {
+    expect(floorplanEntryYieldsToTool({ mode: 'build', openingPlacement: false })).toBe(true)
+    expect(floorplanEntryYieldsToTool({ mode: 'select', openingPlacement: true })).toBe(true)
+    expect(floorplanEntryYieldsToTool({ mode: 'select', openingPlacement: false })).toBe(false)
+    expect(floorplanEntryYieldsToTool({ mode: 'delete', openingPlacement: false })).toBe(false)
+  })
+})
+
+describe('isFloorplanHierarchyVisible', () => {
+  const node = (id: string, type: string, parentId: string | null, visible = true) =>
+    ({ object: 'node', id, type, parentId, visible, metadata: {} }) as unknown as AnyNode
+  const noOverrides = new Map<string, LiveNodeOverrides>()
+  const visibleUnder = (nodes: Record<string, AnyNode>, rootId: string, id: string) =>
+    isFloorplanHierarchyVisible(nodes[id]!, nodes, noOverrides, rootId as AnyNodeId)
+
+  test('a hidden Site root keeps the nodes on it, linked or detached', () => {
+    const nodes: Record<string, AnyNode> = {
+      site_a: node('site_a', 'site', null, false),
+      building_a: node('building_a', 'building', 'site_a'),
+      level_a: node('level_a', 'level', 'building_a'),
+      wall_a: node('wall_a', 'wall', 'level_a'),
+      wall_b: node('wall_b', 'wall', 'level_a', false),
+      tree_a: node('tree_a', 'trees:tree', null),
+    }
+    expect(visibleUnder(nodes, 'site_a', 'wall_a')).toBe(true)
+    expect(visibleUnder(nodes, 'site_a', 'tree_a')).toBe(true)
+    expect(visibleUnder(nodes, 'site_a', 'wall_b')).toBe(false)
+    expect(visibleUnder(nodes, 'site_a', 'site_a')).toBe(false)
+  })
+
+  test('a hidden building or level root still hides what it hosts', () => {
+    const nodes: Record<string, AnyNode> = {
+      site_a: node('site_a', 'site', null),
+      building_a: node('building_a', 'building', 'site_a', false),
+      level_a: node('level_a', 'level', 'building_a'),
+      wall_a: node('wall_a', 'wall', 'level_a'),
+      elevator_a: node('elevator_a', 'elevator', null),
+    }
+    expect(visibleUnder(nodes, 'site_a', 'wall_a')).toBe(false)
+    expect(visibleUnder(nodes, 'building_a', 'elevator_a')).toBe(false)
+    // A level plan is scoped to its level: the walk stops at the root and
+    // never consults the building above it.
+    expect(visibleUnder(nodes, 'level_a', 'wall_a')).toBe(true)
+  })
+})

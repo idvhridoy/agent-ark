@@ -1,0 +1,263 @@
+import { getAgentCatalog } from '@tech-leads-club/core'
+import { ZipArchive } from 'archiver'
+import { execFileSync } from 'child_process'
+import * as fs from 'fs'
+import matter from 'gray-matter'
+import * as path from 'path'
+import { fileURLToPath } from 'url'
+
+import { buildLlmsTxt } from '../src/lib/seo/llms-txt'
+import { extractDisplayName } from '../src/lib/skill-display-name'
+import type { AgentTarget, Category, MarketplaceData, Skill } from '../src/types'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+const WORKSPACE_ROOT = path.resolve(__dirname, '../../..')
+const SKILLS_DIR = path.join(WORKSPACE_ROOT, 'packages/skills-catalog/skills')
+const REGISTRY_FILE = path.join(WORKSPACE_ROOT, 'packages/skills-catalog/skills-registry.json')
+const OUTPUT_FILE = path.join(__dirname, '../src/data/skills.json')
+const LLMS_TXT_FILE = path.join(__dirname, '../public/llms.txt')
+const DOWNLOADS_DIR = path.join(__dirname, '../public/downloads')
+
+interface RegistrySkill {
+  name: string
+  description: string
+  category: string
+  path: string
+  files: string[]
+  author?: string
+  version?: string
+}
+
+interface CategoryMetadata {
+  name: string
+  description?: string
+  priority?: number
+}
+
+interface SkillsRegistry {
+  version: string
+  categories: Record<string, CategoryMetadata>
+  skills: RegistrySkill[]
+}
+
+function loadRegistry(): SkillsRegistry {
+  if (!fs.existsSync(REGISTRY_FILE)) {
+    throw new Error(`Registry file not found: ${REGISTRY_FILE}`)
+  }
+  return JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf-8'))
+}
+
+function getGitLastModified(filePath: string): string {
+  try {
+    const date = execFileSync('git', ['log', '-1', '--format=%aI', '--', filePath], {
+      cwd: WORKSPACE_ROOT,
+      encoding: 'utf-8',
+    }).trim()
+    if (date) return date.split('T')[0]
+  } catch {
+    // git not available or file not tracked
+  }
+  return new Date().toISOString().split('T')[0]
+}
+
+// why: `allowed-tools` is space-delimited in the Agent Skills spec, but Claude Code also accepts commas
+// and YAML lists, and entries like `Bash(git status:*)` carry spaces inside the parentheses.
+function parseAllowedTools(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String)
+  if (typeof value !== 'string') return []
+  const separator = value.includes(',') ? /,(?![^(]*\))/ : /\s+(?![^(]*\))/
+  return value
+    .split(separator)
+    .map((tool) => tool.trim())
+    .filter(Boolean)
+}
+
+function readSkillContent(registrySkill: RegistrySkill): {
+  content: string
+  lastModified: string
+  allowedTools: string[]
+} {
+  const skillFile = path.join(SKILLS_DIR, registrySkill.path, 'SKILL.md')
+
+  if (!fs.existsSync(skillFile)) {
+    console.warn(`SKILL.md not found at ${skillFile}`)
+    return { content: '', lastModified: new Date().toISOString().split('T')[0], allowedTools: [] }
+  }
+
+  const fileContent = fs.readFileSync(skillFile, 'utf-8')
+  const lastModified = getGitLastModified(skillFile)
+
+  try {
+    const { content, data } = matter(fileContent)
+    return { content: content.trim(), lastModified, allowedTools: parseAllowedTools(data['allowed-tools']) }
+  } catch {
+    console.warn(`Failed to parse frontmatter for ${registrySkill.name}, using fallback`)
+    const lines = fileContent.split('\n')
+    let contentStart = 0
+
+    if (lines[0] === '---') {
+      const endIndex = lines.findIndex((line, idx) => idx > 0 && line === '---')
+      contentStart = endIndex > 0 ? endIndex + 1 : 1
+    }
+
+    const content = lines.slice(contentStart).join('\n').trim()
+    return { content, lastModified, allowedTools: [] }
+  }
+}
+
+async function generateSkillZip(skillName: string, skillPath: string): Promise<void> {
+  const skillDir = path.join(SKILLS_DIR, skillPath)
+  const zipPath = path.join(DOWNLOADS_DIR, `${skillName}.zip`)
+
+  // why: a missing source dir would otherwise ship an empty ZIP that looks valid to users
+  if (!fs.existsSync(skillDir)) {
+    throw new Error(`skill directory not found: ${skillDir}`)
+  }
+
+  return new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath)
+    const archive = new ZipArchive({ zlib: { level: 9 } })
+
+    output.on('close', resolve)
+    output.on('error', reject)
+    archive.on('error', reject)
+
+    archive.pipe(output)
+    archive.directory(skillDir, skillName)
+    archive.finalize().catch(reject)
+  })
+}
+
+const RUNTIME_BY_EXTENSION: Record<string, string> = {
+  '.py': 'Python',
+  '.js': 'Node.js',
+  '.mjs': 'Node.js',
+  '.cjs': 'Node.js',
+  '.ts': 'Node.js',
+  '.sh': 'Bash',
+}
+
+function inferScriptRuntimes(files: string[]): string[] {
+  const runtimes = files
+    .filter((f) => f.startsWith('scripts/'))
+    .map((f) => RUNTIME_BY_EXTENSION[path.extname(f)])
+    .filter(Boolean)
+  return [...new Set(runtimes)].sort()
+}
+
+function generateMarketplaceData(): MarketplaceData {
+  console.log('Loading skills registry...')
+  const registry = loadRegistry()
+
+  console.log(`Found ${registry.skills.length} skills in registry`)
+
+  // Transform categories from Record to Array
+  const categories: Category[] = Object.entries(registry.categories).map(([id, meta]) => ({
+    id,
+    name: meta.name,
+    description: meta.description,
+    priority: meta.priority,
+  }))
+
+  // Map registry skills to marketplace skills
+  const skills: Skill[] = registry.skills.map((registrySkill) => {
+    // Derive metadata from files array
+    const hasScripts = registrySkill.files.some((f) => f.startsWith('scripts/'))
+    const hasReferences = registrySkill.files.some((f) => f.startsWith('references/'))
+    const referenceFiles = registrySkill.files
+      .filter((f) => f.startsWith('references/') && f.endsWith('.md'))
+      .map((f) => path.basename(f))
+
+    // Read content and lastModified from git history
+    const { content, lastModified, allowedTools } = readSkillContent(registrySkill)
+
+    return {
+      id: registrySkill.name,
+      name: extractDisplayName(content, registrySkill.name),
+      description: registrySkill.description,
+      category: registrySkill.category,
+      path: `skills/${registrySkill.path}/SKILL.md`,
+      content,
+      metadata: {
+        hasScripts,
+        hasReferences,
+        referenceFiles,
+        lastModified,
+        version: registrySkill.version,
+        scriptRuntimes: inferScriptRuntimes(registrySkill.files),
+        allowedTools,
+      },
+    }
+  })
+
+  // why: agent install paths are canonical CLI data — re-typing them into the site would let
+  // published install instructions drift away from what the installer actually does.
+  const agents: AgentTarget[] = getAgentCatalog().map((agent) => ({
+    id: agent.type,
+    name: agent.displayName,
+    description: agent.description,
+    skillsDir: agent.skillsDir,
+    globalSkillsDir: agent.globalSkillsDir,
+  }))
+
+  // Sort skills by name
+  skills.sort((a, b) => a.name.localeCompare(b.name))
+
+  // Sort categories by priority
+  categories.sort((a, b) => (a.priority || 999) - (b.priority || 999))
+
+  return {
+    skills,
+    categories,
+    agents,
+    stats: {
+      totalSkills: skills.length,
+      totalCategories: categories.length,
+      totalAgents: agents.length,
+    },
+  }
+}
+
+async function main() {
+  console.log('Generating marketplace data...')
+
+  const data = generateMarketplaceData()
+
+  const outputDir = path.dirname(OUTPUT_FILE)
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true })
+  }
+
+  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(data, null, 2))
+  fs.writeFileSync(LLMS_TXT_FILE, buildLlmsTxt(data))
+
+  console.log(`✓ Generated data for ${data.stats.totalSkills} skills`)
+  console.log(`✓ Output: ${OUTPUT_FILE}`)
+  console.log(`✓ Output: ${LLMS_TXT_FILE}`)
+
+  // Generate ZIP archives for each skill
+  console.log('Generating skill ZIP archives...')
+  if (!fs.existsSync(DOWNLOADS_DIR)) {
+    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true })
+  }
+
+  let zipCount = 0
+  for (const skill of data.skills) {
+    // skill.path is like "skills/(quality)/web-accessibility/SKILL.md"
+    // Extract the directory part: "(quality)/web-accessibility"
+    const skillDir = path.dirname(skill.path).replace(/^skills\//, '')
+    await generateSkillZip(skill.id, skillDir)
+    zipCount++
+    if (zipCount % 20 === 0) console.log(`  ${zipCount}/${data.skills.length} zips created...`)
+  }
+
+  console.log(`✓ Generated ${zipCount} skill ZIP archives`)
+  console.log(`✓ Output: ${DOWNLOADS_DIR}`)
+}
+
+main().catch((err) => {
+  console.error('Failed:', err)
+  process.exit(1)
+})

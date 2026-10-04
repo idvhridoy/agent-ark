@@ -1,0 +1,408 @@
+{
+  "version": 1,
+  "source_catalog": "skills_index.json",
+  "evaluated_skill_count": 2113,
+  "selection_rules": [
+    "Prefer focused plugins with a clear user job over broad library replicas.",
+    "Include only skill IDs present in skills_index.json.",
+    "Prefer skills marked supported for both Codex and Claude plugin targets, without branding the plugin names around either host.",
+    "Keep each plugin small enough to remain easy to browse, install, and invoke."
+  ],
+  "official_codex_docs_basis": [
+    "Codex skills are the workflow authoring format.",
+    "Codex plugins are the installable distribution unit for reusable skills, apps, and MCP-backed workflows.",
+    "Codex shortens or omits skills from the initial list when many skills are installed, so smaller plugin surfaces improve discoverability."
+  ],
+  "candidates": [
+    {
+      "id": "aas-web-app-builder",
+      "name": "AAS Web App Builder",
+      "priority": "tier-1",
+      "audience": "Frontend and full-stack developers shipping modern web apps.",
+      "why": "Implement a React/Next.js user journey with responsive UI, accessibility checks and browser verification.",
+      "skills": [
+        "frontend-developer",
+        "frontend-design",
+        "react-best-practices",
+        "nextjs-app-router-patterns",
+        "browser-automation",
+        "tailwind-patterns",
+        "shadcn",
+        "form-cro",
+        "seo-audit",
+        "ui-a11y"
+      ]
+    },
+    {
+      "id": "aas-product-design-studio",
+      "name": "AAS Product Design Studio",
+      "priority": "tier-1",
+      "audience": "Builders who want richer UI, brand, portfolio, and visual product work.",
+      "why": "Turn a product brief into a coherent visual direction, responsive interface and actionable design review.",
+      "skills": [
+        "ui-ux-pro-max",
+        "high-end-visual-design",
+        "frontend-design",
+        "mobile-design",
+        "3d-web-experience",
+        "canvas-design",
+        "scroll-experience",
+        "interactive-portfolio",
+        "ui-a11y",
+        "ui-review"
+      ]
+    },
+    {
+      "id": "aas-security-engineer",
+      "name": "AAS Security Engineer",
+      "priority": "tier-1",
+      "audience": "Authorized security testing, audit, and hardening teams.",
+      "why": "Assess explicitly authorized targets and produce reproducible findings, remediation priorities and retest steps.",
+      "skills": [
+        "ethical-hacking-methodology",
+        "burp-suite-testing",
+        "top-web-vulnerabilities",
+        "api-security-testing",
+        "linux-privilege-escalation",
+        "cloud-penetration-testing",
+        "security-auditor",
+        "vulnerability-scanner",
+        "sast-configuration",
+        "web-security-testing"
+      ]
+    },
+    {
+      "id": "aas-secure-app-builder",
+      "name": "AAS Secure App Builder",
+      "priority": "tier-1",
+      "audience": "Application developers who want security embedded while building features.",
+      "why": "Implement authentication, access control and data protection with negative tests and a focused security review.",
+      "skills": [
+        "api-security-best-practices",
+        "auth-implementation-patterns",
+        "backend-security-coder",
+        "frontend-security-coder",
+        "cc-skill-security-review",
+        "pci-compliance",
+        "sast-configuration",
+        "secrets-management",
+        "django-access-review"
+      ]
+    },
+    {
+      "id": "aas-documents-presentations",
+      "name": "AAS Documents & Presentations",
+      "priority": "tier-1",
+      "audience": "Users creating, editing, converting, and automating office documents.",
+      "why": "Produce editable office files and PDFs, with content checks and rendered output review.",
+      "skills": [
+        "office-productivity",
+        "docx-official",
+        "xlsx-official",
+        "pptx-official",
+        "pdf-official",
+        "pdf-conversion-router",
+        "google-docs-automation",
+        "google-sheets-automation",
+        "google-slides-automation"
+      ]
+    },
+    {
+      "id": "aas-data-analytics",
+      "name": "AAS Data Analytics",
+      "priority": "tier-1",
+      "audience": "Operators, analysts, and builders working with product analytics, SQL, dashboards, and experiments.",
+      "why": "Validate source data, write analytical queries and produce a dashboard or experiment readout with traceable definitions.",
+      "skills": [
+        "analytics-tracking",
+        "analytics-product",
+        "sql-pro",
+        "postgres-best-practices",
+        "data-quality-frameworks",
+        "dbt-transformation-patterns",
+        "claude-d3js-skill",
+        "kpi-dashboard-design",
+        "ab-test-setup",
+        "business-analyst"
+      ]
+    },
+    {
+      "id": "aas-agent-mcp-builder",
+      "name": "AAS Agent & MCP Builder",
+      "priority": "tier-1",
+      "audience": "Developers building agentic apps, MCP tools, RAG systems, and evaluation loops.",
+      "why": "Build a bounded agent or MCP tool with explicit interfaces, failure handling and behavioral evaluation.",
+      "skills": [
+        "ai-agents-architect",
+        "agent-evaluation",
+        "mcp-builder",
+        "mcp-tool-developer",
+        "llm-app-patterns",
+        "rag-engineer",
+        "langgraph",
+        "langfuse",
+        "context-window-management",
+        "prompt-engineering"
+      ]
+    },
+    {
+      "id": "aas-qa-test-automation",
+      "name": "AAS QA & Test Automation",
+      "priority": "tier-1",
+      "audience": "Engineers and QA teams writing, debugging, and stabilizing test suites.",
+      "why": "Reproduce failures, add meaningful regression coverage and stabilize browser or service tests.",
+      "skills": [
+        "test-driven-development",
+        "systematic-debugging",
+        "browser-automation",
+        "e2e-testing-patterns",
+        "playwright-skill",
+        "webapp-testing",
+        "k6-load-testing",
+        "test-fixing",
+        "code-review-checklist",
+        "screen-reader-testing"
+      ]
+    },
+    {
+      "id": "aas-devops-cloud",
+      "name": "AAS DevOps & Cloud",
+      "priority": "tier-1",
+      "audience": "Teams shipping infrastructure, deployments, and operational workflows.",
+      "why": "Prepare infrastructure and delivery changes with validation, rollback steps and explicit deployment boundaries.",
+      "skills": [
+        "docker-expert",
+        "aws-serverless",
+        "kubernetes-architect",
+        "terraform-specialist",
+        "github-actions-templates",
+        "environment-setup-guide",
+        "deployment-procedures",
+        "bash-linux",
+        "incident-responder",
+        "devops-troubleshooter"
+      ]
+    },
+    {
+      "id": "aas-marketing-seo-growth",
+      "name": "AAS Marketing, SEO & Growth",
+      "priority": "tier-2",
+      "audience": "Founders and growth teams creating content, SEO systems, experiments, and email campaigns.",
+      "why": "Create an acquisition plan and channel assets grounded in the supplied audience, product and search evidence.",
+      "skills": [
+        "content-creator",
+        "seo-audit",
+        "seo-fundamentals",
+        "seo-content-planner",
+        "programmatic-seo",
+        "analytics-tracking",
+        "ab-test-setup",
+        "email-sequence",
+        "copywriting",
+        "schema-markup"
+      ]
+    },
+    {
+      "id": "aas-automation-builder",
+      "name": "AAS Automation Builder",
+      "priority": "tier-2",
+      "audience": "Teams designing reliable automations across tools, data stores, and communication platforms.",
+      "why": "Design an automation with explicit triggers, mappings, retries and a reviewable test run.",
+      "skills": [
+        "workflow-automation",
+        "mcp-builder",
+        "make-automation",
+        "zapier-make-patterns",
+        "airtable-automation",
+        "notion-automation",
+        "slack-automation",
+        "googlesheets-automation",
+        "github-automation",
+        "n8n-workflow-patterns"
+      ]
+    },
+    {
+      "id": "aas-observability-ir",
+      "name": "AAS Observability IR",
+      "priority": "tier-2",
+      "audience": "Engineering teams monitoring systems, debugging production issues, and writing postmortems.",
+      "why": "Connect logs, metrics and traces to incident diagnosis, recovery checks and a documented follow-up.",
+      "skills": [
+        "observability-engineer",
+        "observability-and-instrumentation",
+        "distributed-tracing",
+        "slo-implementation",
+        "grafana-dashboards",
+        "performance-engineer",
+        "incident-responder",
+        "devops-troubleshooter",
+        "postmortem-writing",
+        "langfuse"
+      ]
+    },
+    {
+      "id": "aas-python-api-builder",
+      "name": "AAS Python API Builder",
+      "priority": "tier-2",
+      "audience": "Python developers building APIs, services, and tests.",
+      "why": "Implement Python service endpoints with schema validation, async boundaries and automated tests.",
+      "skills": [
+        "python-pro",
+        "python-patterns",
+        "fastapi-pro",
+        "fastapi-templates",
+        "django-pro",
+        "python-testing-patterns",
+        "async-python-patterns",
+        "api-design-principles",
+        "pydantic-models-py",
+        "openapi-spec-generation"
+      ]
+    },
+    {
+      "id": "aas-mobile-app-builder",
+      "name": "AAS Mobile App Builder",
+      "priority": "tier-2",
+      "audience": "Mobile teams shipping Expo, React Native, Flutter, and iOS apps.",
+      "why": "Implement a mobile feature in the chosen stack and prepare platform-specific build and release checks.",
+      "skills": [
+        "mobile-developer",
+        "react-native-architecture",
+        "expo-api-routes",
+        "expo-dev-client",
+        "expo-cicd-workflows",
+        "expo-deployment",
+        "flutter-expert",
+        "ios-developer",
+        "app-store-optimization",
+        "multi-platform-apps-multi-platform"
+      ]
+    },
+    {
+      "id": "aas-accessibility-inclusive-ux",
+      "name": "AAS Accessibility & Inclusive UX",
+      "priority": "tier-1",
+      "audience": "Design, frontend, QA, and product teams improving accessible user experiences.",
+      "why": "Find and fix accessibility barriers with keyboard, automated and screen-reader checks appropriate to the interface.",
+      "skills": [
+        "accesslint-audit",
+        "accesslint-scan",
+        "screen-reader-testing",
+        "accesslint-diff",
+        "fixing-accessibility",
+        "ui-a11y",
+        "webapp-testing",
+        "playwright-skill"
+      ]
+    },
+    {
+      "id": "aas-api-platform-builder",
+      "name": "AAS API Platform Builder",
+      "priority": "tier-1",
+      "audience": "Backend and platform teams designing APIs, contracts, auth, security, load tests, and observability.",
+      "why": "Define and implement API contracts, authorization, documentation and service verification across languages.",
+      "skills": [
+        "api-design-principles",
+        "api-patterns",
+        "openapi-spec-generation",
+        "api-documentation",
+        "api-endpoint-builder",
+        "auth-implementation-patterns",
+        "api-security-best-practices",
+        "backend-architect",
+        "k6-load-testing",
+        "observability-engineer"
+      ]
+    },
+    {
+      "id": "aas-saas-launch-revenue",
+      "name": "AAS SaaS Launch & Revenue",
+      "priority": "tier-1",
+      "audience": "Founders and product teams launching, pricing, monetizing, measuring, and improving SaaS products.",
+      "why": "Connect MVP scope, pricing, payments and launch assets into a concrete launch-readiness review.",
+      "skills": [
+        "saas-mvp-launcher",
+        "micro-saas-launcher",
+        "pricing-strategy",
+        "monetization",
+        "stripe-integration",
+        "analytics-product",
+        "launch-strategy",
+        "referral-program",
+        "email-sequence",
+        "seo-audit"
+      ]
+    },
+    {
+      "id": "aas-ai-product-evaluation-ops",
+      "name": "AAS AI Product & Evaluation Ops",
+      "priority": "tier-1",
+      "audience": "PMs, founders, and AI product teams defining, measuring, and improving AI features.",
+      "why": "Define AI feature success criteria, representative evaluation cases and a decision-ready error analysis.",
+      "skills": [
+        "ai-wrapper-product",
+        "agent-evaluation",
+        "langfuse",
+        "llm-app-patterns",
+        "context-window-management",
+        "kpi-dashboard-design",
+        "analytics-product",
+        "product-manager",
+        "ab-test-setup",
+        "hugging-face-evaluation"
+      ]
+    },
+    {
+      "id": "aas-data-engineering-platform",
+      "name": "AAS Data Engineering Platform",
+      "priority": "tier-2",
+      "audience": "Data and AI platform teams building pipelines, warehouses, transforms, embeddings, and RAG-ready data foundations.",
+      "why": "Build ingestion and transformation pipelines with data contracts, quality checks and recovery planning.",
+      "skills": [
+        "data-engineer",
+        "airflow-dag-patterns",
+        "dbt-transformation-patterns",
+        "postgres-best-practices",
+        "database-architect",
+        "vector-database-engineer",
+        "embedding-strategies",
+        "rag-engineer",
+        "sql-pro",
+        "data-quality-frameworks"
+      ]
+    },
+    {
+      "id": "aas-privacy-compliance-engineering",
+      "name": "AAS Privacy & Compliance Engineering",
+      "priority": "tier-2",
+      "audience": "Teams building privacy-aware and compliance-sensitive SaaS, AI, finance, and cloud systems.",
+      "why": "Map data flows to engineering controls and evidence gaps for a scoped privacy or compliance review.",
+      "skills": [
+        "privacy-by-design",
+        "gdpr-data-handling",
+        "pci-compliance",
+        "fsi-compliance-checker",
+        "cc-skill-security-review"
+      ]
+    },
+    {
+      "id": "aas-localization-international-growth",
+      "name": "AAS Localization & International Growth",
+      "priority": "tier-2",
+      "audience": "Growth, content, and product teams expanding sites and products across languages and markets.",
+      "why": "Prepare locale-aware interfaces and content with language, routing and international SEO checks.",
+      "skills": [
+        "i18n-localization",
+        "seo-hreflang",
+        "seo-fundamentals",
+        "seo-content-planner",
+        "seo-content-writer",
+        "schema-markup",
+        "content-creator",
+        "copywriting",
+        "analytics-tracking",
+        "apify-market-research"
+      ]
+    }
+  ]
+}

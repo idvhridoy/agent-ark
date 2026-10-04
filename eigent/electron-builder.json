@@ -1,0 +1,172 @@
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "productName": "Eigent",
+  "appId": "com.eigent.app",
+  "asar": true,
+  "electronLanguages": [
+    "ar",
+    "de",
+    "en-US",
+    "es",
+    "fr",
+    "it",
+    "ja",
+    "ko",
+    "ru",
+    "zh-CN",
+    "zh-TW"
+  ],
+  "asarUnpack": ["node_modules/node-pty/**"],
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist-electron",
+    "dist",
+    "resources",
+    "!backend",
+    "!dist/images",
+    "!**/__pycache__",
+    "!server",
+    "!docs"
+  ],
+  "extraResources": [
+    {
+      "from": "backend",
+      "to": "backend",
+      "filter": ["**/*", "!.venv/**/*", "!workspace/.initial_env/**/*"]
+    },
+    {
+      "from": "resources/prebuilt",
+      "to": "prebuilt",
+      "filter": [
+        "**/*",
+        "!cache/**/*",
+        "!**/.npm-cache/**/*",
+        "!uv_python/**/*.pyc",
+        "!uv_python/**/__pycache__",
+        "!terminal_venv/**/*.pyc",
+        "!terminal_venv/**/__pycache__",
+        "!**/__pycache__/**",
+        "!**/*.pyc",
+        "!**/*.pyo",
+        "!venv/**/__pycache__/**",
+        "!venv/**/*.pyc",
+
+        "!venv/lib/python*/site-packages/yt_dlp/**",
+        "!venv/lib/python*/site-packages/yt_dlp-*.dist-info/**",
+        "!uv_python/**/site-packages/setuptools/**",
+        "!uv_python/**/site-packages/wheel/**"
+      ]
+    },
+    {
+      "from": "resources/example-skills",
+      "to": "example-skills"
+    }
+  ],
+  "protocols": [
+    {
+      "name": "Eigent OAuth",
+      "schemes": ["eigent"]
+    }
+  ],
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "eigent-ai",
+      "repo": "eigent",
+      "releaseType": "release"
+    }
+  ],
+  "icon": "build/icon.ico",
+  "afterPack": "./config/before-sign.cjs",
+  "afterSign": "./config/notarize.cjs",
+  "mac": {
+    "icon": "build/icon.icns",
+    "target": ["dmg", "zip"],
+    "entitlements": "entitlements.mac.plist",
+    "entitlementsInherit": "entitlements.mac.plist",
+    "hardenedRuntime": true,
+    "gatekeeperAssess": false,
+    "notarize": false,
+    "signIgnore": [
+      ".*\\.py$",
+      ".*\\.pyc$",
+      ".*\\.pyo$",
+      ".*\\.pyi$",
+      ".*\\.typed$",
+      ".*\\.txt$",
+      ".*\\.md$",
+      ".*\\.rst$",
+      ".*\\.json$",
+      ".*\\.yaml$",
+      ".*\\.yml$",
+      ".*\\.toml$",
+      ".*\\.cfg$",
+      ".*\\.ini$",
+      ".*\\.csv$",
+      ".*\\.html$",
+      ".*\\.css$",
+      ".*\\.map$"
+    ],
+    "extendInfo": {
+      "CFBundleLocalizations": [
+        "ar",
+        "de",
+        "en",
+        "es",
+        "fr",
+        "it",
+        "ja",
+        "ko",
+        "ru",
+        "zh-Hans",
+        "zh-Hant"
+      ],
+      "CFBundleURLTypes": [
+        {
+          "CFBundleURLName": "com.eigent.app",
+          "CFBundleURLSchemes": ["eigent"]
+        }
+      ]
+    }
+  },
+  "dmg": {
+    "background": "src/assets/dmg-background.png",
+    "window": {
+      "width": 660,
+      "height": 400
+    },
+    "iconSize": 128,
+    "contents": [
+      { "x": 180, "y": 200, "type": "file" },
+      { "x": 480, "y": 200, "type": "link", "path": "/Applications" }
+    ]
+  },
+  "win": {
+    "icon": "build/icon.ico",
+    "artifactName": "${productName}.Setup.${version}.exe",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ]
+  },
+  "linux": {
+    "icon": "build/icon.png",
+    "target": ["AppImage"],
+    "category": "Development"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowElevation": true,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false,
+    "installerIcon": "build/icon.ico",
+    "uninstallerIcon": "build/icon.ico",
+    "installerHeaderIcon": "build/icon.ico",
+    "include": "build/installer.nsh"
+  }
+}

@@ -1,0 +1,312 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <memory>
+#include <string>
+#include <zvec/core/interface/constants.h>
+#include <zvec/db/type.h>
+#include <zvec/export.h>
+
+namespace zvec {
+
+/*
+ * Query Index params
+ */
+class ZVEC_API QueryParams {
+ public:
+  using Ptr = std::shared_ptr<QueryParams>;
+
+  QueryParams(IndexType type) : type_(type) {}
+  virtual ~QueryParams() = default;
+
+  IndexType type() const {
+    return type_;
+  }
+
+  float radius() const {
+    return radius_;
+  }
+
+  void set_radius(float radius) {
+    radius_ = radius;
+  }
+
+  bool is_linear() const {
+    return is_linear_;
+  }
+
+  void set_is_linear(bool is_linear) {
+    is_linear_ = is_linear;
+  }
+
+  void set_is_using_refiner(bool is_using_refiner) {
+    is_using_refiner_ = is_using_refiner;
+  }
+  bool is_using_refiner() const {
+    return is_using_refiner_;
+  }
+
+  // Coarse candidate multiplier when refining. Zero selects the index-specific
+  // default (max(topk, ef) for graph indexes). Positive values below one use
+  // topk candidates. Ignored without refine.
+  float scale_factor() const {
+    return scale_factor_;
+  }
+
+  void set_scale_factor(float scale_factor) {
+    scale_factor_ = scale_factor;
+  }
+
+ private:
+  IndexType type_;
+  float radius_{0.0f};
+  bool is_linear_{false};
+
+  bool is_using_refiner_{false};
+  float scale_factor_{0.0f};
+};
+
+class ZVEC_API HnswQueryParams : public QueryParams {
+ public:
+  HnswQueryParams(
+      int ef = core_interface::kDefaultHnswEfSearch, float radius = 0.0f,
+      bool is_linear = false, bool is_using_refiner = false,
+      uint32_t prefetch_offset = core_interface::kDefaultPrefetchOffset,
+      uint32_t prefetch_lines = core_interface::kDefaultPrefetchLines,
+      float scale_factor = 0.0f)
+      : QueryParams(IndexType::HNSW),
+        ef_(ef),
+        prefetch_offset_(prefetch_offset),
+        prefetch_lines_(prefetch_lines) {
+    set_radius(radius);
+    set_is_linear(is_linear);
+    set_is_using_refiner(is_using_refiner);
+    set_scale_factor(scale_factor);
+  }
+
+  ~HnswQueryParams() override = default;
+
+  int ef() const {
+    return ef_;
+  }
+
+  void set_ef(int ef) {
+    ef_ = ef;
+  }
+
+  uint32_t prefetch_offset() const {
+    return prefetch_offset_;
+  }
+
+  void set_prefetch_offset(uint32_t prefetch_offset) {
+    prefetch_offset_ = prefetch_offset;
+  }
+
+  uint32_t prefetch_lines() const {
+    return prefetch_lines_;
+  }
+
+  void set_prefetch_lines(uint32_t prefetch_lines) {
+    prefetch_lines_ = prefetch_lines;
+  }
+
+ private:
+  int ef_;
+  uint32_t prefetch_offset_{core_interface::kDefaultPrefetchOffset};
+  uint32_t prefetch_lines_{core_interface::kDefaultPrefetchLines};
+};
+
+class ZVEC_API IVFQueryParams : public QueryParams {
+ public:
+  IVFQueryParams(int nprobe = 10, bool is_using_refiner = false,
+                 float scale_factor = 10)
+      : QueryParams(IndexType::IVF), nprobe_(nprobe) {
+    set_is_using_refiner(is_using_refiner);
+    set_scale_factor(scale_factor);
+  }
+
+  ~IVFQueryParams() override = default;
+
+  int nprobe() const {
+    return nprobe_;
+  }
+
+  void set_nprobe(int nprobe) {
+    nprobe_ = nprobe;
+  }
+
+ private:
+  int nprobe_;
+};
+
+class ZVEC_API HnswRabitqQueryParams : public QueryParams {
+ public:
+  HnswRabitqQueryParams(int ef = core_interface::kDefaultHnswEfSearch,
+                        float radius = 0.0f, bool is_linear = false,
+                        bool is_using_refiner = false,
+                        float scale_factor = 0.0f)
+      : QueryParams(IndexType::HNSW_RABITQ), ef_(ef) {
+    set_radius(radius);
+    set_is_linear(is_linear);
+    set_is_using_refiner(is_using_refiner);
+    set_scale_factor(scale_factor);
+  }
+
+  ~HnswRabitqQueryParams() override = default;
+
+  int ef() const {
+    return ef_;
+  }
+
+  void set_ef(int ef) {
+    ef_ = ef;
+  }
+
+ private:
+  int ef_;
+};
+
+class ZVEC_API IvfRabitqQueryParams : public QueryParams {
+ public:
+  IvfRabitqQueryParams(int nprobe = core_interface::kDefaultIvfRabitqNprobe,
+                       float radius = 0.0f, bool is_linear = false,
+                       bool is_using_refiner = false,
+                       float scale_factor = 10.0f)
+      : QueryParams(IndexType::IVF_RABITQ), nprobe_(nprobe) {
+    set_radius(radius);
+    set_is_linear(is_linear);
+    set_is_using_refiner(is_using_refiner);
+    set_scale_factor(scale_factor);
+  }
+
+  ~IvfRabitqQueryParams() override = default;
+
+  int nprobe() const {
+    return nprobe_;
+  }
+  void set_nprobe(int nprobe) {
+    nprobe_ = nprobe;
+  }
+
+ private:
+  int nprobe_;
+};
+
+class ZVEC_API FlatQueryParams : public QueryParams {
+ public:
+  FlatQueryParams(bool is_using_refiner = false, float scale_factor = 10)
+      : QueryParams(IndexType::FLAT) {
+    set_is_using_refiner(is_using_refiner);
+    set_scale_factor(scale_factor);
+  }
+
+  ~FlatQueryParams() override = default;
+};
+
+class ZVEC_API DiskAnnQueryParams : public QueryParams {
+ public:
+  DiskAnnQueryParams(int list_size = 300) : QueryParams(IndexType::DISKANN) {
+    set_list_size(list_size);
+  }
+
+  ~DiskAnnQueryParams() override = default;
+
+  int list_size() const {
+    return list_size_;
+  }
+
+  void set_list_size(int list_size) {
+    list_size_ = list_size;
+  }
+
+ private:
+  // list size: controls the size of the search frontier during graph traversal
+  // — larger values trade query latency for recall
+  int list_size_;
+};
+
+class ZVEC_API VamanaQueryParams : public QueryParams {
+ public:
+  VamanaQueryParams(
+      int ef_search = core_interface::kDefaultVamanaEfSearch,
+      float radius = 0.0f, bool is_linear = false,
+      bool is_using_refiner = false,
+      uint32_t prefetch_offset = core_interface::kDefaultPrefetchOffset,
+      uint32_t prefetch_lines = core_interface::kDefaultPrefetchLines,
+      float scale_factor = 0.0f)
+      : QueryParams(IndexType::VAMANA),
+        ef_search_(ef_search),
+        prefetch_offset_(prefetch_offset),
+        prefetch_lines_(prefetch_lines) {
+    set_radius(radius);
+    set_is_linear(is_linear);
+    set_is_using_refiner(is_using_refiner);
+    set_scale_factor(scale_factor);
+  }
+
+  ~VamanaQueryParams() override = default;
+
+  int ef_search() const {
+    return ef_search_;
+  }
+
+  void set_ef_search(int ef_search) {
+    ef_search_ = ef_search;
+  }
+
+  uint32_t prefetch_offset() const {
+    return prefetch_offset_;
+  }
+
+  void set_prefetch_offset(uint32_t prefetch_offset) {
+    prefetch_offset_ = prefetch_offset;
+  }
+
+  uint32_t prefetch_lines() const {
+    return prefetch_lines_;
+  }
+
+  void set_prefetch_lines(uint32_t prefetch_lines) {
+    prefetch_lines_ = prefetch_lines;
+  }
+
+ private:
+  int ef_search_;
+  uint32_t prefetch_offset_{core_interface::kDefaultPrefetchOffset};
+  uint32_t prefetch_lines_{core_interface::kDefaultPrefetchLines};
+};
+
+class ZVEC_API FtsQueryParams : public QueryParams {
+ public:
+  using Ptr = std::shared_ptr<FtsQueryParams>;
+
+  FtsQueryParams() : QueryParams(IndexType::FTS) {}
+  ~FtsQueryParams() override = default;
+
+  const std::string &default_operator() const {
+    return default_operator_;
+  }
+
+  void set_default_operator(const std::string &default_operator) {
+    default_operator_ = default_operator;
+  }
+
+ private:
+  // Default boolean operator for adjacent bare terms.
+  // Supported values (case-insensitive): "OR" (default), "AND".
+  std::string default_operator_;
+};
+
+}  // namespace zvec

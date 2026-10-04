@@ -1,0 +1,488 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include <cstdint>
+#include <cstring>
+#include <zvec/ailego/utility/float_helper.h>
+#include <zvec/core/framework/index_framework.h>
+#include <zvec/turbo/turbo.h>
+#include "utility/ordinal_access_holder.h"
+
+namespace zvec {
+namespace core {
+
+namespace {
+
+void Fp32ToFp16Fallback(const float *input, size_t dimension, void *output) {
+  ailego::FloatHelper::ToFP16(input, dimension,
+                              static_cast<uint16_t *>(output));
+}
+
+turbo::ConvertFunc ResolveFp16ConvertFunc() {
+  auto convert = turbo::get_convert_func(turbo::DataType::kFp16);
+  return convert ? convert : Fp32ToFp16Fallback;
+}
+
+}  // namespace
+
+/*! Half Float Holder
+ */
+class HalfFloatHolder : public IndexHolder, public OrdinalAccessHolder {
+ public:
+  class OrdinalReader : public OrdinalAccessHolder::Reader {
+   public:
+    OrdinalReader(IndexHolder::Pointer front,
+                  OrdinalAccessHolder::Reader::Pointer reader,
+                  turbo::ConvertFunc convert_func)
+        : front_(std::move(front)),
+          reader_(std::move(reader)),
+          convert_func_(convert_func) {}
+
+    int read(size_t ordinal, uint64_t *key, const void **data) override {
+      if (!key || !data) {
+        return IndexError_InvalidArgument;
+      }
+      *data = nullptr;
+      if (ordinal >= front_->count()) {
+        return IndexError_OutOfRange;
+      }
+      uint64_t source_key = 0;
+      const void *source_data = nullptr;
+      int ret = reader_->read(ordinal, &source_key, &source_data);
+      if (ret != 0) {
+        return ret;
+      }
+      if (!source_data) {
+        return IndexError_Runtime;
+      }
+
+      output_.resize(front_->dimension());
+      // SIMD conversion accepts unaligned loads, but scalar paths still need
+      // natural float alignment. Copy only byte-unaligned provider storage.
+      if (reinterpret_cast<uintptr_t>(source_data) % alignof(float) != 0) {
+        input_.resize(front_->dimension());
+        std::memcpy(input_.data(), source_data, input_.size() * sizeof(float));
+        source_data = input_.data();
+      }
+      // Consume reused provider storage before the next source read/reset.
+      convert_func_(static_cast<const float *>(source_data), output_.size(),
+                    output_.data());
+      *key = source_key;
+      *data = output_.data();
+      return 0;
+    }
+
+    void reset() override {
+      reader_->reset();
+      std::vector<float>().swap(input_);
+      std::vector<uint16_t>().swap(output_);
+    }
+
+   private:
+    // The source must outlive its reader, including reader destruction.
+    IndexHolder::Pointer front_;
+    OrdinalAccessHolder::Reader::Pointer reader_;
+    turbo::ConvertFunc convert_func_;
+    std::vector<float> input_{};
+    std::vector<uint16_t> output_{};
+  };
+
+  /*! Half Float Holder Iterator
+   */
+  class Iterator : public IndexHolder::Iterator {
+   public:
+    //! Index Holder Iterator Pointer
+    typedef std::unique_ptr<Iterator> Pointer;
+
+    //! Constructor
+    Iterator(const HalfFloatHolder *owner,
+             IndexHolder::Iterator::Pointer &&iter)
+        : owner_(owner),
+          buffer_(owner->dimension(), 0),
+          front_iter_(std::move(iter)) {
+      this->transform_record();
+    }
+
+    //! Destructor
+    ~Iterator() override = default;
+
+    //! Retrieve pointer of data
+    const void *data() const override {
+      return buffer_.data();
+    }
+
+    //! Test if the iterator is valid
+    bool is_valid() const override {
+      return this->status() == 0 && front_iter_->is_valid();
+    }
+
+    int status() const override {
+      return status_ != 0 ? status_ : front_iter_->status();
+    }
+
+    //! Retrieve primary key
+    uint64_t key() const override {
+      return front_iter_->key();
+    }
+
+    //! Next iterator
+    void next() override {
+      front_iter_->next();
+      this->transform_record();
+    }
+
+   private:
+    inline void transform_record() {
+      if (this->is_valid()) {
+        const auto *source = static_cast<const float *>(front_iter_->data());
+        status_ = front_iter_->status();
+        if (source == nullptr || status_ != 0) {
+          if (status_ == 0) status_ = IndexError_Runtime;
+          return;
+        }
+        owner_->convert_func_(source, buffer_.size(), buffer_.data());
+      }
+    }
+
+    const HalfFloatHolder *owner_{nullptr};
+    std::vector<uint16_t> buffer_{};
+    IndexHolder::Iterator::Pointer front_iter_{};
+    int status_{0};
+  };
+
+  //! Constructor
+  HalfFloatHolder(IndexHolder::Pointer front, turbo::ConvertFunc convert_func)
+      : front_(std::move(front)), convert_func_(convert_func) {}
+
+  //! Retrieve count of elements in holder (-1 indicates unknown)
+  size_t count() const override {
+    return front_->count();
+  }
+
+  //! Retrieve dimension
+  size_t dimension() const override {
+    return front_->dimension();
+  }
+
+  //! Retrieve type information
+  IndexMeta::DataType data_type() const override {
+    return IndexMeta::DataType::DT_FP16;
+  }
+
+  //! Retrieve element size in bytes
+  size_t element_size() const override {
+    return IndexMeta::ElementSizeof(IndexMeta::DataType::DT_FP16,
+                                    front_->dimension());
+  }
+
+  //! Retrieve if it can multi-pass
+  bool multipass() const override {
+    return front_->multipass();
+  }
+
+  //! Create a new iterator
+  IndexHolder::Iterator::Pointer create_iterator() override {
+    IndexHolder::Iterator::Pointer iter = front_->create_iterator();
+    return iter ? IndexHolder::Iterator::Pointer(
+                      new HalfFloatHolder::Iterator(this, std::move(iter)))
+                : IndexHolder::Iterator::Pointer();
+  }
+
+  int create_ordinal_reader(
+      OrdinalAccessHolder::Reader::Pointer *reader) override {
+    if (!reader) {
+      return IndexError_InvalidArgument;
+    }
+    auto *source = dynamic_cast<OrdinalAccessHolder *>(front_.get());
+    if (!source) {
+      return IndexError_NotImplemented;
+    }
+    OrdinalAccessHolder::Reader::Pointer source_reader;
+    int ret = source->create_ordinal_reader(&source_reader);
+    if (ret != 0) {
+      return ret;
+    }
+    if (!source_reader) {
+      return IndexError_Runtime;
+    }
+    // Do not replace the caller's reader unless creation fully succeeds.
+    reader->reset(
+        new OrdinalReader(front_, std::move(source_reader), convert_func_));
+    return 0;
+  }
+
+ public:
+  //! Disable them
+  HalfFloatHolder() = delete;
+
+ private:
+  //! Members
+  IndexHolder::Pointer front_{};
+  turbo::ConvertFunc convert_func_{nullptr};
+};
+
+/*! Half Float Converter
+ */
+class HalfFloatConverter : public IndexConverter {
+ public:
+  //! Destructor
+  ~HalfFloatConverter() override = default;
+
+  //! Initialize Converter
+  int init(const IndexMeta &mt, const ailego::Params &) override {
+    if (ailego_unlikely(mt.data_type() != IndexMeta::DataType::DT_FP32 ||
+                        mt.unit_size() != sizeof(float))) {
+      LOG_ERROR("Unsupported type %d with unit size %u.", mt.data_type(),
+                mt.unit_size());
+      return IndexError_Unsupported;
+    }
+
+    meta_ = mt;
+    convert_func_ = ResolveFp16ConvertFunc();
+    meta_.set_meta(IndexMeta::DataType::DT_FP16, mt.dimension());
+    meta_.set_converter("HalfFloatConverter", 0, ailego::Params());
+    meta_.set_reformer("HalfFloatReformer", 0, ailego::Params());
+    return 0;
+  }
+
+  //! Cleanup Converter
+  int cleanup() override {
+    return 0;
+  }
+
+  //! Train the data
+  int train(IndexHolder::Pointer) override {
+    return 0;
+  }
+
+  //! Transform the data
+  int transform(IndexHolder::Pointer holder) override {
+    if (holder->data_type() != IndexMeta::DataType::DT_FP32 ||
+        holder->dimension() != meta_.dimension()) {
+      return IndexError_Mismatch;
+    }
+    holder_ =
+        std::make_shared<HalfFloatHolder>(std::move(holder), convert_func_);
+    return 0;
+  }
+
+  //! Dump index into storage
+  int dump(const IndexDumper::Pointer &) override {
+    return 0;
+  }
+
+  //! Retrieve statistics
+  const Stats &stats() const override {
+    return stats_;
+  }
+
+  //! Retrieve a holder as result
+  IndexHolder::Pointer result() const override {
+    return holder_;
+  }
+
+  //! Retrieve Index Meta
+  const IndexMeta &meta() const override {
+    return meta_;
+  }
+
+ private:
+  IndexMeta meta_{};
+  IndexHolder::Pointer holder_{};
+  Stats stats_{};
+  turbo::ConvertFunc convert_func_{nullptr};
+};
+
+/*! Half Float Sparse Holder
+ */
+class HalfFloatSparseHolder : public IndexSparseHolder {
+ public:
+  /*! Half Float Holder Iterator
+   */
+  class Iterator : public IndexSparseHolder::Iterator {
+   public:
+    //! Index Holder Iterator Pointer
+    typedef std::unique_ptr<Iterator> Pointer;
+
+    //! Constructor
+    Iterator(const HalfFloatSparseHolder * /*owner*/,
+             IndexSparseHolder::Iterator::Pointer &&iter)
+        : sparse_buffer_(MAX_DIM_COUNT * sizeof(uint16_t), 0),
+          front_iter_(std::move(iter)) {
+      this->transform_record();
+    }
+
+    //! Destructor
+    ~Iterator() override = default;
+
+    //! Test if the iterator is valid
+    bool is_valid() const override {
+      return front_iter_->is_valid();
+    }
+
+    //! Retrieve primary key
+    uint64_t key() const override {
+      return front_iter_->key();
+    }
+
+    //! Retrieve sparse count
+    uint32_t sparse_count() const override {
+      return front_iter_->sparse_count();
+    }
+
+    //! Retrieve sparse indices
+    const uint32_t *sparse_indices() const override {
+      return front_iter_->sparse_indices();
+    }
+
+    //! Retrieve sparse data
+    const void *sparse_data() const override {
+      return sparse_buffer_.data();
+    }
+
+    //! Next iterator
+    void next() override {
+      front_iter_->next();
+      this->transform_record();
+    }
+
+   private:
+    inline void transform_record() {
+      if (front_iter_->is_valid()) {
+        ailego::FloatHelper::ToFP16(
+            reinterpret_cast<const float *>(front_iter_->sparse_data()),
+            front_iter_->sparse_count(), sparse_buffer_.data());
+      }
+    }
+
+    constexpr static uint32_t MAX_DIM_COUNT = 4096;
+    std::vector<uint16_t> sparse_buffer_{};
+
+    IndexSparseHolder::Iterator::Pointer front_iter_{};
+  };
+
+  //! Constructor
+  HalfFloatSparseHolder(IndexSparseHolder::Pointer front)
+      : front_(std::move(front)) {}
+
+  //! Retrieve count of elements in holder (-1 indicates unknown)
+  size_t count() const override {
+    return front_->count();
+  }
+
+  //! Retrieve type information
+  IndexMeta::DataType data_type() const override {
+    return IndexMeta::DataType::DT_FP16;
+  }
+
+  //! Retrieve if it can multi-pass
+  bool multipass() const override {
+    return front_->multipass();
+  }
+
+  //! Create a new iterator
+  IndexSparseHolder::Iterator::Pointer create_iterator() override {
+    IndexSparseHolder::Iterator::Pointer iter = front_->create_iterator();
+    return iter
+               ? IndexSparseHolder::Iterator::Pointer(
+                     new HalfFloatSparseHolder::Iterator(this, std::move(iter)))
+               : IndexSparseHolder::Iterator::Pointer();
+  }
+
+  size_t total_sparse_count() const override {
+    return front_->total_sparse_count();
+  }
+
+ public:
+  //! Disable them
+  HalfFloatSparseHolder() = delete;
+
+ private:
+  //! Members
+  IndexSparseHolder::Pointer front_{};
+};
+
+/*! Half Float Sparse Converter
+ */
+class HalfFloatSparseConverter : public IndexConverter {
+ public:
+  //! Destructor
+  ~HalfFloatSparseConverter() override = default;
+
+  //! Initialize Converter
+  int init(const IndexMeta &mt, const ailego::Params &) override {
+    if (ailego_unlikely(mt.data_type() != IndexMeta::DataType::DT_FP32 ||
+                        mt.unit_size() != sizeof(float))) {
+      LOG_ERROR("Unsupported type %d with unit size %u.", mt.data_type(),
+                mt.unit_size());
+      return IndexError_Unsupported;
+    }
+
+    meta_ = mt;
+    meta_.set_data_type(IndexMeta::DataType::DT_FP16);
+    meta_.set_converter("HalfFloatSparseConverter", 0, ailego::Params());
+    meta_.set_reformer("HalfFloatSparseReformer", 0, ailego::Params());
+    return 0;
+  }
+
+  //! Cleanup Converter
+  int cleanup() override {
+    return 0;
+  }
+
+  //! Train the data
+  int train(IndexSparseHolder::Pointer) override {
+    return 0;
+  }
+
+  //! Transform the data
+  int transform(IndexSparseHolder::Pointer holder) override {
+    if (holder->data_type() != IndexMeta::DataType::DT_FP32) {
+      return IndexError_Mismatch;
+    }
+
+    holder_ = std::make_shared<HalfFloatSparseHolder>(std::move(holder));
+    return 0;
+  }
+
+  //! Dump index into storage
+  int dump(const IndexDumper::Pointer &) override {
+    return 0;
+  }
+
+  //! Retrieve statistics
+  const Stats &stats() const override {
+    return stats_;
+  }
+
+  //! Retrieve a holder as result
+  IndexSparseHolder::Pointer sparse_result() const override {
+    return holder_;
+  }
+
+  //! Retrieve Index Sparse Meta
+  const IndexMeta &meta() const override {
+    return meta_;
+  }
+
+ private:
+  IndexMeta meta_{};
+  IndexSparseHolder::Pointer holder_{};
+  Stats stats_{};
+};
+
+INDEX_FACTORY_REGISTER_CONVERTER(HalfFloatConverter);
+INDEX_FACTORY_REGISTER_CONVERTER(HalfFloatSparseConverter);
+
+}  // namespace core
+}  // namespace zvec

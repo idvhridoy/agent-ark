@@ -1,0 +1,118 @@
+# Node Schemas
+
+*Node type definitions, Zod schema pattern, and how to create nodes in the scene.*
+
+Applies to: `packages/core/src/schema/**`.
+
+All node types are defined as Zod schemas in `packages/core/src/schema/nodes/`. Each schema extends `BaseNode` and exports both the schema and its inferred TypeScript type.
+
+**Sources**: `packages/core/src/schema/base.ts`, `packages/core/src/schema/nodes/`
+
+## BaseNode
+
+Every node shares these fields:
+
+```ts
+{
+  object: 'node'            // always literal 'node'
+  id: string                // typed ID e.g. "wall_abc123"
+  type: string              // node type discriminator e.g. "wall"
+  name?: string             // optional display name
+  parentId: string | null   // parent node ID; null = root
+  visible: boolean          // defaults to true
+  metadata: Record<string, unknown>  // arbitrary JSON, defaults to {}
+  provenance?: Provenance   // typed source ids and lineage; absent unless a writer sets it
+}
+```
+
+`provenance` (`packages/core/src/schema/provenance.ts`) records which source elements a node reproduces: `refs` of `{ ns?, id, role? }` (role `primary` when absent, or `piece`, `absorbed`, `alias`, `derived`) and an optional `lineage` (`op` plus the `fromIds` it was split, merged or copied from). An importer writes it; the editor only carries it. Its strings are printable ASCII, so the caps are UTF-8 bytes (32 refs, 32 lineage ids, 160-byte ids; an importer percent-encodes other characters). A write over a cap is refused, by the store and every validated writer, and nothing is truncated: load keeps an over-cap node as stored. Clones copy it verbatim today. A preset never keeps it: hosts serialise preset nodes through `withoutSourceIdentity` (`registry/subtree.ts`), which also drops every other `source` reference the reference inventory strips on preset.
+
+`visible: false` takes the node and everything beneath it out of the 2D plan and every export. `site` is the one exception: it is the parcel reference, so hiding it hides only its own ground fill and boundary, and the buildings on it keep their own flag. The rule lives in `hidesDescendants` (`packages/core/src/lib/node-visibility.ts`); `validate_scene` and Load Build warn when a Site is hidden.
+
+## Defining a New Node Type
+
+```ts
+// packages/core/src/schema/nodes/my-node.ts
+import { z } from 'zod'
+import { BaseNode, objectId, nodeType } from '../base'
+
+export const MyNode = BaseNode.extend({
+  id: objectId('my-node'),      // generates IDs like "my-node_abc123"
+  type: nodeType('my-node'),    // sets literal type discriminator
+  // add node-specific fields:
+  width: z.number().default(1),
+  label: z.string().optional(),
+}).describe('My node — one-line description of what it represents')
+
+export type MyNode = z.infer<typeof MyNode>
+export type MyNodeId = MyNode['id']
+```
+
+Then add `MyNode` to the `AnyNode` union in `packages/core/src/schema/types.ts`.
+
+## Creating Nodes in Tools
+
+Always use `.parse()` to validate and generate a proper typed ID. Never construct a plain object manually.
+
+```ts
+import { WallNode } from '@pascal-app/core'
+import { useScene } from '@pascal-app/core'
+
+// 1. Parse validates and fills defaults (including auto-generated id)
+const wall = WallNode.parse({ name: 'Wall 1', start: [0, 0], end: [5, 0] })
+
+// 2. createNode(node, parentId?) inserts it into the scene
+const { createNode } = useScene.getState()
+createNode(wall, levelId)
+```
+
+For batch creation:
+
+```ts
+const { createNodes } = useScene.getState()
+createNodes([
+  { node: WallNode.parse({ start: [0, 0], end: [5, 0] }), parentId: levelId },
+  { node: WallNode.parse({ start: [5, 0], end: [5, 4] }), parentId: levelId },
+])
+```
+
+## Updating Nodes
+
+```ts
+const { updateNode } = useScene.getState()
+updateNode(wall.id, { height: 2.8 })   // partial update, merges with existing
+```
+
+`parseUpdatedNode` preserves the current `children` array when the patch omits
+`children`, including when a built-in or strict registered schema strips the field.
+This protects graph links through single, batch and atomic updates. An explicit
+`children` patch still follows the schema and existing removal semantics. This
+update safeguard does not change direct schema parsing or load migrations.
+
+Slabs are floor supports, not surface-host parents: floor nodes remain level
+children with `supportSlabId`. The shared surface resolver defers slab hits to
+floor placement without producing a refusal that would block the grid event.
+
+## Schema Evolution & Backward Compatibility
+
+Saved scenes are persisted JSON parsed back through `AnyNode` at load (`SceneState.setScene` → `migrateNodes` → `markDirty`, in `packages/core/src/store/use-scene.ts`). Any change to an existing node's properties must keep older saved scenes loadable — a scene written months ago must still parse and render.
+
+- **Adding a field** → give it a Zod `.default(...)` (or `.optional()`). `AnyNode.parse` then fills it for legacy nodes that lack it. A required field with no default makes every pre-existing scene fail validation.
+- **Renaming, removing, or retyping a field** → a `.default()` is not enough; it silently drops the old value. Add an entry to `migrateNodes` (`use-scene.ts`) that reads the legacy shape and rewrites it to the new one *before* parse. This is also where structural changes go (splitting one material into interior/exterior, deriving `pitch` from a legacy `roofHeight`, seeding `children: []` on a new host kind).
+- **Bumping `schemaVersion`** on the `NodeDefinition` records that a kind's shape changed. The per-kind `def.migrate` map is reserved for future use; today all load-time migration is centralised in `migrateNodes`.
+
+When in doubt, load an old scene (or a fixture) after the change and confirm it still parses and renders.
+
+## Real Examples
+
+- **Simple geometry node**: `packages/core/src/schema/nodes/wall.ts` — `start`, `end`, `thickness`, `height`
+- **Polygon node**: `packages/core/src/schema/nodes/slab.ts` — `polygon: [number, number][]`, `holes`
+- **Positioned node**: `packages/core/src/schema/nodes/item.ts` — `position`, `rotation`, `scale`, `asset`
+
+## Rules
+
+- **Always use `.parse()`** — it generates the correct ID prefix and fills defaults. `WallNode.parse({...})` not `{ type: 'wall', id: '...' }`.
+- **Never hardcode IDs.** Let `objectId('type')` generate them.
+- **Add new node types to `AnyNode`** in `types.ts` or they won't be accepted by the store.
+- **Keep schemas in `packages/core`**, not in the viewer or editor — the schema is shared by all packages.
+- **Never break old scenes.** New fields get a `.default()`; renames/removals/retypes get a `migrateNodes` entry. See *Schema Evolution & Backward Compatibility* above.

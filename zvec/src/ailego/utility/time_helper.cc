@@ -1,0 +1,254 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <zvec/ailego/utility/time_helper.h>
+
+#if defined(_WIN64) || defined(_WIN32)
+#include <Windows.h>
+#endif
+
+namespace zvec {
+namespace ailego {
+
+#if defined(_WIN64) || defined(_WIN32)
+uint64_t Monotime::NanoSeconds() {
+  LARGE_INTEGER stamp, freq;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&stamp);
+  return (uint64_t)((double)stamp.QuadPart *
+                    (1000000000.0 / (double)freq.QuadPart));
+}
+
+uint64_t Monotime::MicroSeconds() {
+  LARGE_INTEGER stamp, freq;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&stamp);
+  return (stamp.QuadPart * 1000000u / freq.QuadPart);
+}
+
+uint64_t Monotime::MilliSeconds() {
+  LARGE_INTEGER stamp, freq;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&stamp);
+  return (stamp.QuadPart * 1000u / freq.QuadPart);
+}
+
+uint64_t Monotime::Seconds() {
+  LARGE_INTEGER stamp, freq;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&stamp);
+  return (stamp.QuadPart / freq.QuadPart);
+}
+
+// January 1, 1970 (start of Unix epoch) in "ticks"
+#define UNIX_TIME_START 0x019DB1DED53E8000ull
+
+uint64_t Realtime::NanoSeconds() {
+  LARGE_INTEGER stamp;
+  FILETIME file;
+  GetSystemTimeAsFileTime(&file);
+  stamp.HighPart = file.dwHighDateTime;
+  stamp.LowPart = file.dwLowDateTime;
+  return (stamp.QuadPart - UNIX_TIME_START) * 100u;
+}
+
+uint64_t Realtime::MicroSeconds() {
+  LARGE_INTEGER stamp;
+  FILETIME file;
+  GetSystemTimeAsFileTime(&file);
+  stamp.HighPart = file.dwHighDateTime;
+  stamp.LowPart = file.dwLowDateTime;
+  return (stamp.QuadPart - UNIX_TIME_START) / 10u;
+}
+
+uint64_t Realtime::MilliSeconds() {
+  LARGE_INTEGER stamp;
+  FILETIME file;
+  GetSystemTimeAsFileTime(&file);
+  stamp.HighPart = file.dwHighDateTime;
+  stamp.LowPart = file.dwLowDateTime;
+  return (stamp.QuadPart - UNIX_TIME_START) / 10000u;
+}
+
+uint64_t Realtime::Seconds() {
+  LARGE_INTEGER stamp;
+  FILETIME file;
+  GetSystemTimeAsFileTime(&file);
+  stamp.HighPart = file.dwHighDateTime;
+  stamp.LowPart = file.dwLowDateTime;
+  return (stamp.QuadPart - UNIX_TIME_START) / 10000000u;
+}
+
+size_t Realtime::Localtime(uint64_t stamp, const char *format, char *buf,
+                           size_t len) {
+  time_t val = static_cast<time_t>(stamp);
+  return strftime(buf, len, format, localtime(&val));
+}
+
+size_t Realtime::Gmtime(uint64_t stamp, const char *format, char *buf,
+                        size_t len) {
+  time_t val = static_cast<time_t>(stamp);
+  return strftime(buf, len, format, gmtime(&val));
+}
+
+size_t Realtime::Localtime(const char *format, char *buf, size_t len) {
+  time_t now = time(0);
+  return strftime(buf, len, format, localtime(&now));
+}
+
+size_t Realtime::Gmtime(const char *format, char *buf, size_t len) {
+  time_t now = time(0);
+  return strftime(buf, len, format, gmtime(&now));
+}
+
+namespace {
+
+uint64_t FileTimeToTicks(FILETIME file_time) {
+  ULARGE_INTEGER value;
+  value.LowPart = file_time.dwLowDateTime;
+  value.HighPart = file_time.dwHighDateTime;
+  return value.QuadPart;
+}
+
+uint64_t CurrentThreadCpuTime100NanoSeconds() {
+  FILETIME creation_time;
+  FILETIME exit_time;
+  FILETIME kernel_time;
+  FILETIME user_time;
+  if (!GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time,
+                      &kernel_time, &user_time)) {
+    return 0;
+  }
+  return FileTimeToTicks(kernel_time) + FileTimeToTicks(user_time);
+}
+
+}  // namespace
+
+uint64_t CPUtime::NanoSeconds() {
+  return CurrentThreadCpuTime100NanoSeconds() * 100u;
+}
+
+uint64_t CPUtime::MicroSeconds() {
+  return CurrentThreadCpuTime100NanoSeconds() / 10u;
+}
+
+uint64_t CPUtime::MilliSeconds() {
+  return CurrentThreadCpuTime100NanoSeconds() / 10000u;
+}
+
+uint64_t CPUtime::Seconds() {
+  return CurrentThreadCpuTime100NanoSeconds() / 10000000u;
+}
+#else
+uint64_t Monotime::NanoSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_MONOTONIC, &tspec);
+  return (tspec.tv_sec * 1000000000u + tspec.tv_nsec);
+}
+
+uint64_t Monotime::MicroSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_MONOTONIC, &tspec);
+  return (tspec.tv_sec * 1000000u + tspec.tv_nsec / 1000u);
+}
+
+uint64_t Monotime::MilliSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_MONOTONIC, &tspec);
+  return (tspec.tv_sec * 1000u + tspec.tv_nsec / 1000000u);
+}
+
+uint64_t Monotime::Seconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_MONOTONIC, &tspec);
+  return (tspec.tv_sec);
+}
+
+uint64_t Realtime::NanoSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_REALTIME, &tspec);
+  return (tspec.tv_sec * 1000000000u + tspec.tv_nsec);
+}
+
+uint64_t Realtime::MicroSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_REALTIME, &tspec);
+  return (tspec.tv_sec * 1000000u + tspec.tv_nsec / 1000u);
+}
+
+uint64_t Realtime::MilliSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_REALTIME, &tspec);
+  return (tspec.tv_sec * 1000u + tspec.tv_nsec / 1000000u);
+}
+
+uint64_t Realtime::Seconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_REALTIME, &tspec);
+  return (tspec.tv_sec);
+}
+
+size_t Realtime::Localtime(uint64_t stamp, const char *format, char *buf,
+                           size_t len) {
+  struct tm tmbuf;
+  time_t val = static_cast<time_t>(stamp);
+  return strftime(buf, len, format, localtime_r(&val, &tmbuf));
+}
+
+size_t Realtime::Gmtime(uint64_t stamp, const char *format, char *buf,
+                        size_t len) {
+  struct tm tmbuf;
+  time_t val = static_cast<time_t>(stamp);
+  return strftime(buf, len, format, gmtime_r(&val, &tmbuf));
+}
+
+size_t Realtime::Localtime(const char *format, char *buf, size_t len) {
+  struct tm tmbuf;
+  time_t now = time(nullptr);
+  return strftime(buf, len, format, localtime_r(&now, &tmbuf));
+}
+
+size_t Realtime::Gmtime(const char *format, char *buf, size_t len) {
+  struct tm tmbuf;
+  time_t now = time(nullptr);
+  return strftime(buf, len, format, gmtime_r(&now, &tmbuf));
+}
+
+uint64_t CPUtime::NanoSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tspec);
+  return (tspec.tv_sec * 1000000000u + tspec.tv_nsec);
+}
+
+uint64_t CPUtime::MicroSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tspec);
+  return (tspec.tv_sec * 1000000u + tspec.tv_nsec / 1000u);
+}
+
+uint64_t CPUtime::MilliSeconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tspec);
+  return (tspec.tv_sec * 1000u + tspec.tv_nsec / 1000000u);
+}
+
+uint64_t CPUtime::Seconds() {
+  struct timespec tspec;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tspec);
+  return (tspec.tv_sec);
+}
+#endif  // _WIN64 || _WIN32
+
+}  // namespace ailego
+}  // namespace zvec

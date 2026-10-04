@@ -1,0 +1,242 @@
+---
+title: "Sharing your resume publicly"
+description: "Publish your resume at a public URL, share it with recruiters, track views and downloads, and optionally protect it with a password."
+---
+
+Reactive Resume can publish your resume at a **public URL**. Anyone with the link can open it, so you can send it to recruiters, collaborators, or people visiting your portfolio. Public resume URLs are not search-indexed by default.
+
+## What public sharing gives you
+
+<CardGroup cols={2}>
+  <Card title="Always up-to-date" icon="arrows-rotate">
+    Viewers always see the latest version of your resume. No need to send new files when you make updates.
+  </Card>
+  <Card title="Track engagement" icon="chart-line">
+    See public view counters in the builder.
+  </Card>
+  <Card title="Password protection" icon="lock">
+    Optionally require a password so only people you trust can access your resume.
+  </Card>
+  <Card title="Easy to share" icon="share">
+    One URL you can paste into an email signature, LinkedIn, a portfolio, or a job application.
+  </Card>
+</CardGroup>
+
+## How to enable public sharing
+
+<Steps>
+  <Step title="Open your resume in the builder">
+    Navigate to your resume in the resume builder.
+  </Step>
+
+<Step title="Go to the Sharing section">In the **right sidebar**, select **Sharing**.</Step>
+
+<Step title="Toggle 'Allow Public Access'">
+  Turn on the **Allow Public Access** switch. Your resume is then reachable at its public URL.
+
+  <Frame caption="Sharing section in the resume builder">
+    <img
+      src="/images/guides/sharing-your-resume-publicly/screenshot-1.webp"
+      alt="Sharing section showing the public access control"
+    />
+  </Frame>
+</Step>
+
+  <Step title="Copy your public URL">
+    Your public URL is displayed below the toggle. It follows this format:
+
+    ```
+    https://rxresu.me/{username}/{slug}
+    ```
+
+    Click the **copy** button to copy the URL to your clipboard.
+
+  </Step>
+</Steps>
+
+<Tip>
+  The `{slug}` is the unique, URL-safe name you assign to your resume when you create it. If you want to change your
+  slug, go to the dashboard, right-click your resume card, and choose "Update" to edit its details.
+</Tip>
+
+## How the public URL works
+
+When someone visits your public resume URL:
+
+1. They see the live version. The page renders your current resume data, including your latest changes.
+2. No account is required. Visitors don't need a Reactive Resume account to view or download your resume.
+3. They can download a PDF. The public page shows an identity header with your name, headline, and picture, plus a **Download PDF** action.
+4. Link previews work. Reactive Resume generates per-resume Open Graph and Twitter card previews, so links you paste into LinkedIn, Slack, iMessage, and similar apps show your name and headline instead of a generic placeholder.
+5. Views are tracked. Visits are counted in your resume statistics (see below).
+
+<Info>
+  Changes you make in the builder show up immediately on the public URL. There is no separate "publish" step. Treat the
+  link as something you send to people directly, not as a search profile page.
+</Info>
+
+## Resume language
+
+Set **Page → Language** in the builder's right sidebar to choose the language of default section headings. Public visitors and PDF downloads use this saved resume language, even when the visitor's app interface uses another language. Section titles you rename remain as written.
+
+The interface language selected in Preferences is stored in the current browser. It does not change the resume's language or sync to other browsers.
+
+## Tracking public engagement
+
+When your resume is public, Reactive Resume counts public views, so you can tell whether people are opening the link you shared.
+
+### Where to find statistics
+
+In the resume builder, open the **right sidebar** and select **Statistics**.
+
+You'll see public view information such as:
+
+| Metric              | Description                                                      |
+| ------------------- | ---------------------------------------------------------------- |
+| **Views**           | Number of times your public resume page was visited              |
+| **Downloads**       | Number of times a visitor downloaded your resume as a PDF        |
+| **Last viewed**     | The date when your resume was last viewed                        |
+
+Each metric also shows a 30-day sparkline and the change against the previous period, so you can see whether interest rose or fell after you shared the link.
+
+<Info>
+  Statistics are only shown after public sharing is enabled. If you turn off public access, existing stats are
+  preserved.
+</Info>
+
+### What counts as a view?
+
+A view is counted each time someone loads your public resume page. This includes:
+
+- Direct visits to your public URL
+- Clicks from links you've shared
+
+Owner self-visits while you are signed in to your account are not included in the view statistics.
+
+<Note>
+  Only **you** can see your resume's view statistics. Visitors to your public URL cannot see how many views your resume
+  has.
+</Note>
+
+## Password protecting your resume
+
+To share your resume with specific people while keeping it away from everyone else, add password protection.
+
+When password protection is enabled:
+
+- Visitors must enter the correct password to view your resume
+- The password prompt appears before any resume content is shown
+- You can share the password separately with trusted individuals
+
+### How to set a password
+
+<Steps>
+  <Step title="Enable public access">
+    First, make sure **Allow Public Access** is turned on in the **Sharing** section.
+  </Step>
+
+<Step title="Click Set Password">Below the public URL, click **Set Password**.</Step>
+
+<Step title="Enter your password">
+  Type a password (6-64 characters) and confirm it. Viewers have to enter this password to see your resume.
+</Step>
+
+  <Step title="Share the password separately">
+    Share the password with your intended audience through a secure channel (e.g., direct message, email).
+  </Step>
+</Steps>
+
+<Warning>
+  Choose a password you're comfortable sharing. Anyone with the password can view and download your resume.
+</Warning>
+
+### How to remove password protection
+
+If you no longer need password protection:
+
+1. Go to the **Sharing** section in the right sidebar
+2. Click **Remove Password**
+3. Confirm the action
+
+Your resume is then open to anyone with the public URL.
+
+## Use cases for public sharing
+
+<AccordionGroup>
+  <Accordion title="LinkedIn profile" icon="linkedin">
+    Add your public resume URL to your LinkedIn profile's **Featured** section or **Contact Info**. Recruiters can view your detailed resume directly.
+  </Accordion>
+
+<Accordion title="Email signature" icon="envelope">
+  Include your resume link in your email signature, so anyone you write to can open it.
+</Accordion>
+
+<Accordion title="Portfolio website" icon="globe">
+  Embed or link to your resume from your personal website. The link always shows your latest resume.
+</Accordion>
+
+<Accordion title="Job applications" icon="briefcase">
+  Some applications accept a link to your resume, while others require a file upload. Use the public URL when a link is
+  accepted, and export a PDF when an upload is required.
+</Accordion>
+
+<Accordion title="Networking events" icon="users">
+  Share your resume URL via QR code or NFC. Update the resume before the event and everyone gets the current version.
+</Accordion>
+
+  <Accordion title="Confidential job search" icon="lock">
+    Use password protection to share your resume only with specific recruiters while keeping it hidden from your current employer.
+  </Accordion>
+</AccordionGroup>
+
+## Turning off public access
+
+To make your resume private again:
+
+1. Go to the **Sharing** section in the right sidebar
+2. Turn off the **Allow Public Access** switch
+
+When public access is disabled:
+
+- Your public URL returns a "not found" error
+- Existing links stop working immediately
+- Your statistics are preserved (they'll resume if you re-enable public access)
+- Password protection settings are preserved
+
+<Tip>
+  To hide your resume temporarily, use password protection instead of turning off public access. The URL stays active
+  for people who have the password.
+</Tip>
+
+## Copying the URL from the builder dock
+
+The builder dock has a **Copy URL** shortcut. It copies the same public URL shown in the **Sharing** section.
+
+<Warning>
+  Copying the URL does not enable public access. Turn on **Allow Public Access** in the **Sharing** section before sending
+  the link to someone else.
+</Warning>
+
+## Frequently asked questions
+
+<AccordionGroup>
+  <Accordion title="Can I customize my public URL?">
+    Yes. The URL is based on your **username** and the resume's **slug**. You can change the slug in the **Update Resume** dialog. To open it, right-click your resume card in the dashboard and select "Update". The username is set in your account settings.
+  </Accordion>
+
+<Accordion title="Are public resumes meant to be search-indexed pages?">
+  No. By default, public resume URLs are meant for human recipients who receive the link from you, not as search profile
+  pages. If you want tighter access control, use password protection or keep your resume private.
+</Accordion>
+
+<Accordion title="Do views from my own visits count?">
+  No. If you are signed in as the owner, your own visits are excluded from the view statistics.
+</Accordion>
+
+<Accordion title="Can I see who viewed my resume?">
+  No, Reactive Resume tracks public view counts, not the identity of visitors. This protects visitor privacy.
+</Accordion>
+
+  <Accordion title="What happens if I change my username?">
+    Your public URL changes to match the new username, and the old URLs stop working immediately. Update any links you have already shared.
+  </Accordion>
+</AccordionGroup>

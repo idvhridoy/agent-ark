@@ -1,0 +1,70 @@
+{
+  "name": "marketplace",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/marketplace",
+  "projectType": "application",
+  "tags": [],
+  "targets": {
+    "generate-data": {
+      "dependsOn": ["@tech-leads-club/skills-catalog:generate-registry"],
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsx scripts/generate-data.ts",
+        "cwd": "packages/marketplace"
+      }
+    },
+    "build": {
+      "dependsOn": ["generate-data"],
+      "executor": "@nx/next:build",
+      "outputs": ["{projectRoot}/.next"],
+      "options": {
+        "outputPath": "packages/marketplace/.next"
+      }
+    },
+    "export": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "packages/marketplace",
+        "commands": ["next build"]
+      },
+      "dependsOn": ["generate-data"]
+    },
+    "dev": {
+      "executor": "@nx/next:server",
+      "defaultConfiguration": "development",
+      "options": {
+        "buildTarget": "marketplace:build",
+        "dev": true,
+        "port": 3000,
+        "turbopack": false
+      },
+      "configurations": {
+        "development": {
+          "buildTarget": "marketplace:build:development",
+          "dev": true
+        },
+        "production": {
+          "buildTarget": "marketplace:build:production",
+          "dev": false
+        }
+      },
+      "dependsOn": ["generate-data"]
+    },
+    "test": {
+      "executor": "@nx/jest:jest",
+      "outputs": ["{workspaceRoot}/coverage/packages/marketplace"],
+      "options": {
+        "jestConfig": "packages/marketplace/jest.config.ts",
+        "passWithNoTests": false
+      }
+    },
+    "seo-smoke": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["export"],
+      "options": {
+        "cwd": "packages/marketplace",
+        "commands": ["node scripts/seo-smoke.mjs"]
+      }
+    }
+  }
+}

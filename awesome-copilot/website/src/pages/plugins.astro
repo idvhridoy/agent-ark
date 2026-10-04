@@ -1,0 +1,30 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { PluginsCatalog } from "../components/brand/PluginsCatalog";
+import { plugins, searchIndex } from "../lib/site-data";
+
+// The prototype exposes a fixed tag rail. Real data has a long tail of tags, so
+// surface the most-used ones to keep each filter group usefully populated.
+const tagCounts = new Map<string, number>();
+for (const plugin of plugins as { tags?: string[] }[]) {
+  for (const tag of plugin.tags ?? []) {
+    tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+  }
+}
+const tags = [...tagCounts.entries()]
+  .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  .slice(0, 12)
+  .map(([tag]) => tag);
+---
+
+<BaseLayout
+  title="Plugins | Awesome GitHub Copilot"
+  description="Browse community-contributed plugins for GitHub Copilot."
+>
+  <PluginsCatalog
+    client:load
+    plugins={plugins as any}
+    tags={tags}
+    searchIndex={searchIndex}
+  />
+</BaseLayout>

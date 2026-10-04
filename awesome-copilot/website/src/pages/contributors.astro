@@ -1,0 +1,45 @@
+---
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+import BaseLayout from "../layouts/BaseLayout.astro";
+import {
+  ContributorsPage,
+  type Contributor,
+} from "../components/brand/ContributorsPage";
+import { searchIndex } from "../lib/site-data";
+
+// `.all-contributorsrc` at the repository root is the same source the website
+// data generator uses, so the page never drifts from the generated data.
+// Resolved from the working directory rather than `import.meta.url`, which is
+// unreliable once this module is bundled during a production build.
+const rcPath = path.resolve(process.cwd(), "..", ".all-contributorsrc");
+const rc = JSON.parse(readFileSync(rcPath, "utf8")) as {
+  contributors: {
+    login: string;
+    name?: string;
+    avatar_url: string;
+    profile: string;
+  }[];
+};
+
+const contributors: Contributor[] = rc.contributors
+  .map((entry) => ({
+    login: entry.login,
+    name: entry.name?.trim() || entry.login,
+    avatarUrl: entry.avatar_url,
+    profileUrl: entry.profile,
+  }))
+  .sort((a, b) => a.login.localeCompare(b.login, "en", { sensitivity: "base" }));
+---
+
+<BaseLayout
+  title="Contributors | Awesome GitHub Copilot"
+  description="The people who build the Awesome GitHub Copilot community library."
+>
+  <ContributorsPage
+    client:load
+    contributors={contributors}
+    searchIndex={searchIndex}
+  />
+</BaseLayout>

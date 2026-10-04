@@ -1,0 +1,348 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+interface IpcRenderer {
+  on: (
+    channel: string,
+    listener: (event: unknown, ...args: any[]) => void
+  ) => void;
+  off: (
+    channel: string,
+    listener: (event: unknown, ...args: any[]) => void
+  ) => void;
+  send: (channel: string, ...args: any[]) => void;
+  invoke: (channel: string, ...args: any[]) => Promise<any>;
+  removeAllListeners: (channel: string) => void;
+}
+
+type LocalPathActionResult =
+  { success: true } | { success: false; error: string };
+
+interface ElectronAPI {
+  closeWindow: (isForceQuit?: boolean) => void;
+  minimizeWindow: () => void;
+  toggleMaximizeWindow: () => void;
+  isFullScreen: () => Promise<boolean>;
+  selectFile: (options?: any) => Promise<{
+    success: boolean;
+    files?: Array<{
+      filePath: string;
+      fileName: string;
+    }>;
+    fileCount?: number;
+    canceled?: boolean;
+  }>;
+  /**
+   * Trusted user gesture for selecting an Agent Plugins standard directory
+   * or archive. The path is accepted only by local Brain import endpoints and
+   * must never be persisted in a Bundle or Cloud projection.
+   */
+  selectAgentPluginSource?: () => Promise<{
+    canceled: boolean;
+    source_path?: string;
+    display_name?: string;
+    source_kind?: 'directory' | 'archive';
+  }>;
+  processDroppedFiles: (
+    fileData: Array<{ name: string; path?: string }>
+  ) => Promise<{
+    success: boolean;
+    files?: Array<{
+      filePath: string;
+      fileName: string;
+    }>;
+    error?: string;
+  }>;
+  getPathForFile: (file: File) => string;
+  savePastedFile: (
+    fileName: string,
+    data: ArrayBuffer
+  ) => Promise<{
+    success: boolean;
+    filePath?: string;
+    fileName?: string;
+    error?: string;
+  }>;
+  onAppCommand: (
+    callback: (command: import('@/shared/appCommands').AppCommandId) => void
+  ) => () => void;
+  onCloseRequest: (
+    callback: (
+      request: import('@/shared/windowClose').WindowCloseRequest
+    ) => void
+  ) => () => void;
+  respondToCloseRequest: (
+    response: import('@/shared/windowClose').WindowCloseResponse
+  ) => void;
+  getPlatform: () => string;
+  getHomeDir: () => Promise<string>;
+  createWebView: (id: string, url: string) => Promise<any>;
+  hideWebView: (id: string) => Promise<any>;
+  changeViewSize: (id: string, size: any) => Promise<any>;
+  onWebviewNavigated: (
+    callback: (id: string, url: string) => void
+  ) => () => void;
+  showWebview: (id: string) => Promise<any>;
+  getActiveWebview: () => Promise<any>;
+  setSize: (size: any) => Promise<any>;
+  hideAllWebview: () => Promise<any>;
+  getShowWebview: () => Promise<any>;
+  webviewDestroy: (webviewId: string) => Promise<any>;
+  exportLog: () => Promise<{
+    success: boolean;
+    savedPath?: string;
+    data?: string;
+    error?: string;
+  }>;
+  exportCamelLog: (
+    email: string,
+    taskId?: string,
+    projectId?: string,
+    userId?: string | number | null
+  ) => Promise<{
+    success: boolean;
+    savedPath?: string;
+    error?: string;
+  }>;
+  getDiagnosticsInfo: () => Promise<{
+    version: string;
+    platform: string;
+    arch: string;
+  }>;
+  exportDiagnosticsZip: (payload: {
+    description: string;
+    steps?: string;
+  }) => Promise<{
+    success: boolean;
+    savedPath?: string;
+    error?: string;
+  }>;
+  openMailto: (url: string) => Promise<{
+    success: boolean;
+    error?: string;
+  }>;
+  openExternal: (url: string) => Promise<{
+    success: boolean;
+    error?: string;
+  }>;
+  mcpInstall: (name: string, mcp: any) => Promise<any>;
+  mcpRemove: (name: string) => Promise<any>;
+  mcpUpdate: (name: string, mcp: any) => Promise<any>;
+  mcpList: () => Promise<any>;
+  envWrite: (email: string, kv: { key: string; value: string }) => Promise<any>;
+  envRemove: (email: string, key: string) => Promise<any>;
+  getEnvPath: (email: string) => Promise<string>;
+  workspaceSecretPut: (request: {
+    account_scope_digest: string;
+    space_id: string;
+    revision_id: string;
+    slot_id: string;
+    value: string;
+  }) => Promise<{
+    secret_ref: string;
+    account_scope_digest: string;
+    space_id: string;
+    revision_id: string;
+    slot_id: string;
+    state: 'available';
+    created_at?: string;
+    updated_at?: string;
+  }>;
+  workspaceSecretStatus: (request: {
+    secret_ref: string;
+    account_scope_digest: string;
+    space_id: string;
+    revision_id: string;
+    slot_id: string;
+  }) => Promise<{
+    secret_ref: string;
+    account_scope_digest: string;
+    space_id: string;
+    revision_id: string;
+    slot_id: string;
+    state: 'available' | 'missing' | 'needs_rebind';
+    created_at?: string;
+    updated_at?: string;
+  }>;
+  workspaceSecretDelete: (request: {
+    secret_ref: string;
+    account_scope_digest: string;
+    space_id: string;
+    revision_id: string;
+    slot_id: string;
+  }) => Promise<{
+    secret_ref: string;
+    account_scope_digest: string;
+    space_id: string;
+    revision_id: string;
+    slot_id: string;
+    state: 'missing';
+  }>;
+  executeCommand: (
+    command: string,
+    email: string
+  ) => Promise<{
+    success: boolean;
+    stdout?: string;
+    stderr?: string;
+    error?: string;
+  }>;
+  readFile: (filePath: string) => Promise<any>;
+  readFileAsDataUrl: (path: string) => Promise<string>;
+  reviewListBackups: (filePaths: string[]) => Promise<
+    Array<{
+      path: string;
+      exists: boolean;
+      size: number | null;
+      backups: Array<{ path: string; size: number }>;
+    }>
+  >;
+  deleteFolder: (email: string) => Promise<any>;
+  getMcpConfigPath: (email: string) => Promise<string>;
+  uploadLog: (
+    email: string,
+    taskId: string,
+    baseUrl: string,
+    token: string
+  ) => Promise<any>;
+  startBrowserImport: (args?: any) => Promise<any>;
+  checkAndInstallDepsOnUpdate: () => Promise<{
+    success: boolean;
+    error?: string;
+  }>;
+  checkInstallBrowser: () => Promise<{ data: any[] }>;
+  getInstallationStatus: () => Promise<{
+    success: boolean;
+    isInstalling?: boolean;
+    hasLockFile?: boolean;
+    installedExists?: boolean;
+    timestamp?: number;
+    error?: string;
+  }>;
+  getBackendPort: () => Promise<number | null>;
+  getLocalControlCapability: () => Promise<string>;
+  getDesktopInstanceId: (legacyRendererId?: string) => Promise<string>;
+  restartBackend: () => Promise<{ success: boolean; error?: string }>;
+  onInstallDependenciesStart: (callback: () => void) => void;
+  onInstallDependenciesLog: (
+    callback: (data: { type: string; data: string }) => void
+  ) => void;
+  onInstallDependenciesComplete: (
+    callback: (data: {
+      success: boolean;
+      code?: number;
+      error?: string;
+    }) => void
+  ) => void;
+  onUpdateNotification: (
+    callback: (data: {
+      type: string;
+      currentVersion: string;
+      previousVersion: string;
+      reason: string;
+    }) => void
+  ) => void;
+  onBackendReady: (
+    callback: (data: {
+      success: boolean;
+      port?: number;
+      error?: string;
+    }) => void
+  ) => void;
+  removeAllListeners: (channel: string) => void;
+  getEmailFolderPath: (email: string) => Promise<{
+    MCP_REMOTE_CONFIG_DIR: string;
+    MCP_CONFIG_DIR: string;
+    tempEmail: string;
+  }>;
+  restartApp: () => Promise<void>;
+  readGlobalEnv: (key: string) => Promise<{ value: string | null }>;
+  codexSubscriptionStatus: (email: string) => Promise<{
+    connected: boolean;
+    status:
+      | 'connected'
+      | 'connected_non_refreshable'
+      | 'expired'
+      | 'revoked'
+      | 'plan_unavailable'
+      | 'quota_exceeded'
+      | 'error'
+      | 'not_connected';
+    account_label?: string | null;
+    expires_at?: string | null;
+    last_error_code?: string | null;
+  }>;
+  codexSubscriptionLogin: (
+    email: string
+  ) => Promise<{ success: boolean; error_code?: string; error?: string }>;
+  codexSubscriptionDisconnect: (
+    email: string
+  ) => Promise<{ success: boolean; error_code?: string; error?: string }>;
+  getProjectFolderPath: (
+    email: string,
+    projectId: string,
+    userId?: string | number | null
+  ) => Promise<string>;
+  /** Open a selected folder itself, or reveal and highlight a selected file. */
+  revealLocalPath: (targetPath: string) => Promise<LocalPathActionResult>;
+  /** Open a selected non-executable local file with its default OS app. */
+  openLocalFile: (targetPath: string) => Promise<LocalPathActionResult>;
+  openInIDE: (
+    targetPath: string,
+    ide: 'vscode' | 'cursor' | 'system'
+  ) => Promise<LocalPathActionResult>;
+  // Skills: all operations via Brain REST API
+  setBrowserPort: (port: number, isExternal?: boolean) => Promise<any>;
+  getBrowserPort: () => Promise<number>;
+  getCdpBrowsers: () => Promise<any[]>;
+  addCdpBrowser: (
+    port: number,
+    isExternal: boolean,
+    name?: string
+  ) => Promise<{ success: boolean; browser?: any; error?: string }>;
+  removeCdpBrowser: (
+    browserId: string,
+    closeBrowser?: boolean
+  ) => Promise<{ success: boolean; browser?: any; error?: string }>;
+  onCdpPoolChanged: (callback: (browsers: any[]) => void) => () => void;
+  launchCdpBrowser: () => Promise<{
+    success: boolean;
+    port?: number;
+    data?: any;
+    error?: string;
+  }>;
+  terminalCreate: (options: {
+    id: string;
+    cwd?: string;
+    cols?: number;
+    rows?: number;
+  }) => Promise<{ success: boolean; existing?: boolean; error?: string }>;
+  terminalInput: (id: string, data: string) => void;
+  terminalResize: (id: string, cols: number, rows: number) => void;
+  terminalDispose: (id: string) => Promise<{ success: boolean }>;
+  terminalStop: (id: string) => Promise<{ success: boolean; error?: string }>;
+  onTerminalData: (
+    callback: (payload: { id: string; data: string }) => void
+  ) => () => void;
+  onTerminalExit: (
+    callback: (payload: { id: string; exitCode: number }) => void
+  ) => () => void;
+}
+
+declare global {
+  interface Window {
+    ipcRenderer: IpcRenderer;
+    electronAPI: ElectronAPI;
+  }
+}

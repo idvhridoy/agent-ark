@@ -1,0 +1,33 @@
+{
+	"name": "@reactive-resume/tooling",
+	"version": "0.0.0",
+	"type": "module",
+	"private": true,
+	"scripts": {
+		"db:reset": "tsx database/reset.ts",
+		"docs:gen": "tsx semantic-css/generate-reference.ts",
+		"test": "vitest run --passWithNoTests",
+		"test:ci": "vitest run --coverage --reporter=default --reporter=github-actions --reporter=json --reporter=junit --outputFile.json=reports/vitest-results.json --outputFile.junit=reports/vitest-junit.xml --passWithNoTests",
+		"typecheck": "tsgo --noEmit",
+		"pdf:translations": "tsx locales/generate.ts"
+	},
+	"dependencies": {
+		"@reactive-resume/schema": "workspace:*"
+	},
+	"devDependencies": {
+		"@lingui/format-po": "^6.8.0",
+		"@reactive-resume/config": "workspace:*",
+		"@reactive-resume/docx": "workspace:*",
+		"@reactive-resume/env": "workspace:*",
+		"@reactive-resume/pdf": "workspace:*",
+		"@reactive-resume/resume": "workspace:*",
+		"@types/pg": "^8.23.1",
+		"pdfjs-dist": "6.3.289",
+		"jszip": "3.10.2",
+		"@typescript/native-preview": "7.0.0-dev.20260707.2",
+		"drizzle-orm": "1.0.0-rc.4",
+		"pg": "^8.23.0",
+		"tsx": "^4.23.15",
+		"vitest": "^5.0.2"
+	}
+}

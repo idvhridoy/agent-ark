@@ -1,0 +1,172 @@
+/**
+ * Builds the Pagefind search index after the static build completes.
+ *
+ * Indexes every built HTML page and additionally injects synthetic records for
+ * catalog resources (agents, skills, instructions, hooks, workflows, plugins)
+ * so they are findable even where they are rendered client-side.
+ */
+import type { AstroIntegration } from "astro";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import * as pagefind from "pagefind";
+
+interface SearchRecord {
+  type: string;
+  id: string;
+  title: string;
+  description: string;
+  path: string;
+  tags?: string[];
+  searchText: string;
+}
+
+const TYPE_LABELS: Record<string, string> = {
+  agent: "Agent",
+  instruction: "Instruction",
+  skill: "Skill",
+  hook: "Hook",
+  workflow: "Workflow",
+  plugin: "Plugin",
+  tool: "Tool",
+  extension: "Extension",
+};
+
+const TYPE_PAGES: Record<string, string> = {
+  agent: "/agents/",
+  instruction: "/instructions/",
+  skill: "/skills/",
+  hook: "/hooks/",
+  workflow: "/workflows/",
+  plugin: "/plugins/",
+  tool: "/tools/",
+  extension: "/extensions/",
+};
+
+// Resource types that have a dedicated detail page at /<type>/<id>/. Search
+// results for these should deep-link to the canonical detail page.
+const DETAIL_ROUTE_TYPES = new Set([
+  "agent",
+  "instruction",
+  "skill",
+  "hook",
+  "workflow",
+  "plugin",
+  "extension",
+]);
+
+export default function pagefindResources(): AstroIntegration {
+  let siteBase = "/";
+
+  return {
+    name: "pagefind-resources",
+    hooks: {
+      "astro:config:done": ({ config }) => {
+        siteBase = config.base;
+      },
+      "astro:build:done": async ({ dir, logger }) => {
+        const log = logger.fork("pagefind-resources");
+        const now = performance.now();
+
+        try {
+          log.info("Building search index with Pagefind + resource records...");
+
+          const response = await pagefind.createIndex();
+          if (response.errors.length > 0) {
+            for (const err of response.errors) log.error(err);
+            throw new Error("Failed to create Pagefind index");
+          }
+          const { index } = response;
+
+          if (!index) {
+            throw new Error("Pagefind index is undefined");
+          }
+
+          // Index all built HTML pages
+          const indexResult = await index.addDirectory({
+            path: fileURLToPath(dir),
+          });
+          if (indexResult.errors.length > 0) {
+            for (const err of indexResult.errors) log.error(err);
+            throw new Error("Failed to index HTML directory");
+          }
+          log.info(`Indexed ${indexResult.page_count} HTML pages.`);
+
+          // Read and index resource records from search-index.json
+          const searchIndexPath = fileURLToPath(
+            new URL("./data/search-index.json", dir)
+          );
+          let records: SearchRecord[];
+          try {
+            records = JSON.parse(readFileSync(searchIndexPath, "utf-8"));
+          } catch {
+            log.warn(
+              "Could not read search-index.json, skipping resource indexing."
+            );
+            records = [];
+          }
+
+          // Use the base path from Astro config (e.g. "/")
+          const base = siteBase.endsWith("/") ? siteBase : `${siteBase}/`;
+
+          let added = 0;
+          for (const record of records) {
+            const hasDetailPage =
+              DETAIL_ROUTE_TYPES.has(record.type) && Boolean(record.id);
+            const typePage = TYPE_PAGES[record.type];
+            // Skip records we can neither deep-link nor point at a listing page.
+            if (!hasDetailPage && !typePage) continue;
+
+            const url = hasDetailPage
+              ? `${base}${record.type}/${encodeURIComponent(record.id)}/`
+              : `${base}${typePage.slice(1)}`;
+            const typeLabel = TYPE_LABELS[record.type] || record.type;
+
+            const addResult = await index.addCustomRecord({
+              url,
+              content:
+                record.searchText || `${record.title} ${record.description}`,
+              language: "en",
+              meta: {
+                title: `${record.title} — ${typeLabel}`,
+              },
+              filters: {
+                type: [record.type],
+              },
+            });
+
+            if (addResult.errors.length > 0) {
+              for (const err of addResult.errors)
+                log.warn(`Record ${record.id}: ${err}`);
+            } else {
+              added++;
+            }
+          }
+
+          log.info(`Added ${added} resource records.`);
+
+          // Write the combined index
+          const writeResult = await index.writeFiles({
+            outputPath: fileURLToPath(new URL("./pagefind/", dir)),
+          });
+          if (writeResult.errors.length > 0) {
+            for (const err of writeResult.errors) log.error(err);
+            throw new Error("Failed to write Pagefind files");
+          }
+
+          const elapsed = performance.now() - now;
+          log.info(
+            `Search index built in ${
+              elapsed < 750
+                ? `${Math.round(elapsed)}ms`
+                : `${(elapsed / 1000).toFixed(2)}s`
+            }.`
+          );
+        } catch (cause) {
+          throw new Error("Failed to build Pagefind search index.", { cause });
+        } finally {
+          await pagefind.close();
+        }
+      },
+    },
+  };
+}

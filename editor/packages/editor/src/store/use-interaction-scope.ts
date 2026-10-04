@@ -1,0 +1,350 @@
+'use client'
+
+import {
+  type AnyNode,
+  type AnyNodeId,
+  collectSubtree,
+  useLiveNodeOverrides,
+  useLiveTransforms,
+  useScene,
+} from '@pascal-app/core'
+import {
+  beginPerfAction,
+  commitPerfAction,
+  getActivePerfActionId,
+  hasUncommittedPerfAction,
+} from '@pascal-app/viewer'
+import { useRef } from 'react'
+import { create } from 'zustand'
+import { useShallow } from 'zustand/react/shallow'
+import { discardFreshPlacementSubtree } from '../lib/fresh-planar-placement'
+import {
+  type ActiveInteractionScope,
+  controlPointReshapeInfo,
+  editingHoleInfo,
+  endpointReshapeInfo,
+  handleDragInfo,
+  IDLE_SCOPE,
+  type InteractionScope,
+  isCurveReshape,
+  isFloorplanDrivenReshape,
+  isToolDrivenReshape,
+  movingNodeOf,
+  reshapingNodeId,
+  tangentReshapeInfo,
+} from '../lib/interaction/scope'
+import usePlacementPreview from './use-placement-preview'
+
+// The authoritative interaction state machine. A single owner holds exactly one
+// scope at a time. `begin` enters an interaction (atomically replacing any prior
+// one — a single owner, no producer races), `update` narrows the live payload,
+// and `end` returns to idle atomically so no interaction payload can leak past
+// the end of its interaction. There is no setter that can leave the store in an
+// illegal half-state: the only writable shape is `InteractionScope`.
+
+type SubtreeCreation = {
+  rootId: AnyNodeId
+  node: AnyNode
+  hydrationId: object | null
+}
+type OwnedSubtree = { creation: SubtreeCreation; gesture: object }
+
+export type InteractionScopeState = {
+  scope: InteractionScope
+  gesture: object | null
+  pendingSubtree: SubtreeCreation | null
+  ownedSubtree: OwnedSubtree | null
+  noteSubtreeCreation: (node: AnyNode) => void
+  adoptSubtree: (rootId: AnyNodeId) => boolean
+  finishSubtree: (rootId: AnyNodeId) => void
+  // Enter an interaction. If one is already active it is ended first, so the
+  // store is always single-owner.
+  begin: (scope: ActiveInteractionScope) => void
+  // Patch the current scope's payload. Ignored when idle, or when the patch's
+  // implied kind differs from the active kind — payload updates must not change
+  // which interaction is running (use `begin` for that).
+  update: (patch: Partial<ActiveInteractionScope>) => void
+  // Return to idle atomically. Both commit and cancel paths call this; the
+  // distinction (write vs revert) lives in the interaction body, not here.
+  end: () => void
+  // Return to idle only if the active scope matches `match`. Used when scope is
+  // driven from independent legacy flag clears, so clearing one flag (e.g. a
+  // fence curve) cannot stomp an unrelated active scope (e.g. a wall move).
+  endIf: (match: (scope: ActiveInteractionScope) => boolean) => void
+}
+
+// Perf action ledger (`?perf`): every 3D gesture funnels through this store, so
+// begin/end are the one generic bracket for action-cost receipts. A more
+// specific call site (use-drag-action, the 2D floorplan layer) may have begun
+// its own action first — yield to it while ITS gesture is in flight, but a
+// merely-settling previous action must not swallow a new gesture. The scope
+// remembers the id it began and commits only that action at `end`, so a
+// specific site's receipt (or a cancelled one finalized via
+// markToolCancelConsumed) is never committed by the generic bracket. Known
+// limit: a scope-begun gesture cancelled through a path that skips
+// markToolCancelConsumed still commits at end and bills its revert as settle.
+let scopePerfActionId: number | null = null
+
+function beginScopePerfAction(scope: ActiveInteractionScope): void {
+  if (hasUncommittedPerfAction()) return
+  switch (scope.kind) {
+    case 'moving':
+      scopePerfActionId = beginPerfAction('drag:move', scope.nodeId)
+      break
+    case 'placing':
+      scopePerfActionId = beginPerfAction(
+        `place:${scope.node?.type ?? 'node'}`,
+        scope.node?.id ?? '',
+      )
+      break
+    case 'reshaping': {
+      const nodeType = useScene.getState().nodes[scope.nodeId as AnyNodeId]?.type
+      scopePerfActionId = beginPerfAction(
+        `drag:${nodeType ? `${nodeType}-` : ''}${scope.reshape}`,
+        scope.nodeId,
+      )
+      break
+    }
+    case 'handle-drag':
+      scopePerfActionId = beginPerfAction(`drag:${scope.handle}`, scope.nodeId)
+      break
+    default:
+      // drafting / mesh-editing are long-lived modes, not gestures
+      break
+  }
+}
+
+function commitScopePerfAction(): void {
+  if (scopePerfActionId !== null && getActivePerfActionId() === scopePerfActionId) {
+    commitPerfAction()
+  }
+  scopePerfActionId = null
+}
+
+const useInteractionScope = create<InteractionScopeState>((set, get) => ({
+  scope: IDLE_SCOPE,
+  gesture: null,
+  pendingSubtree: null,
+  ownedSubtree: null,
+  noteSubtreeCreation: (node) =>
+    set({
+      pendingSubtree: { rootId: node.id, node, hydrationId: useScene.getState().hydrationId },
+    }),
+  adoptSubtree: (rootId) => {
+    const state = get()
+    if (state.ownedSubtree?.creation.rootId === rootId)
+      return (
+        state.ownedSubtree.gesture === state.gesture &&
+        isCurrentCreation(state.ownedSubtree.creation)
+      )
+    const creation = state.pendingSubtree
+    if (
+      !creation ||
+      creation.rootId !== rootId ||
+      !state.gesture ||
+      movingNodeOf(state.scope)?.id !== rootId ||
+      !isCurrentCreation(creation)
+    )
+      return false
+    set({ ownedSubtree: { creation, gesture: state.gesture }, pendingSubtree: null })
+    return true
+  },
+  finishSubtree: (rootId) =>
+    set((state) => {
+      if (state.ownedSubtree?.creation.rootId !== rootId && state.pendingSubtree?.rootId !== rootId)
+        return state
+      return {
+        ownedSubtree: state.ownedSubtree?.creation.rootId === rootId ? null : state.ownedSubtree,
+        pendingSubtree: state.pendingSubtree?.rootId === rootId ? null : state.pendingSubtree,
+      }
+    }),
+  begin: (scope) => {
+    const state = get()
+    const nodeId = movingNodeOf(scope)?.id
+    const creation = state.ownedSubtree?.creation ?? state.pendingSubtree
+    if (
+      nodeId &&
+      nodeId === movingNodeOf(state.scope)?.id &&
+      creation?.rootId === nodeId &&
+      isCurrentCreation(creation)
+    ) {
+      set({ scope })
+      return
+    }
+    beginScopePerfAction(scope)
+    set({
+      scope,
+      gesture: {},
+      ownedSubtree: null,
+      pendingSubtree:
+        get().pendingSubtree?.rootId === movingNodeOf(scope)?.id ? get().pendingSubtree : null,
+    })
+  },
+  update: (patch) =>
+    set((state) => {
+      if (state.scope.kind === 'idle') return state
+      if ('kind' in patch && patch.kind !== state.scope.kind) return state
+      return { scope: { ...state.scope, ...patch } as InteractionScope }
+    }),
+  end: () => {
+    if (get().scope.kind === 'idle') return
+    commitScopePerfAction()
+    set({ scope: IDLE_SCOPE, gesture: null, ownedSubtree: null, pendingSubtree: null })
+  },
+  endIf: (match) => {
+    const scope = get().scope
+    if (scope.kind === 'idle') return
+    if (match(scope)) {
+      commitScopePerfAction()
+      set({ scope: IDLE_SCOPE, gesture: null, ownedSubtree: null, pendingSubtree: null })
+    }
+  },
+}))
+
+function isCurrentCreation(creation: SubtreeCreation): boolean {
+  const scene = useScene.getState()
+  return (
+    scene.hydrationId === creation.hydrationId && scene.nodes[creation.rootId] === creation.node
+  )
+}
+
+export function isInteractionSubtreeDraft(
+  rootId = movingNodeOf(useInteractionScope.getState().scope)?.id,
+): boolean {
+  const state = useInteractionScope.getState()
+  const creation = state.ownedSubtree?.creation ?? state.pendingSubtree
+  return Boolean(
+    creation &&
+      state.gesture &&
+      rootId === movingNodeOf(state.scope)?.id &&
+      creation.rootId === rootId &&
+      (!state.ownedSubtree || state.ownedSubtree.gesture === state.gesture) &&
+      isCurrentCreation(creation),
+  )
+}
+
+// Track the identity of the factory-created node through scene patches, never through metadata.
+// Hydration or deletion invalidates the creation even if a later scene reuses the same id.
+useScene.subscribe((scene, previous) => {
+  const state = useInteractionScope.getState()
+  for (const creation of [state.pendingSubtree, state.ownedSubtree?.creation]) {
+    if (!creation) continue
+    if (
+      scene.hydrationId !== creation.hydrationId ||
+      previous.nodes[creation.rootId] !== creation.node ||
+      !scene.nodes[creation.rootId]
+    ) {
+      state.finishSubtree(creation.rootId)
+    } else creation.node = scene.nodes[creation.rootId]!
+  }
+})
+
+// Factory drafts belong to their gesture even before a mover mounts to adopt them.
+useInteractionScope.subscribe((state, previous) => {
+  if (
+    state.gesture === previous.gesture &&
+    movingNodeOf(state.scope)?.id === movingNodeOf(previous.scope)?.id
+  )
+    return
+  const owned =
+    previous.ownedSubtree ??
+    (previous.pendingSubtree && previous.gesture
+      ? { creation: previous.pendingSubtree, gesture: previous.gesture }
+      : null)
+  if (
+    !owned ||
+    owned.gesture !== previous.gesture ||
+    movingNodeOf(previous.scope)?.id !== owned.creation.rootId ||
+    !isCurrentCreation(owned.creation)
+  )
+    return
+  const node = owned.creation.node
+  const subtree = collectSubtree(useScene.getState().nodes, node.id)
+  const temporal = useScene.temporal.getState()
+  const wasTracking = temporal.isTracking
+  temporal.pause()
+  try {
+    discardFreshPlacementSubtree(node.id)
+    for (const entry of subtree ? [subtree.root, ...subtree.descendants] : []) {
+      useLiveTransforms.getState().clear(entry.id)
+      useLiveNodeOverrides.getState().clear(entry.id)
+    }
+    if (usePlacementPreview.getState().node?.id === node.id) usePlacementPreview.getState().clear()
+  } finally {
+    if (wasTracking) temporal.resume()
+  }
+})
+
+// Derived, reference-stable views of the active scope, replacing the legacy
+// `useEditor.activeHandleDrag` / `useEditor.editingHole` flags. `useShallow`
+// keeps the result reference-stable across unrelated scope changes, so hot-path
+// subscribers (camera controls, floating menu) don't re-render on every update.
+export const useActiveHandleDrag = (): { nodeId: string; label: string } | null =>
+  useInteractionScope(useShallow((s) => handleDragInfo(s.scope)))
+
+export const useEditingHole = (): { nodeId: string; holeIndex: number } | null =>
+  useInteractionScope(useShallow((s) => editingHoleInfo(s.scope)))
+
+// Imperative (non-React) reads for event handlers / effects.
+export const getEditingHole = (): { nodeId: string; holeIndex: number } | null =>
+  editingHoleInfo(useInteractionScope.getState().scope)
+
+export const getIsCurveReshape = (): boolean => isCurveReshape(useInteractionScope.getState().scope)
+
+// Replaces the legacy `curvingWall` / `curvingFence` existence flags. The
+// wall-vs-fence distinction (both now map to one `reshaping/'curve'` scope) is
+// recovered by reading the reshaped node's type from `useReshapingNode`.
+export const useIsCurveReshape = (): boolean => useInteractionScope((s) => isCurveReshape(s.scope))
+
+export const useIsToolDrivenReshape = (): boolean =>
+  useInteractionScope((s) => isToolDrivenReshape(s.scope))
+
+export const useIsFloorplanDrivenReshape = (): boolean =>
+  useInteractionScope((s) => isFloorplanDrivenReshape(s.scope))
+
+// Replaces the legacy `movingWallEndpoint` / `movingFenceEndpoint` payloads,
+// minus the node (fetch it from `useReshapingNode`).
+export const useEndpointReshape = (): { nodeId: string; endpoint: 'start' | 'end' } | null =>
+  useInteractionScope(useShallow((s) => endpointReshapeInfo(s.scope)))
+
+export const useControlPointReshape = (): { nodeId: string; index: number } | null =>
+  useInteractionScope(useShallow((s) => controlPointReshapeInfo(s.scope)))
+
+export const useTangentReshape = (): { nodeId: string; index: number; side: 'in' | 'out' } | null =>
+  useInteractionScope(useShallow((s) => tangentReshapeInfo(s.scope)))
+
+// The node currently being reshaped (curve / endpoint / hole), looked up live
+// from the scene by the scope's `nodeId`. During a reshape the scene node holds
+// the same data the legacy `curvingWall` / `movingWallEndpoint.wall` carried, so
+// consumers that need the full node (affordance-tool mounts, wall-vs-fence type
+// checks) read it here instead of from a parallel flag.
+export const useReshapingNode = (): AnyNode | null => {
+  const nodeId = useInteractionScope((s) => reshapingNodeId(s.scope))
+  // Snapshot the node ONCE when the reshape begins (keyed on nodeId), like the
+  // legacy `curvingWall` / `movingWallEndpoint.wall` flags did. The affordance
+  // tools write the node live during the drag; subscribing to the live scene
+  // node would feed those writes straight back into the tool — the curve resets
+  // on pointer-stop, the endpoint drag loops and freezes. nodeId is stable for
+  // the whole gesture, so a ref snapshot stays frozen until the next reshape.
+  const snapshot = useRef<{ id: string | null; node: AnyNode | null }>({ id: null, node: null })
+  if (snapshot.current.id !== nodeId) {
+    snapshot.current = {
+      id: nodeId,
+      node: nodeId ? (useScene.getState().nodes[nodeId as AnyNodeId] ?? null) : null,
+    }
+  }
+  return snapshot.current.node
+}
+
+// The node currently being placed or moved. Replaces the legacy
+// `useEditor.movingNode` flag. Unlike `useReshapingNode`, no `useRef` snapshot is
+// needed: the node is carried inline in the scope and set once at `begin`, so it
+// remains stable until a caller explicitly re-arms the same interaction.
+// Returns null whenever no placing/moving interaction is active.
+export const useMovingNode = (): AnyNode | null => useInteractionScope((s) => movingNodeOf(s.scope))
+
+// Imperative (non-React) read for event handlers / effects.
+export const getMovingNode = (): AnyNode | null =>
+  movingNodeOf(useInteractionScope.getState().scope)
+
+export default useInteractionScope

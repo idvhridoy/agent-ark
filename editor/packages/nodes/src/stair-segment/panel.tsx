@@ -1,0 +1,364 @@
+'use client'
+
+import {
+  type AnyNode,
+  type AnyNodeId,
+  type AttachmentSide,
+  DEFAULT_LEVEL_HEIGHT,
+  resolveStairTotalRise,
+  runAsSingleSceneHistoryStep,
+  type StairSegmentNode,
+  StairSegmentNode as StairSegmentNodeSchema,
+  type StairSegmentType,
+  useScene,
+} from '@pascal-app/core'
+import {
+  ActionButton,
+  ActionGroup,
+  PanelSection,
+  PanelWrapper,
+  SegmentedControl,
+  SliderControl,
+  ToggleControl,
+  triggerSFX,
+  useEditor,
+} from '@pascal-app/editor'
+import { useViewer } from '@pascal-app/viewer'
+import { Copy, Move, Trash2 } from 'lucide-react'
+import { useCallback } from 'react'
+
+const SEGMENT_TYPE_OPTIONS: { label: string; value: StairSegmentType }[] = [
+  { label: 'Flight', value: 'stair' },
+  { label: 'Landing', value: 'landing' },
+]
+
+const ATTACHMENT_SIDE_OPTIONS: { label: string; value: AttachmentSide }[] = [
+  { label: 'Front', value: 'front' },
+  { label: 'Left', value: 'left' },
+  { label: 'Right', value: 'right' },
+]
+
+export default function StairSegmentPanel() {
+  const selectedId = useViewer((s) => s.selection.selectedIds[0])
+  const setSelection = useViewer((s) => s.setSelection)
+  const updateNode = useScene((s) => s.updateNode)
+  const setMovingNode = useEditor((s) => s.setMovingNode)
+
+  const node = useScene((s) =>
+    selectedId ? (s.nodes[selectedId as AnyNode['id']] as StairSegmentNode | undefined) : undefined,
+  )
+
+  // Boolean selector — re-renders only when this segment's position among the
+  // parent stair's children flips to/from "first".
+  const isFirstSegment = useScene((s) => {
+    if (!node?.parentId) return true
+    const parent = s.nodes[node.parentId as AnyNodeId]
+    if (parent?.type !== 'stair') return true
+    const children = (parent as any).children ?? []
+    return children[0] === node.id
+  })
+
+  const handleUpdate = useCallback(
+    (updates: Partial<StairSegmentNode>) => {
+      if (!selectedId) return
+      updateNode(selectedId as AnyNode['id'], updates)
+    },
+    [selectedId, updateNode],
+  )
+
+  const handleClose = useCallback(() => {
+    setSelection({ selectedIds: [] })
+  }, [setSelection])
+
+  // A follows-level stair would hand the edited height straight back to
+  // `syncStairRises`, so a flight edit also pins the parent to the new total:
+  // the stair becomes Custom rise, exactly as editing Rise on its own panel.
+  const parentFollowsLevel = useScene((s) => {
+    const parent = node?.parentId ? s.nodes[node.parentId as AnyNodeId] : undefined
+    return parent?.type === 'stair' && parent.totalRise == null
+  })
+  const handleFlightHeightChange = useCallback(
+    (height: number) => {
+      if (!node) return
+      const sceneNodes = useScene.getState().nodes
+      const parent = node.parentId ? sceneNodes[node.parentId as AnyNodeId] : undefined
+      if (parent?.type !== 'stair') {
+        handleUpdate({ height })
+        return
+      }
+      const totalRise = parent.children.reduce((sum, childId) => {
+        const child = sceneNodes[childId as AnyNodeId]
+        if (child?.type !== 'stair-segment') return sum
+        return sum + (child.id === node.id ? height : child.height)
+      }, 0)
+      runAsSingleSceneHistoryStep(useScene, () => {
+        useScene.getState().updateNodes([
+          { id: node.id as AnyNodeId, data: { height } },
+          { id: parent.id as AnyNodeId, data: { totalRise } },
+        ])
+      })
+    },
+    [node, handleUpdate],
+  )
+
+  // Turning a landing back into a flight seeds the rise the parent stair
+  // resolves — a fixed 2.5 m stops halfway up a tall storey, and for a
+  // follows-mode stair it is what `syncStairRises` would converge to anyway.
+  const resolveParentStairRise = useCallback(() => {
+    const sceneNodes = useScene.getState().nodes
+    const parent = node?.parentId ? sceneNodes[node.parentId as AnyNodeId] : undefined
+    return parent?.type === 'stair'
+      ? resolveStairTotalRise(parent, sceneNodes)
+      : DEFAULT_LEVEL_HEIGHT
+  }, [node])
+
+  const handleBack = useCallback(() => {
+    if (node?.parentId) {
+      setSelection({ selectedIds: [node.parentId] })
+    }
+  }, [node?.parentId, setSelection])
+
+  const handleDuplicate = useCallback(() => {
+    if (!node?.parentId) return
+    triggerSFX('sfx:item-pick')
+
+    let duplicateInfo = structuredClone(node) as any
+    delete duplicateInfo.id
+    duplicateInfo.metadata = { ...duplicateInfo.metadata, isNew: true }
+    duplicateInfo.position = [
+      duplicateInfo.position[0] + 1,
+      duplicateInfo.position[1],
+      duplicateInfo.position[2] + 1,
+    ]
+
+    try {
+      const duplicate = StairSegmentNodeSchema.parse(duplicateInfo)
+      useScene.getState().createNode(duplicate, duplicate.parentId as AnyNodeId)
+      setSelection({ selectedIds: [] })
+      setMovingNode(duplicate)
+    } catch (e) {
+      console.error('Failed to duplicate stair segment', e)
+    }
+  }, [node, setSelection, setMovingNode])
+
+  const handleMove = useCallback(() => {
+    if (node) {
+      triggerSFX('sfx:item-pick')
+      setMovingNode(node)
+      setSelection({ selectedIds: [] })
+    }
+  }, [node, setMovingNode, setSelection])
+
+  const handleDelete = useCallback(() => {
+    if (!(selectedId && node)) return
+    triggerSFX('sfx:item-delete')
+    const parentId = node.parentId
+    useScene.getState().deleteNode(selectedId as AnyNodeId)
+    if (parentId) {
+      useScene.getState().dirtyNodes.add(parentId as AnyNodeId)
+      setSelection({ selectedIds: [parentId] })
+    } else {
+      setSelection({ selectedIds: [] })
+    }
+  }, [selectedId, node, setSelection])
+
+  if (!(node && node.type === 'stair-segment' && selectedId)) return null
+
+  return (
+    <PanelWrapper
+      icon="/icons/stairs.webp"
+      onBack={handleBack}
+      onClose={handleClose}
+      title={node.name || 'Stair Segment'}
+      width={300}
+    >
+      <PanelSection title="Type">
+        <SegmentedControl
+          onChange={(v) => {
+            const updates: Partial<StairSegmentNode> = { segmentType: v }
+            if (v === 'landing') {
+              updates.height = 0
+              updates.stepCount = 0
+              updates.length = 1.0
+            } else {
+              updates.height = resolveParentStairRise()
+              updates.stepCount = 10
+              updates.length = 3.0
+            }
+            handleUpdate(updates)
+          }}
+          options={SEGMENT_TYPE_OPTIONS}
+          value={node.segmentType}
+        />
+      </PanelSection>
+
+      {!isFirstSegment && (
+        <PanelSection title="Attachment">
+          <SegmentedControl
+            onChange={(v) => handleUpdate({ attachmentSide: v })}
+            options={ATTACHMENT_SIDE_OPTIONS}
+            value={node.attachmentSide}
+          />
+        </PanelSection>
+      )}
+
+      <PanelSection title="Dimensions">
+        <SliderControl
+          label="Width"
+          max={1000}
+          min={0.5}
+          onChange={(v) => handleUpdate({ width: v })}
+          precision={2}
+          step={0.1}
+          unit="m"
+          value={node.width}
+        />
+        <SliderControl
+          label="Length"
+          max={1000}
+          min={0.5}
+          onChange={(v) => handleUpdate({ length: v })}
+          precision={2}
+          step={0.1}
+          unit="m"
+          value={node.length}
+        />
+        {node.segmentType === 'stair' && (
+          <>
+            <SliderControl
+              label="Height"
+              max={1000}
+              min={0.5}
+              onChange={handleFlightHeightChange}
+              precision={2}
+              step={0.1}
+              unit="m"
+              value={node.height}
+            />
+            {parentFollowsLevel && (
+              <div className="px-1 text-[11px] text-muted-foreground">
+                Editing switches the stair to Custom rise
+              </div>
+            )}
+            <SliderControl
+              label="Steps"
+              max={30}
+              min={2}
+              onChange={(v) => handleUpdate({ stepCount: Math.round(v) })}
+              precision={0}
+              step={1}
+              unit=""
+              value={node.stepCount}
+            />
+          </>
+        )}
+      </PanelSection>
+
+      <PanelSection title="Structure">
+        <div className="space-y-3">
+          <ToggleControl
+            checked={node.fillToFloor}
+            label="Fill to floor"
+            onChange={(checked) => handleUpdate({ fillToFloor: checked })}
+          />
+          {!node.fillToFloor && (
+            <SliderControl
+              label="Thickness"
+              max={1000}
+              min={0.05}
+              onChange={(v) => handleUpdate({ thickness: v })}
+              precision={2}
+              step={0.05}
+              unit="m"
+              value={node.thickness ?? 0.25}
+            />
+          )}
+        </div>
+      </PanelSection>
+
+      <PanelSection title="Position">
+        <SliderControl
+          label="X"
+          onChange={(v) => {
+            const pos = [...node.position] as [number, number, number]
+            pos[0] = v
+            handleUpdate({ position: pos })
+          }}
+          precision={2}
+          step={0.05}
+          unit="m"
+          value={node.position[0]}
+        />
+        <SliderControl
+          label="Y"
+          onChange={(v) => {
+            const pos = [...node.position] as [number, number, number]
+            pos[1] = v
+            handleUpdate({ position: pos })
+          }}
+          precision={2}
+          step={0.05}
+          unit="m"
+          value={node.position[1]}
+        />
+        <SliderControl
+          label="Z"
+          onChange={(v) => {
+            const pos = [...node.position] as [number, number, number]
+            pos[2] = v
+            handleUpdate({ position: pos })
+          }}
+          precision={2}
+          step={0.05}
+          unit="m"
+          value={node.position[2]}
+        />
+        <SliderControl
+          label="Rotation"
+          max={180}
+          min={-180}
+          onChange={(degrees) => {
+            handleUpdate({ rotation: (degrees * Math.PI) / 180 })
+          }}
+          precision={0}
+          step={1}
+          unit="°"
+          value={Math.round((node.rotation * 180) / Math.PI)}
+        />
+        <div className="flex gap-1.5 px-1 pt-2 pb-1">
+          <ActionButton
+            label="-45°"
+            onClick={() => {
+              triggerSFX('sfx:item-rotate')
+              handleUpdate({ rotation: node.rotation - Math.PI / 4 })
+            }}
+          />
+          <ActionButton
+            label="+45°"
+            onClick={() => {
+              triggerSFX('sfx:item-rotate')
+              handleUpdate({ rotation: node.rotation + Math.PI / 4 })
+            }}
+          />
+        </div>
+      </PanelSection>
+
+      <PanelSection title="Actions">
+        <ActionGroup>
+          <ActionButton icon={<Move className="h-3.5 w-3.5" />} label="Move" onClick={handleMove} />
+          <ActionButton
+            icon={<Copy className="h-3.5 w-3.5" />}
+            label="Duplicate"
+            onClick={handleDuplicate}
+          />
+          <ActionButton
+            className="hover:bg-red-500/20"
+            icon={<Trash2 className="h-3.5 w-3.5 text-red-400" />}
+            label="Delete"
+            onClick={handleDelete}
+          />
+        </ActionGroup>
+      </PanelSection>
+    </PanelWrapper>
+  )
+}

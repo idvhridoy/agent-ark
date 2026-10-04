@@ -1,0 +1,123 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef __IVF_STREAMER_H__
+#define __IVF_STREAMER_H__
+
+#include <zvec/core/framework/index_streamer.h>
+#include "ivf_centroid_index.h"
+#include "ivf_entity.h"
+#include "ivf_searcher_context.h"
+
+namespace zvec {
+namespace core {
+
+/*! IVF Searcher
+ */
+class IVFStreamer : public IndexStreamer {
+ public:
+  //! Initialize Searcher
+  int init(const IndexMeta & /*meta*/,
+           const ailego::Params & /*params*/) override;
+
+  //! Cleanup Searcher
+  int cleanup() override;
+
+  //! Load index from container
+  int open(IndexStorage::Pointer storage) override;
+
+  int flush(uint64_t /*check_point*/) override {
+    return 0;
+  }
+  int close() override {
+    return this->unload();
+  }
+
+  //! Unload index
+  int unload() override;
+
+  //! Similarity brute force search
+  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                     Context::Pointer &context) const override;
+
+  //! Similarity brute force search
+  int search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
+                     uint32_t count, Context::Pointer &context) const override;
+
+  //! Similarity search
+  int search_impl(const void *query, const IndexQueryMeta &qmeta,
+                  Context::Pointer &context) const override;
+
+  //! Similarity search
+  int search_impl(const void *query, const IndexQueryMeta &qmeta,
+                  uint32_t count, Context::Pointer &context) const override;
+
+  //! Retrieve statistics
+  const Stats &stats() const override;
+
+  //! Create a searcher context
+  Context::Pointer create_context() const override;
+
+  //! Create a new iterator
+  IndexProvider::Pointer create_provider() const override;
+
+  //! Retrieve meta of index
+  const IndexMeta &meta() const override {
+    return meta_;
+  }
+
+  int get_vector_by_id(const uint32_t id,
+                       IndexStorage::MemoryBlock &block) const override {
+    return entity_->get_vector_by_key(id, block);
+  }
+
+ protected:
+  int update_context(IVFSearcherContext *ctx) const {
+    auto entity = entity_->clone();
+    if (!entity) {
+      LOG_ERROR("Failed to clone QcEntity");
+      return IndexError_Runtime;
+    }
+
+    //! The centroid index searcher may be different, so need to create one
+    auto centroid_ctx = centroid_index_->create_context();
+    if (!centroid_ctx) {
+      LOG_ERROR("Failed to create centroid index searcher context");
+      return IndexError_Runtime;
+    }
+
+    return ctx->update_context(entity, centroid_ctx, params_, magic_);
+  }
+
+ private:
+  //! Constants
+  static constexpr uint32_t kDefaultBfThreshold = 1000u;
+
+  enum State { STATE_INIT = 0, STATE_INITED = 1, STATE_LOADED = 2 };
+
+  //! Members
+  IndexMeta meta_{};
+  ailego::Params params_{};
+  IndexBuilder::Pointer builder_;
+  IVFCentroidIndex::Pointer centroid_index_{};
+  IVFEntity::Pointer entity_{};
+  uint32_t bruteforce_threshold_{kDefaultBfThreshold};
+  uint32_t magic_{0};
+  Stats stats_{};
+  State searcher_state_{STATE_INIT};
+};
+
+}  // namespace core
+}  // namespace zvec
+
+#endif  //__IVF_STREAMER_H__

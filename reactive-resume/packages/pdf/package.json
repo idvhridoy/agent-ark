@@ -1,0 +1,49 @@
+{
+	"name": "@reactive-resume/pdf",
+	"version": "0.0.0",
+	"type": "module",
+	"private": true,
+	"exports": {
+		"./browser": "./src/browser.tsx",
+		"./document": "./src/document.tsx",
+		"./semantic": "./src/semantic/index.ts",
+		"./semantic-legacy": "./src/semantic/legacy-converter.ts",
+		"./semantic-tree": "./src/semantic/tree.ts",
+		"./section-title": "./src/section-title.ts",
+		"./server": "./src/server.tsx"
+	},
+	"imports": {
+		"#react-pdf-renderer": "@react-pdf/renderer"
+	},
+	"scripts": {
+		"typecheck": "tsgo --noEmit",
+		"test": "vitest run --passWithNoTests",
+		"test:coverage": "vitest run --coverage --passWithNoTests",
+		"test:ci": "vitest run --coverage --reporter=default --reporter=github-actions --reporter=json --reporter=junit --outputFile.json=reports/vitest-results.json --outputFile.junit=reports/vitest-junit.xml --passWithNoTests",
+		"test:agent": "vitest run --reporter=agent --reporter=json --outputFile.json=reports/vitest-results.json --passWithNoTests"
+	},
+	"dependencies": {
+		"@react-pdf/hyphenate": "0.1.0",
+		"@react-pdf/renderer": "^4.9.0",
+		"@reactive-resume/fonts": "workspace:*",
+		"@reactive-resume/resume": "workspace:*",
+		"@reactive-resume/schema": "workspace:*",
+		"@reactive-resume/utils": "workspace:*",
+		"cjk-regex": "^3.5.0",
+		"fast-png": "^8.0.0",
+		"node-html-parser": "^9.0.4",
+		"phosphor-icons-react-pdf": "^0.1.3",
+		"react": "^19.3.0",
+		"react-pdf-html": "^2.1.5"
+	},
+	"devDependencies": {
+		"@napi-rs/canvas": "1.0.9",
+		"@react-pdf/types": "^2.14.0",
+		"@reactive-resume/config": "workspace:*",
+		"@types/react": "^19.3.0",
+		"@typescript/native-preview": "7.0.0-dev.20260707.2",
+		"pdfjs-dist": "6.3.289",
+		"pixelmatch": "^7.2.0",
+		"typescript": "^7.0.2"
+	}
+}

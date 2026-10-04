@@ -1,0 +1,668 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+import { fetchGet, fetchPost } from '@/api/http';
+import i18n from '@/i18n';
+import { generateUniqueId } from '@/lib';
+import { getAccountEnvironmentKey } from '@/lib/authEnvironment';
+import { notifyExecutionError } from '@/lib/notifyError';
+import { executionScope } from '@/service/executionApi';
+import {
+  flushPendingTriggerExecutionUpdates,
+  proxyUpdateTriggerExecution,
+} from '@/service/triggerApi';
+import { getAuthStore } from '@/store/authStore';
+import {
+  closeIdleSSEConnectionsForTasks,
+  hasActiveSSEConnection,
+  hasSSETransportForTasks,
+  waitForIdleSSEDisplayTail,
+} from '@/store/chatStore';
+import {
+  type TaskQueue,
+  useProjectRuntimeStore,
+} from '@/store/projectRuntimeStore';
+import { requireLegacyExecution } from '@/store/sessionExecutionStore';
+import { useTriggerTaskStore } from '@/store/triggerTaskStore';
+import { ExecutionStatus } from '@/types';
+import { AgentStep, ChatTaskStatus } from '@/types/constants';
+import { useCallback, useEffect, useRef } from 'react';
+
+/** Poll interval in ms */
+const POLL_INTERVAL_MS = 2000;
+const RUNTIME_OWNERSHIP_TIMEOUT_MS = 10_000;
+
+interface ActiveBackgroundTask {
+  projectId: string;
+  chatTaskId: string;
+  executionId: string;
+  triggerTaskId?: string;
+}
+
+interface LegacyChatRuntimeStatus {
+  status?: string;
+  run_id?: string | null;
+  consumer_alive?: boolean;
+}
+
+const RETRYABLE_BACKGROUND_ADMISSION_ERROR_CODES = new Set([
+  'project_consumer_active',
+]);
+
+const isRetryableBackgroundAdmissionError = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  'code' in error &&
+  typeof error.code === 'string' &&
+  RETRYABLE_BACKGROUND_ADMISSION_ERROR_CODES.has(error.code);
+
+/**
+ * Hook that processes background tasks from project queuedMessages.
+ * Supports trigger tasks (with executionId) and can be extended for other task types.
+ *
+ * - Polls all projects' queuedMessages for messages with executionId
+ * - Retires an idle Project consumer before cold start
+ */
+export function useBackgroundTaskProcessor() {
+  const projectStore = useProjectRuntimeStore();
+  const triggerTaskStore = useTriggerTaskStore();
+
+  const activeTasksRef = useRef<Map<string, ActiveBackgroundTask>>(new Map());
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isProcessingRef = useRef(false);
+  const runtimeRequestRef = useRef<AbortController | null>(null);
+  const lifetimeRef = useRef({ active: false });
+
+  useEffect(() => {
+    const lifetime = { active: true };
+    lifetimeRef.current = lifetime;
+    return () => {
+      lifetime.active = false;
+      runtimeRequestRef.current?.abort();
+    };
+  }, []);
+
+  const processOneTask = useCallback(async () => {
+    const lifetime = lifetimeRef.current;
+    if (!lifetime.active || isProcessingRef.current) return;
+    isProcessingRef.current = true;
+    try {
+      const requestRuntime = async <T>(
+        request: (signal: AbortSignal) => Promise<T>
+      ): Promise<T> => {
+        const controller = new AbortController();
+        runtimeRequestRef.current = controller;
+        let onAbort!: () => void;
+        const aborted = new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(controller.signal.reason);
+          controller.signal.addEventListener('abort', onAbort, { once: true });
+        });
+        const timeout = setTimeout(
+          () =>
+            controller.abort(
+              new DOMException(
+                'Runtime ownership request timed out',
+                'AbortError'
+              )
+            ),
+          RUNTIME_OWNERSHIP_TIMEOUT_MS
+        );
+        try {
+          // Bound the whole helper, including readiness/header resolution.
+          // A late response cannot continue this timed-out admission attempt.
+          return await Promise.race([request(controller.signal), aborted]);
+        } finally {
+          clearTimeout(timeout);
+          controller.signal.removeEventListener('abort', onAbort);
+          if (runtimeRequestRef.current === controller)
+            runtimeRequestRef.current = null;
+        }
+      };
+      const findQueuedExecution = (
+        projectId: string,
+        identity: Pick<TaskQueue, 'task_id' | 'executionId' | 'timestamp'>
+      ) =>
+        projectStore
+          .getProjectById(projectId)
+          ?.queuedMessages.find(
+            (queued) =>
+              queued.task_id === identity.task_id &&
+              queued.executionId === identity.executionId &&
+              queued.timestamp === identity.timestamp
+          );
+      const getIdleProjectTaskIds = (projectId: string): string[] | null => {
+        const project = projectStore.getProjectById(projectId);
+        if (!project) return null;
+        const chatStates = Object.values(project.chatStores || {}).map((cs) =>
+          cs.getState()
+        );
+        const hasRunningChatTask = chatStates.some((state) =>
+          Object.values(state.tasks).some((task) => {
+            // Admission/Resume claims ownership before it registers SSE or
+            // changes the previous terminal display status.
+            if (task.isPending) return true;
+            // Terminal direct/single-agent tasks may retain skeleton markers.
+            // They must not block the next queued trigger.
+            if (task.status === ChatTaskStatus.FINISHED) return false;
+            return (
+              task.status === ChatTaskStatus.RUNNING ||
+              task.status === ChatTaskStatus.PAUSE ||
+              task.messages.some(
+                (message) =>
+                  message.step === AgentStep.TO_SUB_TASKS && !message.isConfirm
+              ) ||
+              (!task.messages.find(
+                (message) => message.step === AgentStep.TO_SUB_TASKS
+              ) &&
+                !task.hasWaitComfirm &&
+                task.messages.length > 0) ||
+              task.isTakeControl
+            );
+          })
+        );
+        if (hasRunningChatTask) return null;
+        const taskIds = chatStates.flatMap((state) => Object.keys(state.tasks));
+        return hasActiveSSEConnection(taskIds) ? null : taskIds;
+      };
+      const projects = projectStore.getAllProjects();
+      let messageToProcess: {
+        projectId: string;
+        task_id: string;
+        content: string;
+        attaches: File[];
+        executionId: string;
+        triggerTaskId?: string;
+        triggerId?: number;
+        triggerName?: string;
+        timestamp: number;
+      } | null = null;
+
+      for (const project of projects) {
+        if (!lifetime.active) return;
+        const projectData = projectStore.getProjectById(project.id);
+        if (!projectData?.queuedMessages?.length) continue;
+        const msg = projectData.queuedMessages.find(
+          (queuedMessage) =>
+            queuedMessage.executionId && !queuedMessage.processing
+        );
+        if (!msg?.executionId) continue;
+        // Ownership requests below yield to queue cancellation, replacement,
+        // and other processors. Keep an immutable identity for revalidation.
+        const queuedIdentity = {
+          task_id: msg.task_id,
+          executionId: msg.executionId,
+          timestamp: msg.timestamp,
+        };
+
+        // Per-project concurrency: skip if this project already has an active background task
+        const hasActiveBackgroundTask = Array.from(
+          activeTasksRef.current.values()
+        ).some((t) => t.projectId === project.id);
+        if (hasActiveBackgroundTask) {
+          console.log(
+            '[BackgroundTaskProcessor] Skipping project',
+            project.id,
+            '- already has an active background task'
+          );
+          continue;
+        }
+
+        // A logically active Run blocks queued trigger processing. Browser SSE
+        // ownership and the backend TaskLock consumer have separate lifetimes,
+        // so both must be resolved before admitting a scheduled Run.
+        if (getIdleProjectTaskIds(project.id) === null) {
+          console.log(
+            '[BackgroundTaskProcessor] Skipping project',
+            project.id,
+            '- has an active Run'
+          );
+          continue;
+        }
+
+        let runtimeStatus: LegacyChatRuntimeStatus;
+        try {
+          await requestRuntime((signal) =>
+            requireLegacyExecution({ ...executionScope(project.id), signal })
+          );
+          runtimeStatus = await requestRuntime((signal) =>
+            fetchGet(
+              `/chat/${encodeURIComponent(project.id)}/status`,
+              undefined,
+              undefined,
+              { signal }
+            )
+          );
+        } catch (error) {
+          console.warn(
+            '[BackgroundTaskProcessor] Skipping project',
+            project.id,
+            '- could not verify legacy runtime ownership',
+            error
+          );
+          continue;
+        }
+        if (!lifetime.active) return;
+
+        const pendingAfterStatus = findQueuedExecution(
+          project.id,
+          queuedIdentity
+        );
+        if (!pendingAfterStatus || pendingAfterStatus.processing) continue;
+        // Foreground startup can add a Run while ownership requests are in
+        // flight, before Brain has registered its consumer. Re-read the local
+        // task stores and SSE ownership at each boundary as well.
+        if (getIdleProjectTaskIds(project.id) === null) continue;
+
+        if (
+          runtimeStatus.consumer_alive &&
+          (runtimeStatus.status !== 'done' || !runtimeStatus.run_id)
+        ) {
+          console.log(
+            '[BackgroundTaskProcessor] Skipping project',
+            project.id,
+            '- backend legacy Run is not idle'
+          );
+          continue;
+        }
+
+        const displayTaskIds = getIdleProjectTaskIds(project.id);
+        if (displayTaskIds === null) continue;
+        // Canonical completion can overtake the legacy display tail. The
+        // connection owns a bounded drain window; it is not an active Run.
+        await waitForIdleSSEDisplayTail(displayTaskIds);
+        if (!lifetime.active) return;
+        const pendingAfterDisplay = findQueuedExecution(
+          project.id,
+          queuedIdentity
+        );
+        if (!pendingAfterDisplay || pendingAfterDisplay.processing) continue;
+        const drainedTaskIds = getIdleProjectTaskIds(project.id);
+        if (
+          drainedTaskIds === null ||
+          drainedTaskIds.length !== displayTaskIds.length ||
+          drainedTaskIds.some((taskId) => !displayTaskIds.includes(taskId))
+        )
+          continue;
+
+        if (runtimeStatus.consumer_alive) {
+          // subscriber_count is only a point-in-time observation. Reusing a
+          // warm consumer would race a renderer disconnect between this read
+          // and follow-up admission, leaving the new Run without either the
+          // legacy stream or a canonical terminal observer. Scheduled work
+          // therefore retires the idle consumer before opening a fresh stream.
+          let retired: LegacyChatRuntimeStatus;
+          try {
+            retired = await requestRuntime((signal) =>
+              fetchPost(
+                `/chat/${encodeURIComponent(project.id)}/runtime/retire-idle`,
+                { run_id: runtimeStatus.run_id },
+                undefined,
+                { signal }
+              )
+            );
+          } catch (error) {
+            console.warn(
+              '[BackgroundTaskProcessor] Skipping project',
+              project.id,
+              '- could not retire the backend idle consumer',
+              error
+            );
+            continue;
+          }
+          if (!lifetime.active) return;
+          if (retired?.consumer_alive) {
+            console.warn(
+              '[BackgroundTaskProcessor] Skipping project',
+              project.id,
+              '- backend idle consumer did not retire'
+            );
+            continue;
+          }
+        }
+
+        const pendingAfterRetirement = findQueuedExecution(
+          project.id,
+          queuedIdentity
+        );
+        if (!pendingAfterRetirement || pendingAfterRetirement.processing)
+          continue;
+        const allTaskIds = getIdleProjectTaskIds(project.id);
+        if (
+          allTaskIds === null ||
+          allTaskIds.length !== displayTaskIds.length ||
+          allTaskIds.some((taskId) => !displayTaskIds.includes(taskId))
+        )
+          continue;
+
+        if (hasSSETransportForTasks(allTaskIds)) {
+          console.log(
+            '[BackgroundTaskProcessor] Closing idle SSE for project',
+            project.id,
+            '- backend consumer is retired'
+          );
+          closeIdleSSEConnectionsForTasks(allTaskIds);
+          if (hasSSETransportForTasks(allTaskIds)) {
+            console.warn(
+              '[BackgroundTaskProcessor] Skipping project',
+              project.id,
+              '- idle SSE cleanup did not release the transport'
+            );
+            continue;
+          }
+        }
+
+        messageToProcess = {
+          projectId: project.id,
+          ...queuedIdentity,
+          content: pendingAfterRetirement.content,
+          attaches: pendingAfterRetirement.attaches || [],
+          triggerTaskId: pendingAfterRetirement.triggerTaskId,
+          triggerId: pendingAfterRetirement.triggerId,
+          triggerName: pendingAfterRetirement.triggerName,
+        };
+        break;
+      }
+
+      if (!messageToProcess) return;
+
+      const {
+        projectId,
+        task_id,
+        content,
+        attaches,
+        executionId,
+        triggerTaskId,
+        triggerId,
+        triggerName,
+      } = messageToProcess;
+
+      const pendingMessage = findQueuedExecution(projectId, messageToProcess);
+      if (!pendingMessage || pendingMessage.processing) return;
+      if (getIdleProjectTaskIds(projectId) === null) return;
+
+      const newTaskId = generateUniqueId();
+      // Preflight can fail before a Run binding exists. Its failure receipt
+      // must still retain the account that submitted this execution.
+      const executionAccountKey = getAccountEnvironmentKey(getAuthStore());
+
+      // Track BEFORE markQueuedMessageAsProcessing — that call triggers
+      // projectStore subscription → poll() → processOneTask() re-entrancy.
+      // Having the guard set first ensures the per-project concurrency check
+      // blocks any re-entrant attempt.
+      activeTasksRef.current.set(executionId, {
+        projectId,
+        chatTaskId: newTaskId,
+        executionId,
+        triggerTaskId,
+      });
+
+      projectStore.markQueuedMessageAsProcessing(projectId, task_id);
+
+      // Marking emits synchronous store notifications. A subscriber may remove
+      // or replace the row, so confirm the claim before admitting any Run.
+      // There must be no await between the eligibility check, claim and start.
+      if (!findQueuedExecution(projectId, messageToProcess)?.processing) {
+        activeTasksRef.current.delete(executionId);
+        return;
+      }
+
+      console.log(
+        '[BackgroundTaskProcessor] Marked message as processing:',
+        task_id,
+        'executionId:',
+        executionId
+      );
+
+      try {
+        // Get the latest project's chatStore
+        const chatStore = projectStore.getChatStore(projectId);
+        if (!chatStore) {
+          throw new Error('Failed to get chat store for background task');
+        }
+
+        triggerTaskStore.registerExecutionMapping(
+          newTaskId,
+          executionId,
+          triggerTaskId || task_id,
+          projectId,
+          triggerName,
+          triggerId
+        );
+
+        // Notify backend that we're starting - prevents 60s timeout marking as "missed"
+        // (WebSocket ack may not reach backend in some cases, e.g. multi-worker, connection issues)
+        proxyUpdateTriggerExecution(
+          executionId,
+          { status: 'running' },
+          { projectId, triggerId, triggerName }
+        ).catch((err) =>
+          console.warn(
+            '[BackgroundTaskProcessor] Failed to update execution status to running:',
+            err
+          )
+        );
+
+        const admissionPromise = chatStore
+          .getState()
+          .startTask(
+            newTaskId,
+            undefined,
+            undefined,
+            undefined,
+            content,
+            attaches,
+            executionId,
+            projectId,
+            undefined,
+            {
+              preserveTaskId: true,
+              awaitAdmission: true,
+            }
+          );
+
+        // The Promise resolves after Brain admits this exact Run. Runtime
+        // completion remains owned by task state and canonical ingress.
+        admissionPromise
+          .then(() => {
+            console.log(
+              '[BackgroundTaskProcessor] Background task admitted:',
+              executionId
+            );
+            // Only remove the durable queue item after the server owns it.
+            projectStore.removeQueuedMessage(projectId, task_id);
+            activeTasksRef.current.delete(executionId);
+          })
+          .catch((err: any) => {
+            console.error(
+              '[BackgroundTaskProcessor] Background task error:',
+              err
+            );
+            if (isRetryableBackgroundAdmissionError(err)) {
+              // Status/retirement checks and admission are separate requests.
+              // If another Run wins that race, retain this trigger and let a
+              // later poll repeat the full ownership check.
+              projectStore.setQueuedMessageProcessing(
+                projectId,
+                task_id,
+                false
+              );
+              activeTasksRef.current.delete(executionId);
+              return;
+            }
+            // Remove from queue on error as well
+            projectStore.removeQueuedMessage(projectId, task_id);
+            // Report failure to backend
+            proxyUpdateTriggerExecution(
+              executionId,
+              {
+                status: ExecutionStatus.Failed,
+                error_message: err?.message || 'Task failed',
+              },
+              { projectId, triggerId, triggerName },
+              executionAccountKey
+            ).catch((e) =>
+              console.warn(
+                '[BackgroundTaskProcessor] Failed to report error status:',
+                e
+              )
+            );
+            notifyExecutionError(
+              i18n.t('triggers.background-task-failed', {
+                defaultValue: 'Background task failed',
+              }),
+              {
+                description:
+                  err?.message ||
+                  i18n.t('layout.unknown-error', {
+                    defaultValue: 'Unknown error',
+                  }),
+              },
+              executionId
+            );
+            activeTasksRef.current.delete(executionId);
+          });
+
+        console.log(
+          '[BackgroundTaskProcessor] Started background task:',
+          executionId,
+          'for project',
+          projectId
+        );
+
+        console.log(
+          '[BackgroundTaskProcessor] Current active tasks:',
+          Array.from(activeTasksRef.current.keys())
+        );
+      } catch (error: any) {
+        console.error(
+          '[BackgroundTaskProcessor] Failed to start background task:',
+          error
+        );
+        // Remove from queue on error
+        projectStore.removeQueuedMessage(projectId, task_id);
+        // Report failure to backend
+        proxyUpdateTriggerExecution(
+          executionId,
+          {
+            status: ExecutionStatus.Failed,
+            error_message: error?.message || 'Background task failed',
+          },
+          { projectId, triggerId, triggerName },
+          executionAccountKey
+        ).catch((e) =>
+          console.warn(
+            '[BackgroundTaskProcessor] Failed to report error status:',
+            e
+          )
+        );
+        notifyExecutionError(
+          i18n.t('triggers.background-task-failed', {
+            defaultValue: 'Background task failed',
+          }),
+          {
+            description:
+              error?.message ||
+              i18n.t('layout.unknown-error', {
+                defaultValue: 'Unknown error',
+              }),
+          },
+          executionId
+        );
+        activeTasksRef.current.delete(executionId);
+      }
+    } finally {
+      isProcessingRef.current = false;
+    }
+  }, [projectStore, triggerTaskStore]);
+
+  const checkCompletedTasks = useCallback(() => {
+    const toRemove: string[] = [];
+
+    activeTasksRef.current.forEach((task, executionId) => {
+      const project = projectStore.getProjectById(task.projectId);
+      if (!project?.chatStores) return;
+
+      for (const chatStore of Object.values(project.chatStores)) {
+        const state = chatStore.getState();
+        const t = state.tasks[task.chatTaskId];
+        if (t) {
+          if (
+            t.status !== ChatTaskStatus.RUNNING &&
+            t.status !== ChatTaskStatus.PAUSE
+          ) {
+            toRemove.push(executionId);
+          }
+          break;
+        }
+      }
+    });
+
+    toRemove.forEach((executionId) => {
+      activeTasksRef.current.delete(executionId);
+    });
+  }, [projectStore]);
+
+  const poll = useCallback(() => {
+    checkCompletedTasks();
+    processOneTask();
+  }, [checkCompletedTasks, processOneTask]);
+
+  useEffect(() => {
+    // Recover terminal receipts persisted by a previous renderer session.
+    // This is independent from canonical/legacy observer lifetime.
+    void flushPendingTriggerExecutionUpdates().catch((error) => {
+      console.warn(
+        '[BackgroundTaskProcessor] Failed to flush terminal execution updates:',
+        error
+      );
+    });
+    // A Run can finish while no renderer exists, or after startup hydration.
+    // Reconcile retained exact-Run identities as well as retrying delivery.
+    const recoveryTimer = setInterval(() => {
+      void flushPendingTriggerExecutionUpdates().catch((error) => {
+        console.warn(
+          '[BackgroundTaskProcessor] Trigger reconciliation deferred:',
+          error
+        );
+      });
+    }, 30_000);
+
+    // Run poll immediately on mount - don't wait for first interval
+    poll();
+
+    const runPoll = () => {
+      poll();
+      pollTimerRef.current = setTimeout(runPoll, POLL_INTERVAL_MS);
+    };
+
+    pollTimerRef.current = setTimeout(runPoll, POLL_INTERVAL_MS);
+
+    const unsubscribe = useProjectRuntimeStore.subscribe(() => {
+      const state = useProjectRuntimeStore.getState();
+      const hasTriggerTasks = Object.values(state.projects).some((p) =>
+        p?.queuedMessages?.some((m) => m.executionId)
+      );
+      if (hasTriggerTasks) poll();
+    });
+
+    return () => {
+      clearInterval(recoveryTimer);
+      unsubscribe();
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, [poll]);
+}

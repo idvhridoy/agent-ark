@@ -1,0 +1,400 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+import { TooltipSimple } from '@/components/ui/tooltip';
+import { cn } from '@/lib/utils';
+import { Check, ChevronDown, CircleAlert } from 'lucide-react';
+import * as React from 'react';
+import {
+  formFieldInputSelectSizeClasses,
+  formFieldInputSelectState,
+} from './formFieldSurface';
+import { formControlTokenAliases } from './tokenAliases';
+
+export type InputSelectSize = 'default' | 'sm';
+export type InputSelectState = 'error' | 'success';
+
+type InputSelectOption = {
+  value: string;
+  label: string;
+};
+
+type InputSelectProps = {
+  value: string;
+  onChange: (value: string) => void;
+  options: InputSelectOption[];
+  placeholder?: string;
+  title?: string;
+  tooltip?: string;
+  note?: string;
+  errorNote?: string;
+  required?: boolean;
+  disabled?: boolean;
+  size?: InputSelectSize;
+  state?: InputSelectState;
+  leadingIcon?: React.ReactNode;
+  className?: string;
+  maxDropdownHeight?: number;
+  /**
+   * Called when an option is selected from the dropdown
+   */
+  onOptionSelect?: (option: InputSelectOption) => void;
+  /**
+   * Custom validation function for the input value
+   * Returns true if valid, false if invalid
+   * If returns false, component will show error state
+   */
+  validateInput?: (value: string) => boolean;
+  /**
+   * Called when input loses focus or dropdown closes
+   * Use this to transform/normalize the input value
+   * Return the normalized value, or undefined to keep as-is
+   * Return false to indicate validation failure (will show error state)
+   */
+  onInputCommit?: (value: string) => string | false | void;
+};
+
+const InputSelect = React.forwardRef<HTMLInputElement, InputSelectProps>(
+  (
+    {
+      value,
+      onChange,
+      options,
+      placeholder,
+      title,
+      tooltip,
+      note,
+      errorNote,
+      required = false,
+      disabled = false,
+      size = 'default',
+      state,
+      leadingIcon,
+      className,
+      maxDropdownHeight = 200,
+      onOptionSelect,
+      validateInput,
+      onInputCommit,
+    },
+    ref
+  ) => {
+    const [isOpen, setIsOpen] = React.useState(false);
+    const [inputValue, setInputValue] = React.useState(() => {
+      const option = options.find((opt) => opt.value === value);
+      return option ? option.label : value;
+    });
+    const [hasError, setHasError] = React.useState(false);
+    const containerRef = React.useRef<HTMLDivElement>(null);
+    const inputRef = React.useRef<HTMLInputElement>(null);
+    const dropdownRef = React.useRef<HTMLDivElement>(null);
+    const isCommittingRef = React.useRef(false);
+    const optionSelectedRef = React.useRef(false);
+    const inputValueRef = React.useRef(inputValue);
+
+    // Merge refs
+    React.useImperativeHandle(ref, () => inputRef.current as HTMLInputElement);
+
+    // Keep inputValueRef in sync with inputValue
+    React.useEffect(() => {
+      inputValueRef.current = inputValue;
+    }, [inputValue]);
+
+    // Sync input value with external value
+    React.useEffect(() => {
+      const option = options.find((opt) => opt.value === value);
+      setInputValue(option ? option.label : value);
+      setHasError(false); // Clear error when external value changes
+    }, [value, options]);
+
+    // Commit value function - validates and saves input
+    const commitValue = React.useCallback(() => {
+      // Skip commit if an option was just selected (it handles its own update)
+      if (optionSelectedRef.current) {
+        optionSelectedRef.current = false;
+        return;
+      }
+
+      // Prevent double commits
+      if (isCommittingRef.current) return;
+      isCommittingRef.current = true;
+
+      // Use ref to get the latest inputValue (avoids stale closure issue)
+      const currentInputValue = inputValueRef.current;
+      let finalValue = currentInputValue;
+
+      // Run custom commit handler if provided
+      if (onInputCommit) {
+        const result = onInputCommit(currentInputValue);
+        if (result === false) {
+          // Validation failed - show error state
+          setHasError(true);
+          isCommittingRef.current = false;
+          return;
+        }
+        if (typeof result === 'string') {
+          finalValue = result;
+          setInputValue(result);
+        }
+      }
+
+      // Validate if validator is provided
+      if (validateInput && !validateInput(finalValue)) {
+        setHasError(true);
+        isCommittingRef.current = false;
+        return;
+      }
+
+      // Validation passed - clear error and update value
+      setHasError(false);
+      if (finalValue !== value) {
+        onChange(finalValue);
+      }
+
+      isCommittingRef.current = false;
+    }, [value, onInputCommit, validateInput, onChange]);
+
+    // Handle click outside to close dropdown
+    React.useEffect(() => {
+      if (!isOpen) return;
+
+      const handleClickOutside = (event: MouseEvent) => {
+        const target = event.target as Node;
+        if (
+          containerRef.current &&
+          !containerRef.current.contains(target) &&
+          dropdownRef.current &&
+          !dropdownRef.current.contains(target)
+        ) {
+          commitValue();
+          setIsOpen(false);
+        }
+      };
+
+      const handleEscape = (event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
+          setInputValue(value); // Reset to original value
+          setIsOpen(false);
+          inputRef.current?.blur();
+        }
+      };
+
+      // Use capture phase to handle events before they bubble
+      document.addEventListener('mousedown', handleClickOutside, true);
+      document.addEventListener('keydown', handleEscape, true);
+
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside, true);
+        document.removeEventListener('keydown', handleEscape, true);
+      };
+    }, [isOpen, value, commitValue]);
+
+    // Handle scroll within dropdown - prevent parent scroll only when necessary
+    const handleDropdownWheel = React.useCallback(
+      (e: React.WheelEvent<HTMLDivElement>) => {
+        const target = e.currentTarget;
+        const { scrollTop, scrollHeight, clientHeight } = target;
+        const hasScrollableContent = scrollHeight > clientHeight;
+
+        if (!hasScrollableContent) {
+          // No scrollable content, prevent all scroll and stop propagation
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+
+        const isAtTop = scrollTop <= 0;
+        const isAtBottom = scrollTop + clientHeight >= scrollHeight - 1; // -1 for rounding
+
+        // If at boundary and trying to scroll past it, prevent default to stop parent from scrolling
+        if ((isAtTop && e.deltaY < 0) || (isAtBottom && e.deltaY > 0)) {
+          e.preventDefault();
+        }
+
+        // Always stop propagation to prevent parent dialog from scrolling
+        e.stopPropagation();
+      },
+      []
+    );
+
+    const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+      setInputValue(e.target.value);
+      // Clear error when user starts typing again
+      if (hasError) {
+        setHasError(false);
+      }
+    };
+
+    const handleInputFocus = () => {
+      if (!disabled) {
+        setIsOpen(true);
+      }
+    };
+
+    const handleInputBlur = () => {
+      // Use setTimeout to allow option clicks to process first
+      // If user clicks an option, the option handler will update the value
+      // If user clicks outside, we commit the current input value
+      setTimeout(() => {
+        commitValue();
+        setIsOpen(false);
+      }, 150);
+    };
+
+    const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitValue();
+        setIsOpen(false);
+        inputRef.current?.blur();
+      } else if (e.key === 'ArrowDown' && !isOpen) {
+        e.preventDefault();
+        setIsOpen(true);
+      }
+    };
+
+    const handleOptionClick = (option: InputSelectOption) => {
+      // Mark that an option was selected so blur handler skips commit
+      optionSelectedRef.current = true;
+      setInputValue(option.label);
+      inputValueRef.current = option.label; // Update ref immediately
+      setHasError(false); // Clear error when selecting an option
+      onChange(option.value);
+      onOptionSelect?.(option);
+      setIsOpen(false);
+    };
+
+    const handleContainerClick = () => {
+      if (!disabled) {
+        inputRef.current?.focus();
+        setIsOpen(true);
+      }
+    };
+
+    // Use internal error state if no external state is provided
+    const effectiveState = hasError ? 'error' : state;
+    const stateCls = formFieldInputSelectState(effectiveState, disabled);
+
+    // Determine which note to show
+    const displayNote =
+      effectiveState === 'error' && errorNote ? errorNote : note;
+
+    // Find the currently selected option
+    const selectedOption = options.find((opt) => opt.value === value);
+
+    return (
+      <div
+        className={cn('relative w-full min-w-0', stateCls.wrapper, className)}
+        style={formControlTokenAliases}
+      >
+        {title && (
+          <div className="mb-1.5 flex items-center gap-1 text-ds-text-meta font-bold text-ds-ink-default-default">
+            <span>{title}</span>
+            {required && <span className="text-ds-ink-default-default">*</span>}
+            {tooltip && (
+              <TooltipSimple content={tooltip}>
+                <CircleAlert
+                  size={16}
+                  className="text-ds-ink-default-default"
+                />
+              </TooltipSimple>
+            )}
+          </div>
+        )}
+
+        {/* Input container */}
+        <div
+          ref={containerRef}
+          onClick={handleContainerClick}
+          className={cn(
+            'relative flex w-full min-w-0 cursor-text items-center gap-2 rounded-lg border border-x border-y border-solid px-3 text-ds-ink-default-default shadow-sm transition-[background-color,border-color,box-shadow,opacity] outline-none',
+            formFieldInputSelectSizeClasses[size],
+            stateCls.container,
+            !disabled &&
+              state !== 'error' &&
+              state !== 'success' && [
+                'hover:bg-ds-neutral-default-hover hover:ring-1 hover:ring-ds-hairline-strong-default hover:ring-offset-0',
+                isOpen &&
+                  'bg-ds-neutral-strong-default ring-1 ring-ds-ring-focus ring-offset-0',
+              ]
+          )}
+        >
+          {leadingIcon && (
+            <span className="h-4 w-4 shrink-0 text-ds-ink-default-default">
+              {leadingIcon}
+            </span>
+          )}
+          <input
+            ref={inputRef}
+            type="text"
+            value={inputValue}
+            onChange={handleInputChange}
+            onFocus={handleInputFocus}
+            onBlur={handleInputBlur}
+            onKeyDown={handleInputKeyDown}
+            placeholder={placeholder}
+            disabled={disabled}
+            className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-ds-ink-muted-default"
+          />
+          <ChevronDown
+            className={cn(
+              'h-4 w-4 shrink-0 text-ds-ink-default-default transition-transform',
+              isOpen && 'rotate-180'
+            )}
+          />
+        </div>
+
+        {/* Dropdown */}
+        {isOpen && (
+          <div
+            ref={dropdownRef}
+            className="absolute top-full right-0 left-0 z-50 mt-1 overflow-hidden rounded-lg border border-x border-y border-solid border-transparent bg-ds-neutral-default-default shadow-md"
+          >
+            <div
+              className="overflow-x-hidden overflow-y-auto overscroll-contain p-1"
+              style={{ maxHeight: maxDropdownHeight }}
+              onWheel={handleDropdownWheel}
+            >
+              {options.map((option) => (
+                <div
+                  key={option.value}
+                  onClick={() => handleOptionClick(option)}
+                  className={cn(
+                    'relative flex w-full cursor-pointer items-center rounded-lg py-1.5 pr-8 pl-2 text-sm transition-colors outline-none select-none hover:bg-ds-neutral-default-hover',
+                    selectedOption?.value === option.value &&
+                      'bg-ds-neutral-default-hover'
+                  )}
+                >
+                  {option.label}
+                  {selectedOption?.value === option.value && (
+                    <span className="absolute right-2 flex h-3.5 w-3.5 items-center justify-center">
+                      <Check className="h-4 w-4" />
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {displayNote && (
+          <div className={cn('mt-1 text-xs', stateCls.note)}>{displayNote}</div>
+        )}
+      </div>
+    );
+  }
+);
+
+InputSelect.displayName = 'InputSelect';
+
+export { InputSelect, type InputSelectOption };

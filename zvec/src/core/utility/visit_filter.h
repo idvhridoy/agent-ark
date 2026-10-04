@@ -1,0 +1,536 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <limits>
+#include <random>
+#include <tuple>
+#include <utility>
+#include <vector>
+#include <ailego/container/bloom_filter.h>
+#include <ailego/utility/bitset_helper.h>
+#include <zvec/ailego/internal/platform.h>
+#include <zvec/ailego/logger/logger.h>
+#include <zvec/core/framework/index_error.h>
+
+namespace zvec {
+namespace core {
+
+struct VisitFilterHeader {
+  VisitFilterHeader() : max_doc_cnt(0), max_scan_num(0) {}
+  uint64_t max_doc_cnt;
+  uint64_t max_scan_num;
+};
+
+constexpr int PROXIMA_HNSW_VISITFILTER_CUSTOM_PARAMS_INDEX_NEGPROB = 0;
+
+class VisitBloomFilter {
+ public:
+  static constexpr int mode = 1;
+
+  static constexpr int N = 5;
+  struct Context {
+    Context()
+        : mt(std::chrono::system_clock::now().time_since_epoch().count()) {};
+    VisitFilterHeader h;
+    std::mt19937 mt;
+    ailego::BloomFilter<N> *filter{nullptr};
+    int offset[N] = {0};
+  };
+#define BLOOM_FILTER_HASH_BITS_OFFSETS(i)                                 \
+  i + c->offset[0], i + c->offset[1], i + c->offset[2], i + c->offset[3], \
+      i + c->offset[4]
+
+  VisitBloomFilter() = delete;
+
+  inline static void set_visited(Context *c, id_t idx) {
+    c->filter->force_insert(BLOOM_FILTER_HASH_BITS_OFFSETS(idx));
+    return;
+  }
+
+  inline static void *get_visited(Context *, id_t) {
+    // TODO
+    return nullptr;
+  }
+
+  inline static bool visited(Context *c, id_t idx) {
+    return c->filter->has(BLOOM_FILTER_HASH_BITS_OFFSETS(idx));
+  }
+
+  inline static int set_max_scan_num(Context *c, uint64_t max_scan_num) {
+    if (max_scan_num == c->h.max_scan_num) {
+      return 0;
+    }
+    c->h.max_scan_num = max_scan_num;
+    if (c->filter->reset(max_scan_num, c->filter->probability()) != 0) {
+      LOG_ERROR("reset BloomFilter failed");
+      return IndexError_Runtime;
+    }
+    gen_random_hash_bits(c);
+    return 0;
+  }
+
+  inline static void clear(Context *c) {
+    c->filter->clear();
+    return;
+  }
+
+  inline static bool reset(Context *c, uint64_t max_doc_cnt,
+                           uint64_t max_scan_num) {
+    if (ailego_unlikely(max_doc_cnt > c->h.max_doc_cnt ||
+                        max_scan_num > c->h.max_scan_num)) {
+      // Create a new one, if failed, we can reuse the old one
+      auto filter = new (std::nothrow) ailego::BloomFilter<VisitBloomFilter::N>(
+          max_scan_num, c->filter->probability());
+      if (ailego_unlikely(filter == nullptr)) {
+        LOG_ERROR("reset bloomfilter failed, maxScanNum %zu prob %f",
+                  (size_t)max_scan_num, c->filter->probability());
+        c->filter->clear();
+        return false;
+      }
+
+      delete c->filter;
+      c->filter = filter;
+      c->h.max_scan_num = max_scan_num;
+      c->h.max_doc_cnt = max_doc_cnt;
+      gen_random_hash_bits(c);
+    }
+    return true;
+  }
+
+  inline static void gen_random_hash_bits(Context *c) {
+    std::uniform_int_distribution<int> dt(0, c->h.max_doc_cnt);
+    for (size_t i = 0; i < sizeof(c->offset) / sizeof(c->offset[0]); ++i) {
+      int r = dt(c->mt);
+      size_t j = 0;
+      do {  // gen distinct number
+        for (j = 0; j < i; ++j) {
+          if (c->offset[j] == r) {
+            r = dt(c->mt);
+            break;
+          }
+        }
+      } while (j < i);
+      c->offset[i] = r;
+    }
+    std::sort(c->offset, c->offset + N);
+  }
+
+  template <class... T>
+  static int init(Context *, void **ctx, uint64_t max_doc_cnt,
+                  uint64_t max_scan_num, std::tuple<T...> &&tpl) {
+    Context *c = new (std::nothrow) Context;
+    if (c == nullptr) {
+      LOG_ERROR("New memory in initVisitBitMap failed");
+      return IndexError_NoMemory;
+    }
+    c->h.max_doc_cnt = max_doc_cnt;
+    c->h.max_scan_num = max_scan_num;
+    float p =
+        std::get<PROXIMA_HNSW_VISITFILTER_CUSTOM_PARAMS_INDEX_NEGPROB>(tpl);
+    c->filter = new (std::nothrow)
+        ailego::BloomFilter<VisitBloomFilter::N>(max_scan_num, p);
+    if (c->filter == nullptr) {
+      LOG_ERROR("New BloomFilter failed");
+      delete c;
+      return IndexError_NoMemory;
+    }
+    gen_random_hash_bits(c);
+    *ctx = c;
+    return 0;
+  }
+
+  inline static void destroy(Context *c) {
+    delete c->filter;
+    delete c;
+  }
+#undef BLOOM_FILTER_HASH_BITS_OFFSETS
+};  // end of VisitBloomFilter
+
+class VisitBitMap {
+ public:
+  static constexpr int mode = 2;
+
+  struct Context {
+    VisitFilterHeader h;
+    ailego::BitsetHelper bitset;
+    char *buf{nullptr};
+  };
+
+  VisitBitMap() = delete;
+
+  inline static void set_visited(Context *c, id_t idx) {
+    c->bitset.set(idx);
+    return;
+  }
+
+  inline static void *get_visited(Context *c, id_t idx) {
+    return &c->buf[idx >> 3];
+  }
+
+  inline static bool visited(Context *c, id_t idx) {
+    return c->bitset.test(idx);
+  }
+
+  inline static int set_max_scan_num(Context *c, uint64_t max_scan_num) {
+    c->h.max_scan_num = max_scan_num;
+    return 0;
+  }
+
+  inline static void clear(Context *c) {
+    c->bitset.clear();
+    return;
+  }
+
+  inline static bool reset(Context *c, uint64_t max_doc_cnt,
+                           uint64_t max_scan_num) {
+    if (ailego_unlikely(max_doc_cnt > c->h.max_doc_cnt ||
+                        max_scan_num > c->h.max_scan_num)) {
+      uint64_t len = ((max_doc_cnt + 31) >> 5) << 2;  // round to uint32_t
+      auto buf = new (std::nothrow) char[len];
+      if (buf == nullptr) {
+        LOG_ERROR("New memory in initVisitBitMap failed");
+        c->bitset.clear();
+        return false;
+      }
+
+      c->h.max_doc_cnt = max_doc_cnt;
+      c->h.max_scan_num = max_scan_num;
+      delete[] c->buf;
+      c->buf = buf;
+      memset(c->buf, 0, len);
+      c->bitset.mount(c->buf, len);
+    }
+    return true;
+  }
+
+  template <class... T>
+  static int init(Context *, void **ctx, uint64_t max_doc_cnt,
+                  uint64_t max_scan_num, std::tuple<T...> &&tpl) {
+    (void)tpl;  // unused warning
+    Context *c = new (std::nothrow) Context;
+    if (c == nullptr) {
+      LOG_ERROR("New memory in initVisitBitMap failed");
+      return IndexError_NoMemory;
+    }
+    c->h.max_doc_cnt = max_doc_cnt;
+    c->h.max_scan_num = max_scan_num;
+    uint64_t len = ((max_doc_cnt + 31) >> 5) << 2;  // round to uint32_t
+    c->buf = new (std::nothrow) char[len];
+    if (c->buf == nullptr) {
+      LOG_ERROR("New memory in initVisitBitMap failed, reuse old one");
+      delete c;
+      return IndexError_NoMemory;
+    }
+    memset(c->buf, 0, len);
+    c->bitset.mount(c->buf, len);
+    *ctx = c;
+    return 0;
+  }
+
+  inline static void destroy(Context *c) {
+    delete[] c->buf;
+    delete c;
+  }
+};  // end of VisitBitMap
+
+class VisitByteMap {
+ public:
+  static constexpr int mode = 3;
+  struct Context {
+    VisitFilterHeader h;
+    uint8_t cur_num{0};
+    std::vector<uint8_t> buf;
+  };
+
+  VisitByteMap() = delete;
+
+  inline static void set_visited(Context *c, id_t idx) {
+    if (ailego_unlikely(idx >= c->h.max_doc_cnt)) {
+      c->h.max_doc_cnt = idx + 1024;  // reserved
+      c->buf.resize(c->h.max_doc_cnt);
+    }
+    c->buf[idx] = c->cur_num;
+    return;
+  }
+
+  inline static void *get_visited(Context *c, id_t idx) {
+    return c->buf.data() + idx;
+  }
+
+  inline static bool visited(Context *c, id_t idx) {
+    if (ailego_unlikely(idx >= c->h.max_doc_cnt)) {
+      return false;
+    }
+    return c->buf[idx] == c->cur_num;
+  }
+
+  inline static int set_max_scan_num(Context *c, uint64_t max_scan_num) {
+    c->h.max_scan_num = max_scan_num;
+    return 0;
+  }
+
+  inline static void clear(Context *c) {
+    c->cur_num++;
+    if (c->cur_num == 0) {
+      memset(c->buf.data(), 0, c->h.max_doc_cnt * sizeof(uint8_t));
+      c->cur_num = 1;
+    }
+    return;
+  }
+
+  inline static bool reset(Context *c, uint64_t max_doc_cnt,
+                           uint64_t max_scan_num) {
+    if (ailego_unlikely(max_doc_cnt > c->h.max_doc_cnt ||
+                        max_scan_num > c->h.max_scan_num)) {
+      try {
+        c->buf.resize(max_doc_cnt);
+      } catch (const std::exception &e) {
+        LOG_ERROR("New memory in initVisitByteMap failed, reuse old one");
+        return false;
+      }
+      memset(c->buf.data(), 0, max_doc_cnt * sizeof(uint8_t));
+      c->cur_num = 1;
+      c->h.max_doc_cnt = max_doc_cnt;
+      c->h.max_scan_num = max_scan_num;
+      return true;
+    }
+    return true;
+  }
+
+  template <class... T>
+  static int init(Context *, void **ctx, uint64_t max_doc_cnt,
+                  uint64_t max_scan_num, std::tuple<T...> &&tpl) {
+    (void)tpl;  // unused warning
+    Context *c = new (std::nothrow) Context;
+    if (c == nullptr) {
+      LOG_ERROR("New memory in initVisitByteMap failed");
+      return IndexError_NoMemory;
+    }
+    c->h.max_doc_cnt = max_doc_cnt;
+    c->h.max_scan_num = max_scan_num;
+    try {
+      c->buf.resize(max_doc_cnt);
+    } catch (const std::exception &e) {
+      LOG_ERROR("New memory in initVisitByteMap failed");
+      delete c;
+      return IndexError_NoMemory;
+    }
+    memset(c->buf.data(), 0, max_doc_cnt * sizeof(uint8_t));
+    c->cur_num = 1;
+    *ctx = c;
+    return 0;
+  }
+
+  inline static void destroy(Context *c) {
+    delete c;
+  }
+};  // end of VisitByteMap
+
+
+#define PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(cls, impl, ctx, ...) \
+  case cls::mode:                                                 \
+    return cls::impl(static_cast<cls::Context *>(ctx), ##__VA_ARGS__);
+
+#define PROXIMA_HNSW_VISITFILTER_CALL_IMPL(impl, ...)                  \
+  switch (mode_) {                                                     \
+    PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(VisitBloomFilter, impl, ctx_, \
+                                         ##__VA_ARGS__)                \
+    PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(VisitBitMap, impl, ctx_,      \
+                                         ##__VA_ARGS__)                \
+    PROXIMA_HNSW_VISITFILTER_SWITCH_CASE(VisitByteMap, impl, ctx_,     \
+                                         ##__VA_ARGS__)                \
+  }
+
+
+class VisitFilter;
+
+// Invoke fn(view) once with a concrete, non-owning VisitFilterView. Returns
+// false without invoking fn if the filter is uninitialized or has an unknown
+// mode. Use the mutable view only within the callback, and do not reset/destroy
+// its owner there. Legacy per-operation VisitFilter accessors remain available.
+template <typename Fn>
+[[nodiscard]] bool dispatch_visit_filter(VisitFilter &visit_filter, Fn &&fn);
+
+// A pointer-sized adapter for statically dispatched hot loops. Copying a view
+// shares the existing context; it does not allocate or own filter storage.
+template <typename Impl>
+class VisitFilterView {
+ public:
+  ailego_force_inline bool visited(id_t idx) const {
+    return Impl::visited(ctx_, idx);
+  }
+
+  ailego_force_inline void set_visited(id_t idx) const {
+    Impl::set_visited(ctx_, idx);
+  }
+
+  ailego_force_inline void clear() const {
+    Impl::clear(ctx_);
+  }
+
+ private:
+  template <typename Fn>
+  friend bool dispatch_visit_filter(VisitFilter &visit_filter, Fn &&fn);
+
+  explicit VisitFilterView(typename Impl::Context *ctx) : ctx_(ctx) {}
+
+  typename Impl::Context *ctx_;
+};
+
+class VisitFilter {
+ public:
+  enum Mode {
+    Default = 0,
+    BloomFilter = VisitBloomFilter::mode,
+    BitMap = VisitBitMap::mode,
+    ByteMap = VisitByteMap::mode
+  };
+
+  VisitFilter() : mode_(0), ctx_(nullptr) {};
+  ~VisitFilter() {
+    destroy();
+  }
+
+  inline bool visited(id_t idx) {
+    PROXIMA_HNSW_VISITFILTER_CALL_IMPL(visited, idx);
+    return true;  // place holder
+  }
+
+  inline void set_visited(id_t idx) {
+    PROXIMA_HNSW_VISITFILTER_CALL_IMPL(set_visited, idx);
+  }
+
+  inline void *get_visited(id_t idx) {
+    PROXIMA_HNSW_VISITFILTER_CALL_IMPL(get_visited, idx);
+    return nullptr;  // place holder
+  }
+
+  inline int set_max_scan_num(id_t idx) {
+    PROXIMA_HNSW_VISITFILTER_CALL_IMPL(set_max_scan_num, idx);
+    return 0;  // place holder
+  }
+
+  inline void clear() {
+    PROXIMA_HNSW_VISITFILTER_CALL_IMPL(clear);
+  }
+
+  inline bool reset(uint64_t max_doc_cnt, uint64_t max_scan_num) {
+    PROXIMA_HNSW_VISITFILTER_CALL_IMPL(reset, max_doc_cnt, max_scan_num);
+    return true;
+  }
+
+  inline void destroy() noexcept {
+    void *ctx = ctx_;
+    const int mode = mode_;
+    ctx_ = nullptr;
+    mode_ = Default;
+    if (ctx == nullptr) {
+      return;
+    }
+
+    switch (mode) {
+      case BloomFilter:
+        VisitBloomFilter::destroy(
+            static_cast<VisitBloomFilter::Context *>(ctx));
+        return;
+      case BitMap:
+        VisitBitMap::destroy(static_cast<VisitBitMap::Context *>(ctx));
+        return;
+      case ByteMap:
+        VisitByteMap::destroy(static_cast<VisitByteMap::Context *>(ctx));
+        return;
+      default:
+        return;
+    }
+  }
+
+  int init(int mode, uint64_t max_doc_cnt, uint64_t max_scan_num,
+           float negative_probability) {
+    destroy();
+    mode_ = mode;
+    int ret = 0;
+    switch (mode_) {
+      case BloomFilter:
+        ret = VisitBloomFilter::init(
+            static_cast<VisitBloomFilter::Context *>(nullptr), &ctx_,
+            max_doc_cnt, max_scan_num, std::make_tuple(negative_probability));
+        break;
+      case BitMap:
+        ret = VisitBitMap::init(static_cast<VisitBitMap::Context *>(nullptr),
+                                &ctx_, max_doc_cnt, max_scan_num,
+                                std::make_tuple(negative_probability));
+        break;
+      case ByteMap:
+        ret = VisitByteMap::init(static_cast<VisitByteMap::Context *>(nullptr),
+                                 &ctx_, max_doc_cnt, max_scan_num,
+                                 std::make_tuple(negative_probability));
+        break;
+      default:
+        // Preserve the existing contract for an unsupported mode: context
+        // construction succeeds with no implementation, and the search-time
+        // dispatcher reports the unsupported mode explicitly.
+        return 0;
+    }
+    if (ret != 0) {
+      ctx_ = nullptr;
+      mode_ = Default;
+    }
+    return ret;
+  }
+
+  int get_mode() const {
+    return mode_;
+  }
+
+
+  VisitFilter(const VisitFilter &) = delete;
+  VisitFilter &operator=(const VisitFilter &) = delete;
+
+ private:
+  template <typename Fn>
+  friend bool dispatch_visit_filter(VisitFilter &visit_filter, Fn &&fn);
+
+  int mode_{0U};  // custom data for each method
+  void *ctx_{nullptr};
+};
+
+template <typename Fn>
+bool dispatch_visit_filter(VisitFilter &visit_filter, Fn &&fn) {
+  if (visit_filter.ctx_ == nullptr) {
+    return false;
+  }
+  switch (visit_filter.mode_) {
+    case VisitBloomFilter::mode:
+      std::forward<Fn>(fn)(VisitFilterView<VisitBloomFilter>(
+          static_cast<VisitBloomFilter::Context *>(visit_filter.ctx_)));
+      return true;
+    case VisitBitMap::mode:
+      std::forward<Fn>(fn)(VisitFilterView<VisitBitMap>(
+          static_cast<VisitBitMap::Context *>(visit_filter.ctx_)));
+      return true;
+    case VisitByteMap::mode:
+      std::forward<Fn>(fn)(VisitFilterView<VisitByteMap>(
+          static_cast<VisitByteMap::Context *>(visit_filter.ctx_)));
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace core
+}  // namespace zvec

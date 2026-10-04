@@ -1,0 +1,18 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { InstructionsCatalog } from "../components/brand/InstructionsCatalog";
+import { instructions, searchIndex } from "../lib/site-data";
+import data from "../../public/data/instructions.json";
+---
+
+<BaseLayout
+  title="Instructions | Awesome GitHub Copilot"
+  description="Browse community-contributed instructions for GitHub Copilot."
+>
+  <InstructionsCatalog
+    client:load
+    instructions={instructions as any}
+    filters={data.filters as any}
+    searchIndex={searchIndex}
+  />
+</BaseLayout>

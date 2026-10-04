@@ -1,0 +1,790 @@
+@layer theme, base, components, utilities;
+
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/utilities.css' layer(utilities) source(none);
+@import 'shadow-plugin';
+@import './token.css';
+@import './generated/tokens.css';
+
+@config '../../tailwind.config.js';
+@source '../../index.html';
+@source '../../src';
+@source '../../.storybook';
+@source not inline('container');
+
+/* Public Accent / Neutral / Ink / Hairline / Ring groups. Engine still emits
+   compatibility axes; product call sites must use these public names. */
+@source inline('{hover:,focus:,active:,disabled:,focus-visible:,group-hover:,dark:,}bg-ds-neutral-{subtle,muted,default,strong}-{default,hover,selected,disabled}');
+@source inline('{hover:,focus:,active:,disabled:,focus-visible:,group-hover:,dark:,placeholder:,}text-ds-ink-{subtle,muted,default,strong}-{default,hover,selected,disabled}');
+@source inline('{hover:,focus:,active:,disabled:,focus-visible:,group-hover:,dark:,}border-ds-hairline-{subtle,muted,default,strong}-{default,hover,selected,disabled}');
+@source inline('{hover:,focus:,active:,disabled:,focus-visible:,group-hover:,dark:,}bg-ds-accent-{subtle,muted,default,strong}-{default,hover,selected,disabled}');
+@source inline('{hover:,focus:,active:,disabled:,focus-visible:,group-hover:,dark:,}divide-ds-hairline-{subtle,muted,default,strong}-{default,hover,selected,disabled}');
+@source inline('{hover:,focus-visible:,focus:,focus-within:,}ring-ds-ring-focus');
+@source inline('text-ds-ink-inverse text-ds-icon-inverse !text-ds-ink-inverse !text-ds-icon-inverse');
+
+/* Palatino LT — welcome headline on History; files in /public/fonts/palatino-lt/ */
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-light.ttf') format('truetype');
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-light-italic.ttf') format('truetype');
+  font-weight: 300;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-roman.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-medium.ttf') format('truetype');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-medium-italic.ttf')
+    format('truetype');
+  font-weight: 500;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-bold-italic.ttf') format('truetype');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-black.ttf') format('truetype');
+  font-weight: 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Palatino LT';
+  src: url('/fonts/palatino-lt/palatino-lt-black-italic.ttf') format('truetype');
+  font-weight: 900;
+  font-style: italic;
+  font-display: swap;
+}
+
+.history-welcome-headline,
+.font-display {
+  font-family:
+    'Palatino LT', 'Palatino Linotype', 'Book Antiqua', Palatino, serif;
+}
+
+:root {
+  font-family: 'Inter';
+  line-height: 1.5;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color-scheme: light dark;
+
+  --shadow-workspace-project-picker:
+    inset 0 0 0 1px var(--ds-bg-neutral-subtle-default),
+    0 0 4px var(--ds-bg-neutral-strong-default);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+* {
+  font-family: 'Inter';
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family: Inter;
+  width: 100%;
+  height: 100%;
+  background-color: transparent !important;
+}
+
+@layer base {
+  body {
+    color: var(--ds-text-neutral-default-default);
+  }
+
+  p,
+  span,
+  li,
+  label {
+    color: inherit;
+  }
+
+  button {
+    color: inherit;
+    background-color: transparent;
+  }
+
+  input,
+  textarea,
+  select {
+    color: var(--ds-text-neutral-default-default);
+    background-color: var(--ds-bg-neutral-subtle-default);
+    border: 1px solid var(--ds-border-neutral-default-default);
+    outline: none;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--ds-text-neutral-subtle-default);
+    opacity: 1;
+  }
+
+  .lucide {
+    color: var(--ds-icon-neutral-muted-default);
+    stroke: currentColor;
+  }
+
+  button .lucide,
+  a .lucide,
+  .lucide[data-state='active'] {
+    color: inherit;
+  }
+
+  :is(
+    .bg-white,
+    .bg-white-100,
+    .bg-white-50,
+    [class*='bg-white-100%'],
+    [class*='bg-white-50']
+  ) {
+    color: var(--ds-text-neutral-default-default);
+    background-color: var(--ds-bg-neutral-default-default) !important;
+    box-shadow: none;
+  }
+
+  [class*='bg-white-50'] {
+    background-color: var(--ds-bg-neutral-strong-default) !important;
+  }
+
+  .theme-image-invert-dark {
+    filter: none;
+    transition: filter 150ms ease;
+  }
+
+  [data-theme='dark'] .theme-image-invert-dark {
+    filter: brightness(0) invert(1);
+  }
+}
+
+#root,
+.App {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+#root {
+  box-shadow:
+    -2px -2px 100px rgba(255, 255, 255, 0.1) inset,
+    2px 2px 100px rgba(29, 29, 29, 0.1) inset;
+  background-color: var(--ds-bg-neutral-subtle-default) !important;
+  backdrop-filter: blur(75px);
+  z-index: 0;
+  color: var(--ds-text-neutral-default-default);
+  position: relative;
+  isolation: isolate;
+}
+
+.blur {
+  position: relative;
+  z-index: 0;
+  box-shadow:
+    -2px -2px 100px rgba(255, 255, 255, 0.1) inset,
+    2px 2px 100px rgba(29, 29, 29, 0.1) inset;
+  z-index: -1;
+  backdrop-filter: blur(75px);
+  -webkit-backdrop-filter: blur(75px);
+}
+
+.blur > * {
+  position: relative;
+  z-index: 3;
+}
+
+.blur-bg {
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  z-index: 1;
+  box-shadow:
+    -2px -2px 100px rgba(255, 255, 255, 0.1) inset,
+    2px 2px 100px rgba(29, 29, 29, 0.1) inset;
+}
+
+/* Perfect Shadow */
+.perfect-shadow,
+.soft-shadow {
+  box-shadow: var(--shadow-soft);
+}
+
+.blur-effect {
+  box-shadow:
+    -2px -2px 0 rgba(255, 255, 255, 0.1) inset,
+    2px 2px 100px rgba(29, 29, 29, 0.1) inset;
+  backdrop-filter: blur(150px);
+  -webkit-backdrop-filter: blur(150px);
+}
+
+/* Custom ResizableHandle Styles */
+.custom-resizable-handle {
+  width: 2px;
+  height: 40px;
+  background: rgba(200, 200, 200, 0.3);
+  transition: background-color 0.2s ease;
+  position: relative;
+  border-radius: 10px;
+}
+
+.custom-resizable-handle:hover {
+  background: var(--ds-accent-default-hover);
+  width: 2px;
+  height: 40px;
+  transform: none;
+  border-radius: 10px;
+}
+
+.custom-resizable-handle div {
+  display: none !important;
+}
+
+.custom-resizable-handle svg {
+  display: none !important;
+}
+
+.radix-alert-dialog {
+  position: fixed;
+  top: 0px;
+  left: 0px;
+  width: 100vw;
+  height: 100vh;
+}
+
+/*
+ * Vite template leftovers. Keep them in `@layer base` so Tailwind utilities
+ * (and component `!` recipes) win in Electron. Unlayered `button { padding }`
+ * and `h1 { font-size }` otherwise crush every control and heading.
+ */
+@layer base {
+  h1 {
+    font-size: inherit;
+    line-height: inherit;
+  }
+
+  button {
+    border-style: none;
+    border-width: 0;
+    padding: 0;
+    font-size: inherit;
+    cursor: pointer;
+  }
+
+  input {
+    border-color: transparent;
+  }
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.drag {
+  -webkit-app-region: drag;
+}
+
+@layer base {
+  :root {
+    --spacing-xs: var(--ds-ref-space-4);
+    --spacing-sm: var(--ds-ref-space-8);
+    --spacing-md: var(--ds-ref-space-16);
+    --spacing-lg: var(--ds-ref-space-32);
+    --spacing-xl: var(--ds-ref-space-64);
+    --spacing-multi-value: 8 64;
+    /* Tailwind spacing-2 / `px-2` — always-visible scrollbar track. */
+    --scrollbar-size: 0.5rem;
+    --borderRadius-sm: var(--ds-ref-radius-4);
+    --borderRadius-lg: var(--ds-ref-radius-8);
+    --borderRadius-xl: var(--ds-ref-radius-16);
+    --borderRadius-multi-value: 4 8;
+    --fontSize-xs: 10px;
+    --fontSize-sm: var(--ds-text-base-size);
+    --fontSize-base: 15px;
+    --fontSize-md: 16px;
+    --fontSize-lg: 18px;
+    --fontSize-xl: 20px;
+    --fontSize-2xl: 24px;
+    --fontSize-3xl: 28px;
+    --fontSize-4xl: 36px;
+    --fontSize-5xl: 44px;
+    --lineHeight-0: 58px;
+    --lineHeight-1: 58px;
+    --lineHeight-2: 46px;
+    --lineHeight-3: 36px;
+    --lineHeight-4: 32px;
+    --lineHeight-5: 30px;
+    --lineHeight-6: 30px;
+    --lineHeight-7: 30px;
+    --lineHeight-8: 30px;
+    --lineHeight-9: 22px;
+    --lineHeight-10: 22px;
+    --lineHeight-11: 22px;
+    --lineHeight-12: 22px;
+    --lineHeight-13: 20px;
+    --lineHeight-14: 20px;
+    --lineHeight-15: 20px;
+    --lineHeight-16: 20px;
+    --lineHeight-17: 16px;
+    --lineHeight-18: 16px;
+    --lineHeight-19: 16px;
+    --lineHeight-20: 16px;
+    --lineHeight-21: 16px;
+    --lineHeight-22: 16px;
+    --lineHeight-23: 20px;
+    --lineHeight-24: 20px;
+    --lineHeight-25: 22px;
+    --lineHeight-26: 22px;
+    --lineHeight-27: 24px;
+    --lineHeight-28: 24px;
+    --lineHeight-29: 16px;
+    --lineHeight-30: 16px;
+    --lineHeight-tight: 16px;
+    --lineHeight-normal: 20px;
+    --lineHeight-relaxed: 22px;
+    --lineHeight-loose: 24px;
+    --lineHeight-xl: 28px;
+    --lineHeight-2xl: 30px;
+    --lineHeight-3xl: 32px;
+    --lineHeight-4xl: 36px;
+    --lineHeight-5xl: 46px;
+    --lineHeight-6xl: 58px;
+    --fontWeight-regular: 400;
+    --fontWeight-medium: 500;
+    --fontWeight-semibold: 600;
+    --fontWeight-bold: 700;
+    --fontWeight-inter-0: 700;
+    --fontWeight-inter-1: 400;
+    --fontWeight-inter-2: 500;
+    --fontWeight-menlo-3: 400;
+  }
+}
+
+/* scroll Style */
+
+.scrollbar {
+  scrollbar-gutter: stable;
+}
+
+.scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scrollbar::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 3px;
+  transition: background-color 0.3s ease;
+}
+
+.scrollbar.scrolling::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.2);
+}
+
+.scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(156, 163, 175, 0.2);
+}
+
+.scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-always-visible {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(156, 163, 175, 0.3) transparent;
+}
+
+.scrollbar-always-visible::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+.scrollbar-always-visible::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.6);
+  border-radius: 4px;
+  opacity: 0.5;
+  transition: opacity 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.scrollbar-always-visible::-webkit-scrollbar-thumb:hover {
+  opacity: 1;
+}
+
+.scrollbar-always-visible::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Overlay scrollbar - sits on top of content without taking space */
+.scrollbar-overlay {
+  overflow-y: scroll;
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: transparent transparent; /* Firefox - invisible by default */
+}
+
+.scrollbar-overlay:hover {
+  scrollbar-color: rgba(0, 0, 0, 0.3) transparent; /* Firefox - show on hover */
+}
+
+.scrollbar-overlay::-webkit-scrollbar {
+  width: 8px;
+  background: transparent;
+}
+
+.scrollbar-overlay::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-overlay::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+  transition: background 0.2s ease;
+}
+
+.scrollbar-overlay:hover::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.scrollbar-overlay::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.terminal-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.terminal-scrollbar::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  margin: 2px;
+}
+
+.terminal-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
+}
+
+.terminal-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.terminal-scrollbar::-webkit-scrollbar-thumb:active {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.terminal-scrollbar::-webkit-scrollbar-corner {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.scrollbar-horizontal::-webkit-scrollbar {
+  height: 6px;
+}
+
+.scrollbar-horizontal::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.8);
+  border-radius: 3px;
+}
+
+.scrollbar-horizontal::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  /* IE & Edge */
+  scrollbar-width: none;
+  /* Firefox */
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  margin: 2px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:active {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-corner {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.stack-login-btn,
+.stack-login-btn button {
+  width: 100%;
+}
+
+.markdown-container ol {
+  padding-left: 1rem;
+  font-size: 12px; /* text-sm */
+}
+
+/* Hover-style scrollbar - appears only on hover with 20% opacity */
+.hover-style-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.hover-style-scrollbar:hover {
+  scrollbar-color: rgba(0, 0, 0, 0.4) transparent;
+}
+
+.hover-style-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.hover-style-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.hover-style-scrollbar::-webkit-scrollbar-thumb {
+  background-color: var(--ds-text-neutral-muted-default, rgba(0, 0, 0, 0.4));
+  opacity: 0;
+  border-radius: 9999px;
+  transition: opacity 0.2s ease;
+}
+
+.hover-style-scrollbar:hover::-webkit-scrollbar-thumb {
+  opacity: 0.2;
+}
+
+/* Scoped file viewer: prevent file content CSS from affecting sidebar and app layout */
+.file-viewer-content {
+  contain: style;
+  isolation: isolate;
+}
+
+/* Dark mode overrides for FolderComponent (CSV/table content) */
+[data-theme='dark'] .folder-component-content {
+  color: var(--ds-text-neutral-default-default);
+}
+
+[data-theme='dark'] .folder-component-content * {
+  color: inherit;
+}
+
+[data-theme='dark'] .folder-component-content table {
+  border-collapse: collapse;
+}
+
+[data-theme='dark'] .folder-component-content table th,
+[data-theme='dark'] .folder-component-content table td {
+  border-color: #30363d !important;
+  color: var(--ds-text-neutral-default-default) !important;
+}
+
+[data-theme='dark'] .folder-component-content table th {
+  background-color: #161b22 !important;
+}
+
+[data-theme='dark'] .folder-component-content table tr {
+  background-color: transparent !important;
+  border-top-color: #30363d !important;
+}
+
+[data-theme='dark'] .folder-component-content table tr:nth-child(2n) {
+  background-color: rgba(110, 118, 129, 0.1) !important;
+}
+
+/* Folder zoom controls only travel in response to a real hover-capable pointer. */
+.zoom-controls-reveal {
+  opacity: 0;
+  transform: translateY(calc(-100% - 8px));
+  transition: opacity 200ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .zoom-controls-reveal {
+    transition:
+      transform 200ms cubic-bezier(0.23, 1, 0.32, 1),
+      opacity 200ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+
+  .group:hover > .zoom-controls-reveal {
+    opacity: 1;
+    transform: translateY(20px);
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .zoom-controls-reveal {
+    opacity: 1;
+    transform: translateY(20px);
+  }
+}
+
+/* ProgressInstall shimmer background */
+.progress-install-shimmer {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  border-radius: var(--borderRadius-lg);
+}
+
+.progress-install-shimmer::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 200%;
+  background: linear-gradient(
+    120deg,
+    transparent 0%,
+    color-mix(in srgb, var(--colors-primary-4) 8%, transparent) 25%,
+    color-mix(in srgb, var(--colors-primary-4) 20%, transparent) 50%,
+    color-mix(in srgb, var(--colors-primary-4) 8%, transparent) 75%,
+    transparent 100%
+  );
+  animation: progress-install-shimmer 3s linear infinite;
+  will-change: transform;
+}
+
+@keyframes progress-install-shimmer {
+  0% {
+    transform: translateX(50%);
+  }
+  100% {
+    transform: translateX(-100%);
+  }
+}
+
+/* Chat: single-agent "working" — static gradient with an opacity pulse. */
+.single-agent-text-shimmer {
+  color: transparent;
+  background: linear-gradient(
+    110deg,
+    var(--ds-text-neutral-default-default) 0%,
+    var(--ds-text-neutral-default-default) 35%,
+    var(--colors-primary-4) 50%,
+    var(--ds-text-neutral-default-default) 65%,
+    var(--ds-text-neutral-default-default) 100%
+  );
+  background-size: 250% 100%;
+  background-position: 50% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: single-agent-text-pulse 1.2s cubic-bezier(0.77, 0, 0.175, 1)
+    infinite alternate;
+}
+
+@keyframes single-agent-text-pulse {
+  0% {
+    opacity: 0.65;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin,
+  .animate-pulse,
+  .animate-bounce,
+  .animate-ping {
+    animation: none !important;
+  }
+
+  /* Keep short fades from tailwindcss-animate, but remove travel, rotation,
+     and scale from shared sheets and other animate-in/out surfaces. */
+  .animate-in,
+  .animate-out {
+    --tw-enter-translate-x: 0 !important;
+    --tw-enter-translate-y: 0 !important;
+    --tw-enter-rotate: 0 !important;
+    --tw-enter-scale: 1 !important;
+    --tw-exit-translate-x: 0 !important;
+    --tw-exit-translate-y: 0 !important;
+    --tw-exit-rotate: 0 !important;
+    --tw-exit-scale: 1 !important;
+    animation-duration: 200ms !important;
+  }
+
+  .zoom-controls-reveal {
+    transition: opacity 200ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+
+  .progress-install-shimmer::before {
+    animation: none;
+    transform: translateX(-25%);
+    will-change: auto;
+  }
+
+  .single-agent-text-shimmer {
+    animation: none;
+    opacity: 1;
+    color: var(--ds-text-neutral-default-default);
+    background: none;
+  }
+}

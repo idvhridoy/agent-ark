@@ -1,0 +1,377 @@
+---
+title: 'Installing and Using Plugins'
+description: 'Learn how to find, install, and manage plugins that extend GitHub Copilot CLI with reusable agents, skills, hooks, and integrations.'
+authors:
+  - GitHub Copilot Learning Hub Team
+lastUpdated: 2026-09-22
+relatedArticles:
+  - ./building-custom-agents.md
+  - ./creating-effective-skills.md
+  - ./automating-with-hooks.md
+prerequisites:
+  - GitHub Copilot CLI installed
+  - Basic understanding of agents, skills, and hooks
+---
+
+Plugins are installable packages that extend GitHub Copilot CLI with reusable agents, skills, hooks, and servers, all bundled into a single unit you can install with one command. Instead of manually copying agent files and configuring MCP servers across every project, plugins let you install a curated set of capabilities and share them with your team.
+
+This article explains what plugins contain, how to find and install them, and how to manage your plugin library.
+
+## What's Inside a Plugin?
+
+A plugin bundles one or more of the following components:
+
+| Component | What It Does | File Location |
+|-----------|-------------|---------------|
+| **Custom Agents** | Specialized AI assistants with tailored expertise | `agents/*.agent.md` |
+| **Skills** | Discrete callable capabilities with bundled resources | `skills/*/SKILL.md` |
+| **Hooks** | Event handlers that intercept agent behavior | `hooks.json` or `hooks/` |
+| **MCP Servers** | Model Context Protocol integrations for external tools | `.mcp.json` or `.github/mcp.json` |
+| **LSP Servers** | Language Server Protocol integrations | `lsp.json` or `.github/lsp.json` |
+| **Extensions** | IDE extensions installable via the plugin marketplace | `extensions/` |
+
+Agent Plugins spec plugins can also ship canvas extensions under a `com.github.copilot/extensions/` directory inside the plugin, so a single plugin package can bundle agents, skills, and canvas extensions together.
+
+A plugin might include all of these or just one — for example, a plugin could provide a single specialized agent, or an entire development toolkit with multiple agents, skills, hooks, and MCP server configurations working together.
+
+### Example: What a Plugin Looks Like
+
+Here's the structure of a typical plugin:
+
+```
+my-plugin/
+├── .github/
+│   └── plugin/
+│       └── plugin.json        # Plugin manifest (name, description, version)
+├── agents/
+│   ├── api-architect.agent.md
+│   └── test-specialist.agent.md
+├── skills/
+│   └── database-migrations/
+│       ├── SKILL.md
+│       └── scripts/migrate.sh
+├── hooks.json
+└── README.md
+```
+
+The `plugin.json` manifest declares what the plugin contains:
+
+```json
+{
+  "name": "my-plugin",
+  "description": "API development toolkit with specialized agents and migration skills",
+  "version": "1.0.0",
+  "agents": [
+    "./agents/api-architect.md",
+    "./agents/test-specialist.md"
+  ],
+  "skills": [
+    "./skills/database-migrations/"
+  ]
+}
+```
+
+## Why Use Plugins?
+
+You might wonder: why not just copy agent files into your project manually? Plugins provide several advantages:
+
+| Feature | Manual Configuration | Plugin |
+|---------|---------------------|--------|
+| **Scope** | Single repository | Any project |
+| **Sharing** | Manual copy/paste | `copilot plugin install` command |
+| **Versioning** | Git history | Marketplace versions |
+| **Discovery** | Searching repositories | Marketplace browsing |
+| **Updates** | Manual tracking | `copilot plugin update` |
+
+Plugins are especially valuable when you want to:
+
+- **Standardize across a team** — Everyone installs the same plugin for consistent tooling
+- **Share domain expertise** — Package a Rails expert, Kubernetes specialist, or security reviewer as an installable unit
+- **Encapsulate complex setups** — Bundle MCP server configurations that would otherwise require manual setup
+- **Reuse across projects** — Install the same capabilities in every project without duplicating files
+
+## Finding Plugins
+
+Plugins are collected in **marketplaces** — registries you can browse and install from. Both Copilot CLI and VS Code come with two marketplaces registered by default — **no setup required**:
+
+- **`copilot-plugins`** — Official GitHub Copilot plugins
+- **`awesome-copilot`** — Community-contributed plugins from this repository
+
+### Browsing in Copilot CLI
+
+List your registered marketplaces:
+
+```bash
+copilot plugin marketplace list
+```
+
+Browse plugins in a specific marketplace:
+
+```bash
+copilot plugin marketplace browse awesome-copilot
+```
+
+Or from within an interactive Copilot session:
+
+```
+/plugin marketplace browse awesome-copilot
+```
+
+> **Tip**: You can also browse plugins on this site's [Plugins Directory](../../plugins/) to see descriptions, included agents, and skills before installing.
+
+### Browsing in VS Code
+
+Because `awesome-copilot` is a default marketplace in VS Code, you can discover plugins without any configuration:
+
+- Open the **Extensions** search view and type **`@agentPlugins`** to see all available plugins
+- Or open the **Command Palette** (`Ctrl+Shift+P` / `Cmd+Shift+P`) and run **Chat: Plugins**
+
+### Adding More Marketplaces
+
+Register additional marketplaces from GitHub repositories:
+
+```bash
+copilot plugin marketplace add anthropics/claude-code
+```
+
+Or from a local path:
+
+```bash
+copilot plugin marketplace add /path/to/local-marketplace
+```
+
+### Sharing Marketplace Registrations Across a Team
+
+To automatically register an additional marketplace for everyone working in a repository, add an `extraKnownMarketplaces` entry to your `.github/copilot-settings.json` (or `config.json`):
+
+```json
+{
+  "extraKnownMarketplaces": [
+    {
+      "name": "my-org-plugins",
+      "source": "my-org/internal-plugins"
+    }
+  ]
+}
+```
+
+With this in place, team members automatically get the `my-org-plugins` marketplace available without running a separate `marketplace add` command.
+
+**Auto-updating team marketplaces**: Set `"autoUpdate": true` on an `extraKnownMarketplaces` entry to have that marketplace's plugins update automatically at the start of each session, without requiring a manual `copilot plugin marketplace update` or `copilot plugin update`:
+
+```json
+{
+  "extraKnownMarketplaces": [
+    {
+      "name": "my-org-plugins",
+      "source": "my-org/internal-plugins",
+      "autoUpdate": true
+    }
+  ]
+}
+```
+
+This is useful for internal marketplaces where you want every team member to always be running the latest published plugin versions.
+
+### Pinning a Marketplace to a Specific Commit
+
+To ensure reproducibility and prevent unintended updates, you can pin a marketplace to an exact commit SHA using the `sha` field in the source configuration:
+
+```json
+{
+  "extraKnownMarketplaces": [
+    {
+      "name": "my-org-plugins",
+      "source": "my-org/internal-plugins",
+      "sha": "a1b2c3d4e5f6..."
+    }
+  ]
+}
+```
+
+Pinning to a SHA guarantees that everyone on the team installs plugins from exactly that snapshot of the marketplace, regardless of subsequent changes to the repository. This is useful for:
+
+- **Reproducible CI environments** — ensure builds always use the same plugin versions
+- **Change control** — review and approve plugin updates before rolling them out team-wide
+- **Stability** — prevent breaking changes in upstream marketplaces from impacting your team without notice
+
+## Installing Plugins
+
+### From Copilot CLI
+
+Reference a plugin by name and marketplace:
+
+```bash
+copilot plugin install database-data-management@awesome-copilot
+```
+
+Or from an interactive session:
+
+```
+/plugin install database-data-management@awesome-copilot
+```
+
+> **Deprecation notice**: Installing plugins directly from a GitHub repository URL, raw URL, or local file path (e.g., `copilot plugin install github/awesome-copilot`) is deprecated and will be removed in a future release. Use marketplace-based installation instead.
+
+### From VS Code
+
+Browse to the plugin via `@agentPlugins` in the Extensions search view or via **Chat: Plugins** in the Command Palette, then click **Install**.
+
+## Managing Plugins
+
+Once installed, plugins are managed with a few simple commands:
+
+```bash
+# List all installed plugins
+copilot plugin list
+
+# Update a plugin to the latest version
+copilot plugin update my-plugin
+
+# Refresh all marketplace catalogs (fetch the latest list of available plugins)
+copilot plugin marketplace update
+
+# Remove a plugin
+copilot plugin uninstall my-plugin
+```
+
+> **Auto-update for first-party plugins**: Plugins sourced from the official `copilot-plugins` marketplace automatically update to their latest version at the start of each session. You do not need to run `copilot plugin update` for first-party plugins — updates are applied silently on startup. Community plugins from `awesome-copilot` and other marketplace registries still require a manual `copilot plugin update` command.
+
+Individual component kinds have their own dedicated CLI commands. Use `copilot instruction list` and `copilot lsp list` to inspect loaded instructions and LSP servers, and use `enable`/`disable` directly on `copilot plugin`, `copilot mcp`, and `copilot skill` (for example, `copilot skill disable my-skill`). Install a standalone skill with `copilot skill add [--project]`. See [Compatibility and Migration Notes](#compatibility-and-migration-notes) if you have scripts using the older cross-kind `copilot plugins` flags.
+
+### Enabling and Disabling Plugin Components
+
+Run `/plugin` (or `copilot plugin list` in non-interactive mode) to see **enable/disable toggles** for individual plugin components. You can turn off specific agents, instructions, hooks, LSP servers, or entire plugins without uninstalling them:
+
+```
+/plugin
+```
+
+This opens an interactive list where each installed plugin and its components are shown with a toggle. Disabling a component hides it from Copilot without removing it from disk — useful for temporarily deactivating a hook that is too noisy, or turning off a plugin's instructions when working on a different type of project. Re-enable the component at any time from the same `/plugin` menu.
+
+`/plugin` also flags installed plugins and marketplaces that have a newer version available upstream, and offers an **Update** action to pull the latest version directly from the dashboard.
+
+The plugins dashboard (`/plugin`, `/mcp`, and `/skills`) is on for all users by default; `/skills`, bare `/mcp`, and `/mcp show` (with no server name) open the dashboard, and `/mcp config` opens the dedicated MCP wizard. See [Compatibility and Migration Notes](#compatibility-and-migration-notes) for the history of the retired `/plugins` command and its dashboard opt-out.
+
+### Loading Plugins from a Local Directory
+
+You can load plugins directly from a local directory without installing them from a marketplace, using the `--plugin-dir` flag when starting Copilot:
+
+```bash
+copilot --plugin-dir /path/to/my-plugin
+```
+
+Plugins loaded this way appear in `/plugin list` under a separate **External Plugins** section, clearly distinguished from marketplace-installed plugins. This is useful for testing local plugins in development or loading private plugins that aren't published to any marketplace.
+
+### Where Plugins Are Stored
+
+- **Marketplace plugins**: `~/.copilot/installed-plugins/MARKETPLACE/PLUGIN-NAME/`
+- **Direct installs**: `~/.copilot/installed-plugins/_direct/PLUGIN-NAME/`
+
+## How Plugins Work at Runtime
+
+When you install a plugin, its components become available to Copilot CLI automatically:
+
+- **Agents** appear in your agent selection (use with `/agent` or the agents dropdown)
+- **Skills** are loaded automatically when relevant to your current task
+- **Hooks** run at the configured lifecycle events during agent sessions
+- **MCP servers** extend the tools available to agents
+
+You don't need to do any additional configuration after installing — the plugin's components integrate seamlessly into your workflow. Plugins take effect immediately after installation without requiring a Copilot CLI restart.
+
+## Plugins from This Repository
+
+This repository (`awesome-copilot`) serves as both a collection of individual resources _and_ a plugin marketplace. You can use it in two ways:
+
+### Install Individual Plugins
+
+Browse the [Plugins Directory](../../plugins/) and install specific plugins:
+
+```bash
+copilot plugin install context-engineering@awesome-copilot
+copilot plugin install azure-cloud-development@awesome-copilot
+copilot plugin install frontend-web-dev@awesome-copilot
+```
+
+Each plugin bundles related agents and skills around a specific theme or technology.
+
+### Use Individual Resources Without Plugins
+
+If you only need a single agent or skill (rather than a full plugin), you can still copy individual files from this repo directly into your project:
+
+- Copy an `.agent.md` file into `.github/agents/`
+- Copy a skill folder into `.github/skills/`
+- Copy a hook configuration into `.github/hooks/`
+
+See [Using the Copilot Coding Agent](../using-copilot-coding-agent/) for details on this approach.
+
+## Agent Plugins Standard Compatibility
+
+GitHub Copilot CLI supports **Open Plugin Spec v1** plugin manifests, in addition to its own `plugin.json` format. This means plugins authored for other AI tools or platforms using the Open Plugin Spec standard can be installed and used in Copilot CLI without any modification.
+
+That standard has since matured: on August 6, 2026, [**Agent Plugins 1.0**](https://agent-plugins.org/) launched as the open, cross-tool specification for this portable packaging format, with VS Code adopting it alongside Copilot CLI. A plugin that follows the standard is just a directory containing a `plugin.json` manifest, skills under `skills/`, and MCP server configuration in `mcp.json` — no per-tool repackaging required. VS Code and Copilot CLI both read the portable parts of the package, and each also reads its own tool-specific components from a dedicated namespace (for example, `com.github.copilot/` for Copilot-specific agents, hooks, and canvas extensions). A client that doesn't recognize a given namespace simply ignores it, so one plugin package can stay portable while still bringing custom agents, slash commands, and hooks to every tool that supports the namespace.
+
+### What This Means for You
+
+If you encounter a plugin from the broader AI ecosystem (outside GitHub's own marketplace) that ships with an Agent Plugins / Open Plugin Spec manifest, you can install it directly:
+
+```bash
+copilot plugin install /path/to/openspec-plugin
+```
+
+The CLI reads the manifest, discovers the bundled agents, skills, and MCP server configuration, and integrates them the same way it handles native Copilot plugins.
+
+### `mcp.json` Configuration
+
+The Agent Plugins standard also standardizes how MCP server configuration is bundled in plugins. A plugin can now include an `mcp.json` file at its root to declare MCP servers it requires — using the same format as `.mcp.json` or `.github/mcp.json` in your repository. When you install such a plugin, its MCP server configuration is automatically merged into your active server list.
+
+This is useful for plugins that bundle dedicated tooling (for example, a database plugin that ships its own MCP server) — users get both the agent/skill and the required MCP server in a single install step.
+
+## Best Practices
+
+- **Start with a marketplace plugin** before building your own — there may already be one that fits your needs
+- **Keep plugins focused** — a plugin for "Rails development" is better than a plugin for "everything"
+- **Check for updates regularly** — run `copilot plugin update` for community plugins; first-party plugins update automatically at session start
+- **Review what you install** — plugins run code on your machine, so inspect unfamiliar plugins before installing
+- **Use plugins for team standards** — publish an internal plugin to ensure every team member has the same agents, skills, and hooks
+- **Remove unused plugins** — declutter with `copilot plugin uninstall` to keep your environment clean
+
+## Compatibility and Migration Notes
+
+This section collects behaviors that **changed or were renamed** in past releases. Check here if a command you remember stopped working — everything above describes current behavior.
+
+- **The `/plugins` command was removed.** Its functionality moved to dedicated commands: `/plugin` (plugin dashboard), `/mcp` (MCP servers), and `/skills` (skills), with `/subagents` for custom agents and `/instructions` for instructions. The plugins dashboard is now on by default for everyone; there is no supported way to opt back into the legacy `copilot plugins` command.
+- **`copilot plugins` lost its cross-kind flags.** The `--kind`, `--scope`, `--mcp`, and `--skill` flags were removed. `copilot plugins list` is now an alias of `copilot plugin list` and reports only plugins. Scripts using `copilot plugins install --skill [--scope project]` should switch to `copilot skill add [--project]`, and scripts reading `.plugins` from `copilot plugins list --json` should expect a flat array instead of the previous `{ plugins, errors }` object.
+- **The older top-level `marketplaces` setting was removed** in favor of `extraKnownMarketplaces` in `.github/copilot-settings.json` (or `config.json`).
+- **Installing plugins directly from a GitHub repository URL, raw URL, or local file path is deprecated** and will be removed in a future release — use marketplace-based installation (`copilot plugin install name@marketplace`) instead.
+
+## Common Questions
+
+**Q: Do plugins work with the coding agent on GitHub.com?**
+
+A: Plugins are specific to GitHub Copilot CLI and the VS Code extension (currently Insiders). For the coding agent on GitHub.com, add agents, skills, and hooks directly to your repository (via a plugin if you prefer!). See [Using the Copilot Coding Agent](../using-copilot-coding-agent/) for details.
+
+**Q: Can I use plugins and repository-level configuration together?**
+
+A: Yes. Plugin components are merged with your repository's local agents, skills, and hooks. Local configuration takes precedence if there are conflicts.
+
+**Q: How do I create my own plugin?**
+
+A: Create a directory with a `plugin.json` manifest and your agents/skills/hooks. See the [GitHub docs on creating plugins](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/plugins-creating) for a step-by-step guide.
+
+**Q: Can I share plugins within my organization?**
+
+A: Yes. You can create a private plugin marketplace in an internal GitHub repository, then have team members register it with `copilot plugin marketplace add org/internal-plugins`.
+
+**Q: What happens if I uninstall a plugin?**
+
+A: The plugin's agents, skills, and hooks are removed from Copilot, and any cached plugin data stored on disk is also cleaned up. Any work already done with those tools is unaffected — only future sessions lose access.
+
+## Next Steps
+
+- **Browse Plugins**: Explore the [Plugins Directory](../../plugins/) for installable plugin packages
+- **Create Skills**: [Creating Effective Skills](../creating-effective-skills/) — Build skills that can be included in plugins
+- **Build Agents**: [Building Custom Agents](../building-custom-agents/) — Create agents to package in plugins
+- **Add Hooks**: [Automating with Hooks](../automating-with-hooks/) — Configure hooks for plugin automation
+
+---

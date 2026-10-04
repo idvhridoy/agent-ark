@@ -1,0 +1,17 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { ExtensionsCatalog } from "../components/brand/ExtensionsCatalog";
+import { extensions, searchIndex } from "../lib/site-data";
+
+---
+
+<BaseLayout
+  title="Extensions | Awesome GitHub Copilot"
+  description="Browse community-contributed canvas extensions for GitHub Copilot."
+>
+  <ExtensionsCatalog
+    client:load
+    extensions={extensions as any}
+    searchIndex={searchIndex}
+  />
+</BaseLayout>

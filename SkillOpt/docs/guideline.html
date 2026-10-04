@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SkillOpt — Documentation &amp; Reproduction Guide</title>
+<meta name="description" content="Accurate entry points for installing, configuring, running, and extending SkillOpt and SkillOpt-Sleep.">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 23 23'%3E%3Crect width='10' height='10' fill='%23F25022'/%3E%3Crect x='13' width='10' height='10' fill='%237FBA00'/%3E%3Crect y='13' width='10' height='10' fill='%2300A4EF'/%3E%3Crect x='13' y='13' width='10' height='10' fill='%23FFB900'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fff;
+    --soft: #f7f8fb;
+    --ink: #1f2733;
+    --muted: #5b6675;
+    --quiet: #7c8797;
+    --line: #e2e7ef;
+    --brand: #4f46e5;
+    --brand-soft: #eef0ff;
+    --green: #047857;
+    --amber: #a16207;
+    --code-bg: #0f172a;
+    --code-ink: #e2e8f0;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background: var(--bg);
+    font: 15px/1.65 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 58px;
+    padding: 0 24px;
+    background: rgba(255,255,255,.94);
+    border-bottom: 1px solid var(--line);
+    backdrop-filter: blur(8px);
+  }
+  header svg { width: 22px; }
+  header strong { letter-spacing: -.01em; }
+  header strong span { color: var(--brand); }
+  header .spacer { flex: 1; }
+  header a {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  header a:hover { color: var(--brand); }
+  .layout {
+    display: grid;
+    grid-template-columns: 240px minmax(0, 880px);
+    justify-content: center;
+    align-items: start;
+  }
+  nav {
+    position: sticky;
+    top: 58px;
+    height: calc(100vh - 58px);
+    padding: 32px 26px;
+    overflow-y: auto;
+    border-right: 1px solid var(--line);
+  }
+  nav strong {
+    display: block;
+    margin: 18px 0 6px;
+    color: var(--quiet);
+    font-size: 11px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  nav strong:first-child { margin-top: 0; }
+  nav a {
+    display: block;
+    padding: 4px 0;
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  nav a:hover { color: var(--brand); }
+  main { padding: 46px 54px 100px; min-width: 0; }
+  section { scroll-margin-top: 76px; }
+  h1 {
+    margin: 4px 0 10px;
+    font-size: clamp(30px, 4vw, 42px);
+    line-height: 1.12;
+    letter-spacing: -.035em;
+  }
+  h2 {
+    margin: 54px 0 14px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--line);
+    font-size: 24px;
+    letter-spacing: -.02em;
+  }
+  h3 { margin: 28px 0 8px; font-size: 18px; }
+  p { margin: 10px 0; }
+  a { color: var(--brand); }
+  code {
+    padding: 2px 5px;
+    border-radius: 5px;
+    background: #eef1f6;
+    color: #9d174d;
+    font: .88em var(--mono);
+  }
+  pre {
+    overflow-x: auto;
+    margin: 14px 0;
+    padding: 16px 18px;
+    border: 1px solid #1e293b;
+    border-radius: 11px;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    font: 13px/1.6 var(--mono);
+  }
+  pre code { padding: 0; background: transparent; color: inherit; font-size: inherit; }
+  ul, ol { padding-left: 23px; }
+  li { margin: 5px 0; }
+  .eyebrow {
+    color: var(--brand);
+    font-size: 12px;
+    font-weight: 750;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+  }
+  .lead { color: var(--muted); font-size: 17px; }
+  .notice {
+    margin: 22px 0;
+    padding: 14px 17px;
+    border: 1px solid #c7d2fe;
+    border-radius: 10px;
+    background: var(--brand-soft);
+  }
+  .notice.warn { border-color: #fde68a; background: #fffbeb; }
+  .notice strong { display: block; color: var(--brand); }
+  .notice.warn strong { color: var(--amber); }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin: 18px 0;
+  }
+  .card {
+    padding: 17px;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: var(--soft);
+  }
+  .card h3 { margin: 0 0 6px; font-size: 17px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14px; }
+  .table {
+    margin: 16px 0;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { background: var(--soft); white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  footer {
+    margin-top: 60px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line);
+    color: var(--quiet);
+    font-size: 13px;
+  }
+  @media (max-width: 850px) {
+    header { padding: 0 16px; }
+    header .optional { display: none; }
+    .layout { display: block; }
+    nav { display: none; }
+    main { padding: 34px 20px 80px; }
+    .cards { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <svg viewBox="0 0 23 23" aria-hidden="true"><rect width="10" height="10" fill="#F25022"/><rect x="13" width="10" height="10" fill="#7FBA00"/><rect y="13" width="10" height="10" fill="#00A4EF"/><rect x="13" y="13" width="10" height="10" fill="#FFB900"/></svg>
+  <strong>Skill<span>Opt</span></strong>
+  <span class="spacer"></span>
+  <a class="optional" href="https://arxiv.org/abs/2605.23904">Paper</a>
+  <a class="optional" href="https://microsoft.github.io/SkillOpt/blog/">Blog</a>
+  <a href="https://github.com/microsoft/SkillOpt">GitHub</a>
+</header>
+
+<div class="layout">
+<nav aria-label="Guide sections">
+  <strong>Start here</strong>
+  <a href="#overview">Overview</a>
+  <a href="#choose">Choose a workflow</a>
+  <a href="#install">Install</a>
+  <a href="#credentials">Credentials</a>
+
+  <strong>Research engine</strong>
+  <a href="#research">First experiment</a>
+  <a href="#backends">Model backends</a>
+  <a href="#research-docs">Reference map</a>
+
+  <strong>SkillOpt-Sleep</strong>
+  <a href="#sleep">Safe first run</a>
+  <a href="#sleep-plugins">Agent integrations</a>
+  <a href="#sleep-replay">Advanced controls</a>
+  <a href="#safety">Data and safety</a>
+
+  <strong>Project</strong>
+  <a href="#contributing">Contributing</a>
+</nav>
+
+<main>
+  <span class="eyebrow">Microsoft Research · documentation hub</span>
+  <h1>SkillOpt Documentation &amp; Reproduction Guide</h1>
+  <p class="lead">Improve frozen agents by optimizing the Markdown skills that guide them—using reflective updates and held-out validation instead of weight training.</p>
+
+  <div class="notice">
+    <strong>How this guide stays accurate</strong>
+    This page is a stable, concise entry point. Detailed commands, defaults,
+    and APIs live in the versioned
+    <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/index.md">Markdown documentation</a>
+    beside the code. For exact behavior in a checkout, the command's
+    <code>--help</code>, the selected YAML config, and the code are authoritative.
+  </div>
+
+  <section id="overview">
+    <h2>Overview</h2>
+    <p><strong>SkillOpt</strong> treats a natural-language skill document as the
+    trainable state of an agent. A target model executes tasks, an optimizer
+    reflects on the resulting trajectories, bounded edits form a candidate
+    skill, and a validation gate decides whether to keep it.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>Research engine</h3>
+        <p>Run reproducible training and evaluation over benchmark splits.
+        Six released benchmark configurations cover QA, document QA, embodied
+        agents, math, spreadsheets, and tool-augmented QA.</p>
+      </div>
+      <div class="card">
+        <h3>SkillOpt-Sleep preview</h3>
+        <p>Harvest supported coding-agent sessions, mine replayable tasks, and
+        stage proposed memory or skill updates for review. It is a separate,
+        evolving deployment companion—not the paper's benchmark runner.</p>
+      </div>
+    </div>
+    <p>The optimizer and target are separate roles and may use different
+    backends. Validation gating is the research default and the paper-style
+    setting; deliberately disabling it force-accepts candidates and changes the
+    experiment semantics. SkillOpt-Sleep stages updates by default; automatic
+    adoption is opt-in.</p>
+  </section>
+
+  <section id="choose">
+    <h2>Choose the right workflow</h2>
+    <div class="table">
+      <table>
+        <thead><tr><th>Goal</th><th>Start with</th></tr></thead>
+        <tbody>
+          <tr><td>Reproduce paper-style benchmark training</td><td><a href="#research">Research first experiment</a></td></tr>
+          <tr><td>Evaluate an existing skill without training</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/reference/cli.md">Evaluation CLI reference</a></td></tr>
+          <tr><td>Add a benchmark adapter</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/new-benchmark.md">New benchmark guide</a></td></tr>
+          <tr><td>Connect another model provider</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/new-backend.md">Backend guide</a></td></tr>
+          <tr><td>Improve a coding-agent skill from local sessions</td><td><a href="#sleep">SkillOpt-Sleep</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p>SkillOpt requires Python 3.10 or newer.</p>
+<pre><code># Published package
+python -m pip install skillopt
+
+# Latest source and development workflow
+git clone https://github.com/microsoft/SkillOpt.git
+cd SkillOpt
+python -m pip install -e .
+
+# Install only the extras you need
+python -m pip install -e ".[searchqa]"  # SearchQA materialization
+python -m pip install -e ".[alfworld]"  # ALFWorld
+python -m pip install -e ".[claude]"    # optional Claude agent SDK support
+python -m pip install -e ".[webui]"     # Gradio dashboard
+python -m pip install -e ".[dev]"       # tests and linting</code></pre>
+    <div class="notice warn">
+      <strong>Release boundary</strong>
+      This guide tracks <code>main</code>. PyPI currently serves 0.2.0; the
+      generic research <code>openai_compatible</code> backend, Sleep handoff,
+      SkillOpt-Sleep support for non-Azure OpenAI-compatible endpoints, the
+      Sleep <code>--preferences</code> flag, and Cursor source/backend/plugin
+      support require a source install from <code>main</code> until the next
+      release.
+    </div>
+    <p>See the <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/installation.md">installation guide</a>
+    for platform notes and dependency boundaries.</p>
+  </section>
+
+  <section id="credentials">
+    <h2>Credentials and endpoint families</h2>
+    <p>Copy <code>.env.example</code>, fill only the backend you use, and load
+    it into your shell. Do not commit the resulting <code>.env</code>.</p>
+<pre><code>cp .env.example .env
+set -a
+source .env
+set +a</code></pre>
+
+    <h3>Azure OpenAI</h3>
+<pre><code>export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
+export AZURE_OPENAI_API_VERSION="2024-12-01-preview"
+export AZURE_OPENAI_AUTH_MODE="api_key"
+export AZURE_OPENAI_API_KEY="your-key"</code></pre>
+    <p>For keyless Azure authentication, use <code>azure_cli</code> or
+    <code>managed_identity</code> and follow the
+    <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/configuration.md">configuration guide</a>.
+    Setting an API key without <code>AZURE_OPENAI_AUTH_MODE=api_key</code> does
+    not change the default authentication mode.</p>
+
+    <h3>Generic OpenAI-compatible research backend</h3>
+<pre><code>export OPENAI_COMPATIBLE_BASE_URL="https://api.example.com/v1"
+export OPENAI_COMPATIBLE_API_KEY="your-key"
+export OPENAI_COMPATIBLE_MODEL="provider-model"
+
+python scripts/train.py --config configs/searchqa/default.yaml &#92;
+  --cfg-options &#92;
+  model.optimizer_backend=openai_compatible &#92;
+  model.target_backend=openai_compatible &#92;
+  model.optimizer=provider-model &#92;
+  model.target=provider-model</code></pre>
+    <p>This provider-neutral backend is distinct from Azure OpenAI. Per-role
+    overrides use <code>OPTIMIZER_OPENAI_COMPATIBLE_*</code> and
+    <code>TARGET_OPENAI_COMPATIBLE_*</code>. Train/eval applies the YAML role
+    models after backend initialization, so they override model-name
+    environment variables.</p>
+
+    <h3>OpenAI-compatible endpoints in SkillOpt-Sleep</h3>
+    <p>The Sleep CLI exposes this compatibility path through its
+    <code>azure_openai</code> backend for backward compatibility, so it uses a
+    different environment-variable family:</p>
+<pre><code>export AZURE_OPENAI_ENDPOINT="https://api.example.com/v1"
+export AZURE_OPENAI_API_KEY="your-key"
+export AZURE_OPENAI_AUTH_MODE="openai_compatible"
+
+skillopt-sleep run --backend azure_openai --model provider-model</code></pre>
+    <p>Do not mix this mode with Azure CLI or managed-identity settings. See
+    the dedicated
+    <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/sleep/openai-compatible-endpoints.md">Sleep endpoint guide</a>.</p>
+  </section>
+
+  <section id="research">
+    <h2>Research engine: first experiment</h2>
+    <p>The repository ships deterministic ID manifests, not the benchmark
+    examples themselves. Materialize the SearchQA examples once, then run its
+    checked-in config:</p>
+<pre><code>python -m pip install -e ".[searchqa]"
+python scripts/materialize_searchqa.py
+
+# Load model credentials first, then:
+python scripts/train.py --config configs/searchqa/default.yaml</code></pre>
+    <p>The run directory contains <code>best_skill.md</code>,
+    <code>runtime_state.json</code>, <code>history.json</code>, versioned files
+    under <code>skills/</code>, and step-level artifacts. Re-running with the
+    same output root resumes from persisted state.</p>
+<pre><code>python scripts/eval_only.py &#92;
+  --config configs/searchqa/default.yaml &#92;
+  --skill outputs/&lt;run&gt;/best_skill.md &#92;
+  --split valid_unseen</code></pre>
+    <div class="notice warn">
+      <strong>Reproduction boundary</strong>
+      Use the released train/validation/test manifests and record the exact
+      model deployment, config, seed, and source revision. Provider behavior
+      can change independently of this repository.
+    </div>
+    <p>Continue with the
+    <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/first-experiment.md">first-experiment guide</a>
+    and <a href="https://github.com/microsoft/SkillOpt/blob/main/data/README.md">dataset manifest documentation</a>.</p>
+  </section>
+
+  <section id="backends">
+    <h2>Research model backends</h2>
+    <div class="table">
+      <table>
+        <thead><tr><th>Backend</th><th>Optimizer</th><th>Target</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>openai_chat</code></td><td>Yes</td><td>Yes</td><td>Azure OpenAI plus its explicit authentication modes.</td></tr>
+          <tr><td><code>openai_compatible</code></td><td>Yes</td><td>Yes</td><td>Provider-neutral chat-completions endpoint.</td></tr>
+          <tr><td><code>claude_chat</code></td><td>Yes</td><td>Yes</td><td>Runs an installed, authenticated Claude Code CLI via <code>claude -p</code>; not a direct Anthropic API client.</td></tr>
+          <tr><td><code>qwen_chat</code></td><td>Yes</td><td>Yes</td><td>Local or hosted Qwen-compatible server.</td></tr>
+          <tr><td><code>minimax_chat</code></td><td>Yes</td><td>Yes</td><td>MiniMax chat endpoint.</td></tr>
+          <tr><td><code>codex_exec</code></td><td>Yes</td><td>Supported adapters only</td><td>Executes Codex for optimizer calls and as a target agent where supported.</td></tr>
+          <tr><td><code>claude_code_exec</code></td><td>No</td><td>Supported adapters only</td><td>Executes Claude Code as a target agent.</td></tr>
+          <tr><td><code>cursor_exec</code></td><td>No</td><td>Supported adapters only</td><td>Executes Cursor Agent as a sandboxed target agent where supported.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Prefer the structured <code>model.optimizer_backend</code> and
+    <code>model.target_backend</code> settings. Legacy <code>--backend</code>
+    aliases do not expose every role-specific combination. Exec backends are
+    not generic chat replacements and require adapter support.</p>
+  </section>
+
+  <section id="research-docs">
+    <h2>Research documentation map</h2>
+    <div class="table">
+      <table>
+        <thead><tr><th>Reference</th><th>Use it for</th></tr></thead>
+        <tbody>
+          <tr><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/configuration.md">Configuration</a></td><td>Authentication, structured YAML, role-specific backends, and overrides.</td></tr>
+          <tr><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/reference/cli.md">CLI</a></td><td>Current train/eval entry points and exact output paths.</td></tr>
+          <tr><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/reference/config.md">Config reference</a></td><td>Supported sections, defaults, and validation constraints.</td></tr>
+          <tr><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/training-loop.md">Training loop</a></td><td>Rollout, reflection, edit selection, gating, slow update, and meta skill.</td></tr>
+          <tr><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/skill-document.md">Skill document</a></td><td>Skill structure and protected regions.</td></tr>
+          <tr><td><a href="https://github.com/microsoft/SkillOpt/blob/main/docs/reference/api.md">Python API</a></td><td>Stable public imports and low-level/internal boundaries.</td></tr>
+          <tr><td><a href="https://github.com/microsoft/SkillOpt/blob/main/CHANGELOG.md">Changelog</a></td><td>Recently merged capabilities, fixes, and contributor credits.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="sleep">
+    <h2>SkillOpt-Sleep: safe first run</h2>
+    <p>SkillOpt-Sleep is a preview deployment companion. Its default
+    <code>mock</code> backend is useful for testing control flow without API
+    spend; it is not evidence that a real model's quality improved.</p>
+<pre><code># Deterministic engine proof; no model credentials required
+python -m skillopt_sleep.experiments.run_experiment &#92;
+  --persona researcher --assert-improves
+
+# Inspect local session handling without adopting any update
+skillopt-sleep dry-run &#92;
+  --project "$PWD" &#92;
+  --source auto &#92;
+  --backend mock
+
+# A real run: explicitly identify the skill to evolve
+skillopt-sleep run &#92;
+  --project "$PWD" &#92;
+  --target-skill-path path/to/SKILL.md &#92;
+  --source auto &#92;
+  --backend claude
+
+skillopt-sleep status --project "$PWD"
+skillopt-sleep adopt --project "$PWD"</code></pre>
+    <p><code>--project</code> scopes collection but does not automatically
+    choose a project's skill file. Use <code>--target-skill-path</code> when
+    you intend to evolve a particular <code>SKILL.md</code>. Transcript source
+    (<code>claude</code>, <code>codex</code>, <code>cursor</code>, or
+    <code>auto</code>) and replay backend are independent settings. The existing
+    <code>auto</code> precedence remains Codex then Claude; select Cursor
+    explicitly with <code>--source cursor</code>.</p>
+    <p>Cursor transcripts default to
+    <code>~/.cursor/projects/&lt;workspace&gt;/agent-transcripts</code>; override
+    that home with <code>--cursor-home</code>. Model-driven replay requires an
+    installed, authenticated <code>cursor-agent</code> and
+    <code>--backend cursor</code>; use <code>--cursor-path</code> when the CLI is
+    not on <code>PATH</code>. Target
+    <code>.cursor/skills/skillopt-sleep-learned/SKILL.md</code> explicitly so
+    adoption updates a project skill rather than the plugin's workflow skill.</p>
+    <p>The Cursor backend inserts that skill text into prompts; it does not
+    invoke the file as a native skill. Ordinary calls run in read-only Ask mode
+    in an empty temporary workspace and cannot inspect files under
+    <code>--project</code>. Cursor tasks containing a <code>tool_called</code>
+    check fail before Agent mode starts; use another backend for those tasks.
+    This validates textual guidance, not end-to-end repository, browser,
+    service, or filesystem workflows.</p>
+    <p>For subscription-based workflows that should not launch an API or model
+    subprocess, use <code>--backend handoff</code> and follow the generated
+    prompt/answer loop. Read the
+    <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/sleep/README.md">complete Sleep guide</a>
+    before a real run.</p>
+  </section>
+
+  <section id="sleep-plugins">
+    <h2>Agent integrations</h2>
+    <div class="table">
+      <table>
+        <thead><tr><th>Agent</th><th>Integration status</th><th>Guide</th></tr></thead>
+        <tbody>
+          <tr><td>Claude Code</td><td>Shared-engine plugin and handoff command</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/plugins/claude-code/README.md">README</a></td></tr>
+          <tr><td>Codex</td><td>Shared-engine skill shell</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/plugins/codex/README.md">README</a></td></tr>
+          <tr><td>Cursor</td><td>Native command and skill, local transcript source, and Cursor Agent backend</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/plugins/cursor/README.md">README</a></td></tr>
+          <tr><td>GitHub Copilot</td><td>Shared-engine Sleep MCP plus a separate research MCP</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/plugins/copilot/README.md">README</a></td></tr>
+          <tr><td>Devin</td><td>Shared-engine MCP with Devin transcript conversion</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/plugins/devin/README.md">README</a></td></tr>
+          <tr><td>OpenClaw</td><td>Independent community/reference adaptation; review locally before use</td><td><a href="https://github.com/microsoft/SkillOpt/blob/main/plugins/openclaw/README.md">README</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The <a href="https://github.com/microsoft/SkillOpt/blob/main/plugins/README.md">plugin overview</a>
+    records which integrations use the shared engine and which require local
+    adaptation.</p>
+  </section>
+
+  <section id="sleep-replay">
+    <h2>Advanced Sleep controls</h2>
+    <p>The main CLI exposes project/source selection, backend/model selection,
+    bounded task and edit counts, preferences, reviewed task files, and
+    staged adoption. Additional JSON configuration fields include:</p>
+    <div class="table">
+      <table>
+        <thead><tr><th>Field</th><th>Default</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td><code>dream_rollouts</code></td><td>1</td><td>Single rollout by default; values above 1 enable experimental contrastive replay.</td></tr>
+          <tr><td><code>dream_factor</code></td><td>0</td><td>Synthetic task variants are off by default.</td></tr>
+          <tr><td><code>recall_k</code></td><td>0</td><td>Historical associative recall is off by default.</td></tr>
+          <tr><td><code>replay_mode</code></td><td>mock</td><td>Reporting label for prompt replay; fresh-worktree replay is not implemented.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>These are configuration fields, not current <code>skillopt-sleep run</code>
+    flags. Treat multi-rollout, recall, synthetic dreaming, and experimental
+    reward/budget controls as advanced features that require task-specific
+    validation. The reported experiments and their exact settings are in
+    <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/sleep/RESULTS.md">RESULTS.md</a>.</p>
+    <p>The managed scheduler persists only project, backend, time, and optional
+    auto-adopt. For Cursor schedules, put <code>transcript_source</code>,
+    <code>cursor_home</code>, <code>cursor_path</code>, <code>model</code>, and
+    <code>target_skill_path</code> in
+    <code>~/.skillopt-sleep/config.json</code>. Use an absolute Cursor CLI path
+    and verify authentication for the scheduled account because schedulers may
+    run with a minimal environment.</p>
+  </section>
+
+  <section id="safety">
+    <h2>Data, privacy, and adoption safety</h2>
+    <ul>
+      <li>Real Sleep backends may send session-derived prompts, mined tasks,
+      trajectories, and candidate edits to the selected provider. Review the
+      source data and provider policy before use.</li>
+      <li>Secret redaction for persisted diagnostics is defense in depth; it
+      is not a guarantee that every outbound model prompt is free of sensitive
+      content. In particular, do not treat raw coding-agent transcripts as
+      pre-sanitized.</li>
+      <li>The Cursor source excludes tool arguments and outputs, retaining only
+      user/assistant text, explicit turn errors, and tool names. The Cursor
+      backend still sends transcript-derived prompts through
+      <code>cursor-agent</code> to Cursor's selected model provider.</li>
+      <li>A real-backend <code>dry-run</code> still performs provider calls; it
+      suppresses staging rather than spend. Session and task limits are not hard
+      provider-call, token, time, or monetary budgets.</li>
+      <li>Updates are staged for review by default. Use
+      <code>--auto-adopt</code> only when you have an independent rollback and
+      validation process.</li>
+      <li>A held-out gate reduces regressions on its measured tasks; it is not
+      a security boundary or a proof of general improvement.</li>
+      <li>Use a temporary clone and synthetic transcripts when validating a
+      new backend or plugin integration.</li>
+    </ul>
+  </section>
+
+  <section id="contributing">
+    <h2>Contributing and extending</h2>
+    <p>Before proposing a change, run the focused tests for the affected area,
+    then the full suite where practical. Documentation changes should pass a
+    strict MkDocs build and should be checked against actual CLI
+    <code>--help</code> output.</p>
+<pre><code>python -m pip install -e ".[dev,docs]"
+python -m pytest -q
+python -m mkdocs build --strict</code></pre>
+    <p>See <a href="https://github.com/microsoft/SkillOpt/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>,
+    the <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/contributing.md">documentation workflow</a>,
+    and the focused guides for
+    <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/new-benchmark.md">benchmarks</a>
+    and <a href="https://github.com/microsoft/SkillOpt/blob/main/docs/guide/new-backend.md">model backends</a>.</p>
+  </section>
+
+  <footer>
+    SkillOpt · <a href="https://github.com/microsoft/SkillOpt">github.com/microsoft/SkillOpt</a>
+    · <a href="https://microsoft.github.io/SkillOpt/blog/">Technical Blog</a>
+    · <a href="https://arxiv.org/abs/2605.23904">arXiv:2605.23904</a><br>
+    This public overview intentionally avoids duplicating the complete,
+    fast-changing configuration surface. Follow the linked versioned
+    references for details.
+  </footer>
+</main>
+</div>
+</body>
+</html>

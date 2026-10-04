@@ -1,0 +1,199 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <cstdarg>
+#include <memory>
+#include <zvec/ailego/container/params.h>
+#include <zvec/ailego/pattern/factory.h>
+#include <zvec/export.h>
+
+// Define printf format attribute for GCC/Clang, empty for MSVC
+#if defined(__GNUC__) || defined(__clang__)
+#define AILEGO_PRINTF_FORMAT(fmt_idx, arg_idx) \
+  __attribute__((format(printf, fmt_idx, arg_idx)))
+#else
+#define AILEGO_PRINTF_FORMAT(fmt_idx, arg_idx)
+#endif
+
+//! Register Index Logger
+#define FACTORY_REGISTER_LOGGER_ALIAS(__NAME__, __IMPL__, ...)      \
+  AILEGO_FACTORY_REGISTER(__NAME__, zvec::ailego::Logger, __IMPL__, \
+                          ##__VA_ARGS__)
+
+//! Register Index Logger
+#define FACTORY_REGISTER_LOGGER(__IMPL__, ...) \
+  FACTORY_REGISTER_LOGGER_ALIAS(__IMPL__, __IMPL__, ##__VA_ARGS__)
+
+#define PROXIMA_LOG_IMPL(level, format, ...)                             \
+  do {                                                                   \
+    if (zvec::ailego::LoggerBroker::IsLevelEnabled(level)) {             \
+      zvec::ailego::LoggerBroker::Log(level, __FILE__, __LINE__, format, \
+                                      ##__VA_ARGS__);                    \
+    }                                                                    \
+  } while (0)
+
+//! Log Debug Message
+#ifndef LOG_DEBUG
+#define LOG_DEBUG(format, ...) \
+  PROXIMA_LOG_IMPL(zvec::ailego::Logger::LEVEL_DEBUG, format, ##__VA_ARGS__)
+#endif
+
+//! Log Information Message
+#ifndef LOG_INFO
+#define LOG_INFO(format, ...) \
+  PROXIMA_LOG_IMPL(zvec::ailego::Logger::LEVEL_INFO, format, ##__VA_ARGS__)
+#endif
+
+//! Log Warn Message
+#ifndef LOG_WARN
+#define LOG_WARN(format, ...) \
+  PROXIMA_LOG_IMPL(zvec::ailego::Logger::LEVEL_WARN, format, ##__VA_ARGS__)
+#endif
+
+//! Log Error Message
+#ifndef LOG_ERROR
+#define LOG_ERROR(format, ...) \
+  PROXIMA_LOG_IMPL(zvec::ailego::Logger::LEVEL_ERROR, format, ##__VA_ARGS__)
+#endif
+
+//! Log Fatal Message
+#ifndef LOG_FATAL
+#define LOG_FATAL(format, ...) \
+  PROXIMA_LOG_IMPL(zvec::ailego::Logger::LEVEL_FATAL, format, ##__VA_ARGS__)
+#endif
+
+namespace zvec {
+namespace ailego {
+
+/*! Index Logger
+ */
+struct ZVEC_AILEGO_API Logger {
+  //! Index Logger Pointer
+  typedef std::shared_ptr<Logger> Pointer;
+
+  static const int LEVEL_DEBUG;
+  static const int LEVEL_INFO;
+  static const int LEVEL_WARN;
+  static const int LEVEL_ERROR;
+  static const int LEVEL_FATAL;
+
+  //! Retrieve string of level
+  static const char *LevelString(int level) {
+    static const char *info[] = {"DEBUG", " INFO", " WARN", "ERROR", "FATAL"};
+    if (level < (int)(sizeof(info) / sizeof(info[0]))) {
+      return info[level];
+    }
+    return "";
+  }
+
+  //! Retrieve symbol of level
+  static char LevelSymbol(int level) {
+    static const char info[5] = {'D', 'I', 'W', 'E', 'F'};
+    if (level < (int)(sizeof(info) / sizeof(info[0]))) {
+      return info[level];
+    }
+    return ' ';
+  }
+
+  //! Destructor
+  virtual ~Logger() = default;
+
+  //! Initialize Logger
+  virtual int init(const Params &params) = 0;
+
+  //! Cleanup Logger
+  virtual int cleanup() = 0;
+
+  //! Log Message
+  virtual void log(int level, const char *file, int line, const char *format,
+                   va_list args) = 0;
+};
+
+/*! Index Logger Broker
+ */
+class ZVEC_AILEGO_API LoggerBroker {
+ public:
+  //! Register Logger
+  static Logger::Pointer Register(Logger::Pointer logger) {
+    Logger::Pointer ret = std::move(LoggerInstance());
+    LoggerInstance() = std::move(logger);
+    return ret;
+  }
+
+  //! Register Logger with init params
+  static int Register(Logger::Pointer logger, const ailego::Params &params) {
+    //! Cleanup the previous, before initizlizing the new one
+    if (LoggerInstance()) {
+      LoggerInstance()->cleanup();
+    }
+    LoggerInstance() = std::move(logger);
+    return LoggerInstance()->init(params);
+  }
+
+  //! Unregister Logger
+  static void Unregister() {
+    LoggerInstance() = nullptr;
+  }
+
+  //! Set Level of Logger
+  static void SetLevel(int level) {
+    LoggerLevel() = level;
+  }
+
+  //! Check if log level is enabled
+  static bool IsLevelEnabled(int level) {
+    return LoggerLevel() <= level && LoggerInstance();
+  }
+
+  //! Log Message
+  AILEGO_PRINTF_FORMAT(4, 5)
+  static void Log(int level, const char *file, int line, const char *format,
+                  ...) {
+    if (IsLevelEnabled(level)) {
+      va_list args;
+      va_start(args, format);
+      LoggerInstance()->log(level, file, line, format, args);
+      va_end(args);
+    }
+  }
+
+  //! Disable them
+  LoggerBroker() = delete;
+  LoggerBroker(const LoggerBroker &) = delete;
+  LoggerBroker(LoggerBroker &&) = delete;
+
+ private:
+  //! Accessors of logger state (Meyers singleton to avoid multiple
+  //! __cxa_atexit registrations when logger.cc is compiled into multiple
+  //! shared libraries via --whole-archive; the guard variable is shared
+  //! across all modules through .dynsym, ensuring initialization and
+  //! destruction happen exactly once)
+  static int &LoggerLevel() {
+    static int logger_level = Logger::LEVEL_WARN;
+    return logger_level;
+  }
+  static Logger::Pointer &LoggerInstance() {
+    static Logger::Pointer instance = MakeDefaultLogger();
+    return instance;
+  }
+
+  //! Factory for the default logger used to initialize the Meyers singleton.
+  //! Defined in logger.cc so the concrete ConsoleLogger type stays private.
+  static Logger::Pointer MakeDefaultLogger();
+};
+
+}  // namespace ailego
+}  // namespace zvec

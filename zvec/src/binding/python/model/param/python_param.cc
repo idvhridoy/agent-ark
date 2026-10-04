@@ -1,0 +1,2635 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "python_param.h"
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+#include <zvec/core/interface/constants.h>
+#include <zvec/db/index_params.h>
+#include <zvec/db/query.h>
+#include "python_doc.h"
+
+namespace zvec {
+
+static std::string index_type_to_string(const IndexType type) {
+  switch (type) {
+    case IndexType::INVERT:
+      return "INVERT";
+    case IndexType::FLAT:
+      return "FLAT";
+    case IndexType::IVF:
+      return "IVF";
+    case IndexType::HNSW:
+      return "HNSW";
+    case IndexType::HNSW_RABITQ:
+      return "HNSW_RABITQ";
+    case IndexType::IVF_RABITQ:
+      return "IVF_RABITQ";
+    case IndexType::DISKANN:
+      return "DISKANN";
+    case IndexType::VAMANA:
+      return "VAMANA";
+    case IndexType::FTS:
+      return "FTS";
+    default:
+      return "UNDEFINED";
+  }
+}
+
+static std::string metric_type_to_string(const MetricType type) {
+  switch (type) {
+    case MetricType::COSINE:
+      return "COSINE";
+    case MetricType::IP:
+      return "IP";
+    case MetricType::L2:
+      return "L2";
+    default:
+      return "UNDEFINED";
+  }
+}
+
+static std::string quantize_type_to_string(const QuantizeType type) {
+  switch (type) {
+    case QuantizeType::UNDEFINED:
+      return "UNDEFINED";
+    case QuantizeType::INT8:
+      return "INT8";
+    case QuantizeType::INT4:
+      return "INT4";
+    case QuantizeType::FP16:
+      return "FP16";
+    case QuantizeType::RABITQ:
+      return "RABITQ";
+    case QuantizeType::UNIFORM_UINT7:
+      return "UNIFORM_UINT7";
+    case QuantizeType::UNIFORM_UINT8:
+      return "UNIFORM_UINT8";
+    case QuantizeType::UNIFORM_UINT4:
+      return "UNIFORM_UINT4";
+    default:
+      return "UNDEFINED";
+  }
+}
+
+static std::string data_type_to_string(const DataType type) {
+  switch (type) {
+    case DataType::VECTOR_FP16:
+      return "VECTOR_FP16";
+    case DataType::VECTOR_FP32:
+      return "VECTOR_FP32";
+    case DataType::VECTOR_UINT8:
+      return "VECTOR_UINT8";
+    case DataType::UNDEFINED:
+      return "UNDEFINED";
+    default:
+      return "UNSUPPORTED";
+  }
+}
+
+template <typename T>
+T checked_cast(const py::handle &h, const std::string &vector_field,
+               const std::string &expected_type) {
+  try {
+    return py::cast<T>(h);
+  } catch (const py::cast_error &e) {
+    std::string actual_type = std::string(py::str(py::type::of(h)));
+    std::string msg =
+        vector_field + ": expected " + expected_type + ", got " + actual_type;
+    throw py::type_error(msg);
+  }
+}
+
+template <typename ValueType, typename ValueCastFn>
+std::pair<std::string, std::string> serialize_sparse_vector(
+    const py::dict &sparse_dict, ValueCastFn &&value_caster) {
+  const size_t n = sparse_dict.size();
+  if (n == 0) return {{}, {}};
+
+  std::string indices_buf;
+  indices_buf.resize(n * sizeof(uint32_t));
+  auto *indices_ptr = reinterpret_cast<uint32_t *>(indices_buf.data());
+
+  std::string values_buf;
+  values_buf.resize(n * sizeof(ValueType));
+  auto *values_ptr = reinterpret_cast<ValueType *>(values_buf.data());
+
+  size_t i = 0;
+  for (const auto &[py_key, py_val] : sparse_dict) {
+    indices_ptr[i] = checked_cast<uint32_t>(py_key, "Sparse indices", "UINT32");
+    values_ptr[i] = value_caster(py_val, i);
+    ++i;
+  }
+  return {std::move(indices_buf), std::move(values_buf)};
+}
+
+void ZVecPyParams::Initialize(pybind11::module_ &parent) {
+  auto m =
+      parent.def_submodule("param", "This module contains the params of Zvec");
+
+  // binding index_params [invert/hnsw/flat/ivf]
+  bind_index_params(m);
+
+  // bind query_params [hnsw/ivf]
+  bind_query_params(m);
+
+  // bind options [collection/index/optimize/column]
+  bind_options(m);
+
+  // bind vector query
+  bind_vector_query(m);
+}
+
+void ZVecPyParams::bind_index_params(pybind11::module_ &m) {
+  // binding base index params
+  py::class_<IndexParams, std::shared_ptr<IndexParams>> index_params(
+      m, "IndexParam", R"pbdoc(
+Base class for all index parameter configurations.
+
+This abstract base class defines the common interface for index types.
+It should not be instantiated directly; use derived classes instead.
+
+Attributes:
+    type (IndexType): The type of the index (e.g., HNSW, FLAT, INVERT).
+)pbdoc");
+  index_params
+      .def_property_readonly(
+          "type",
+          [](const IndexParams &self) -> IndexType { return self.type(); },
+          "IndexType: The type of the index.")
+      .def("clone", &IndexParams::clone, py::return_value_policy::copy)
+      .def(
+          "__eq__",
+          [](const IndexParams &self, const py::object &other) {
+            if (!py::isinstance<IndexParams>(other)) return false;
+            return self == other.cast<const IndexParams &>();
+          },
+          py::is_operator())
+      .def(
+          "to_dict",
+          [](const IndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(py::pickle(
+          [](const IndexParams &self) {  // __getstate__
+            return py::make_tuple(self.type());
+          },
+          [](py::tuple t) {  // __setstate__
+            if (t.size() != 1)
+              throw std::runtime_error("Invalid state for IndexParams");
+            return std::shared_ptr<IndexParams>();
+          }));
+
+  // binding invert index params
+  py::class_<InvertIndexParams, IndexParams, std::shared_ptr<InvertIndexParams>>
+      invert_params(m, "InvertIndexParam", R"pbdoc(
+Parameters for configuring an invert index.
+
+This class controls whether range query
+optimization is enabled for invert index structures.
+
+Attributes:
+    type (IndexType): Always `IndexType.INVERTED`.
+    enable_range_optimization (bool): Whether range optimization is enabled.
+    enable_extended_wildcard (bool): Whether extended wildcard (suffix and infix) search is enabled.
+
+Examples:
+    >>> params = InvertIndexParam(enable_range_optimization=True, enable_extended_wildcard=False)
+    >>> print(params.enable_range_optimization)
+    True
+    >>> print(params.enable_extended_wildcard)
+    False
+    >>> config = params.to_dict()
+    >>> print(config)
+    {'enable_range_optimization': True, 'enable_extended_wildcard': False}
+)pbdoc");
+  invert_params
+      .def(py::init<bool, bool>(), py::arg("enable_range_optimization") = false,
+           py::arg("enable_extended_wildcard") = false,
+           R"pbdoc(
+Constructs an InvertIndexParam instance.
+
+Args:
+    enable_range_optimization (bool, optional): If True, enables range query
+        optimization for the invert index. Defaults to False.
+    enable_extended_wildcard (bool, optional): If True, enables extended wildcard
+        search including suffix and infix patterns. Defaults to False.
+)pbdoc")
+      .def_property_readonly("enable_range_optimization",
+                             &InvertIndexParams::enable_range_optimization,
+                             R"pbdoc(
+bool: Whether range optimization is enabled for this inverted index.
+)pbdoc")
+      .def_property_readonly("enable_extended_wildcard",
+                             &InvertIndexParams::enable_extended_wildcard,
+                             R"pbdoc(
+bool: Whether extended wildcard (suffix and infix) search is enabled.
+Note: Prefix search is always enabled regardless of this setting.
+)pbdoc")
+      .def(
+          "to_dict",
+          [](const InvertIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["enable_range_optimization"] =
+                self.enable_range_optimization();
+            dict["enable_extended_wildcard"] = self.enable_extended_wildcard();
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def("__repr__",
+           [](const InvertIndexParams &self) -> std::string {
+             return "{"
+                    "\"enable_range_optimization\":" +
+                    std::to_string(self.enable_range_optimization()) +
+                    ","
+                    "\"enable_extended_wildcard\":" +
+                    std::to_string(self.enable_extended_wildcard()) + "}";
+           })
+      .def(py::pickle(
+          [](const InvertIndexParams &self) {  // __getstate__
+            return py::make_tuple(self.enable_range_optimization(),
+                                  self.enable_extended_wildcard());
+          },
+          [](py::tuple t) {  // __setstate__
+            if (t.size() != 2)
+              throw std::runtime_error("Invalid state for InvertIndexParams");
+            return std::make_shared<InvertIndexParams>(t[0].cast<bool>(),
+                                                       t[1].cast<bool>());
+          }));
+
+  // binding fts index params
+  py::class_<FtsIndexParams, IndexParams, std::shared_ptr<FtsIndexParams>>
+      fts_index_params(m, "FtsIndexParam", R"pbdoc(
+Parameters for configuring a full-text search (FTS) index.
+
+Controls the tokenizer pipeline used during indexing and querying.
+
+Attributes:
+    type (IndexType): Always ``IndexType.FTS``.
+    tokenizer_name (str): Name of the tokenizer (one of "standard", "ngram",
+        "jieba", "whitespace").
+        Default is "standard".
+    filters (list[str]): List of token filter names applied after tokenization.
+        Supported values include "lowercase", "ascii_folding", and "stemmer".
+        Default is ["lowercase"].
+    extra_params (str): Additional tokenizer/filter parameters as an empty
+        string or JSON object string. Supported keys are grouped by component:
+        Tokenizers:
+            standard:
+                - "max_token_length" (positive integer).
+            ngram:
+                - "ngram_min" (positive integer, default 2).
+                - "ngram_max" (positive integer, default 2).
+                - "token_chars" (array of "letter", "digit", "whitespace",
+                  "punctuation", "symbol"; default [] keeps all valid UTF-8
+                  characters). custom_token_chars is not supported.
+            jieba:
+                - "jieba_dict_dir" (directory containing jieba.dict.utf8 and
+                  hmm_model.utf8).
+                - "user_dict_path" (user dictionary path).
+                - "cut_mode" ("search", "mix", "full", or "hmm"; default
+                  "search").
+            whitespace:
+                - no extra_params.
+        Filters:
+            lowercase:
+                - no extra_params.
+            ascii_folding:
+                - no extra_params.
+            stemmer:
+                - "stemmer_lang" (Snowball language/algorithm; default
+                  "english"), for example {"stemmer_lang":"porter"} for ES
+                  behaviour.
+        Default is "".
+
+Examples:
+    >>> params = FtsIndexParam(
+    ...     tokenizer_name="jieba", filters=["lowercase", "ascii_folding"]
+    ... )
+    >>> print(params.tokenizer_name)
+    jieba
+    >>> params = FtsIndexParam(
+    ...     tokenizer_name="standard",
+    ...     filters=["lowercase", "stemmer"],
+    ...     extra_params='{"stemmer_lang":"porter"}',
+    ... )
+)pbdoc");
+  fts_index_params
+      .def(py::init<std::string, std::vector<std::string>, std::string>(),
+           py::arg("tokenizer_name") = "standard",
+           py::arg("filters") = std::vector<std::string>{"lowercase"},
+           py::arg("extra_params") = "",
+           R"pbdoc(
+Constructs an FtsIndexParam instance.
+
+Args:
+    tokenizer_name (str, optional): Tokenizer name. Defaults to "standard".
+    filters (list[str], optional): Token filter names. Supports "lowercase",
+        "ascii_folding", and "stemmer". Defaults to ["lowercase"].
+    extra_params (str, optional): Extra tokenizer/filter parameters as an empty
+        string or JSON object string. Supported keys:
+        Tokenizers:
+            standard:
+                - "max_token_length" (positive integer).
+            ngram:
+                - "ngram_min" (positive integer, default 2).
+                - "ngram_max" (positive integer, default 2).
+                - "token_chars" (array of "letter", "digit", "whitespace",
+                  "punctuation", "symbol"; default [] keeps all valid UTF-8
+                  characters). custom_token_chars is not supported.
+            jieba:
+                - "jieba_dict_dir".
+                - "user_dict_path".
+                - "cut_mode" ("search", "mix", "full", or "hmm"; default
+                  "search").
+            whitespace:
+                - no extra_params.
+        Filters:
+            lowercase:
+                - no extra_params.
+            ascii_folding:
+                - no extra_params.
+            stemmer:
+                - "stemmer_lang" (Snowball language/algorithm; default
+                  "english").
+        Defaults to "".
+)pbdoc")
+      .def_property_readonly("tokenizer_name", &FtsIndexParams::tokenizer_name,
+                             "str: Name of the tokenizer.")
+      .def_property_readonly("filters", &FtsIndexParams::filters,
+                             "list[str]: Token filter names.")
+      .def_property_readonly("extra_params", &FtsIndexParams::extra_params,
+                             "str: Additional tokenizer parameters.")
+      .def(
+          "to_dict",
+          [](const FtsIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["tokenizer_name"] = self.tokenizer_name();
+            dict["filters"] = self.filters();
+            dict["extra_params"] = self.extra_params();
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def("__repr__",
+           [](const FtsIndexParams &self) -> std::string {
+             std::string filters_str = "[";
+             for (size_t i = 0; i < self.filters().size(); ++i) {
+               if (i > 0) {
+                 filters_str += ",";
+               }
+               filters_str += "\"" + self.filters()[i] + "\"";
+             }
+             filters_str += "]";
+             return "{"
+                    "\"type\":\"" +
+                    index_type_to_string(self.type()) +
+                    "\", \"tokenizer_name\":\"" + self.tokenizer_name() +
+                    "\", \"filters\":" + filters_str + ", \"extra_params\":\"" +
+                    self.extra_params() + "\"}";
+           })
+      .def(py::pickle(
+          [](const FtsIndexParams &self) {
+            return py::make_tuple(self.tokenizer_name(), self.filters(),
+                                  self.extra_params());
+          },
+          [](py::tuple t) {
+            if (t.size() != 3) {
+              throw std::runtime_error("Invalid state for FtsIndexParams");
+            }
+            return std::make_shared<FtsIndexParams>(
+                t[0].cast<std::string>(), t[1].cast<std::vector<std::string>>(),
+                t[2].cast<std::string>());
+          }));
+
+  // binding QuantizerParam
+  py::class_<QuantizerParam, std::shared_ptr<QuantizerParam>> quantizer_param(
+      m, "QuantizerParam", R"pbdoc(
+Parameters for quantizer configuration.
+
+Encapsulates quantization-related settings such as enable_rotate.
+Designed for future extensibility.
+
+Attributes:
+    enable_rotate (bool): Whether to apply random rotation before INT8/INT4
+        quantization to reduce quantization error.
+        Only effective with quantize_type=INT8 or INT4. Defaults to False.
+
+Examples:
+    >>> qp = QuantizerParam(enable_rotate=True)
+    >>> print(qp.enable_rotate)
+    True
+)pbdoc");
+  quantizer_param.def(py::init<bool>(), py::arg("enable_rotate") = false)
+      .def_property_readonly(
+          "enable_rotate",
+          [](const QuantizerParam &self) -> bool {
+            return self.enable_rotate();
+          },
+          "bool: Whether random rotation is enabled before INT8/INT4 "
+          "quantization.")
+      .def(
+          "to_dict",
+          [](const QuantizerParam &self) -> py::dict {
+            py::dict dict;
+            dict["enable_rotate"] = self.enable_rotate();
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def("__repr__",
+           [](const QuantizerParam &self) -> std::string {
+             return "{\"enable_rotate\":" +
+                    std::string(self.enable_rotate() ? "true" : "false") + "}";
+           })
+      .def(
+          "__eq__",
+          [](const QuantizerParam &self, const py::object &other) {
+            if (!py::isinstance<QuantizerParam>(other)) return false;
+            return self == other.cast<const QuantizerParam &>();
+          },
+          py::is_operator())
+      .def(py::pickle(
+          [](const QuantizerParam &self) {
+            return py::make_tuple(self.enable_rotate());
+          },
+          [](py::tuple t) {
+            if (t.size() != 1)
+              throw std::runtime_error("Invalid state for QuantizerParam");
+            return std::make_shared<QuantizerParam>(t[0].cast<bool>());
+          }));
+
+  // binding base vector index params
+  py::class_<VectorIndexParams, IndexParams, std::shared_ptr<VectorIndexParams>>
+      vector_params(m, "VectorIndexParam", R"pbdoc(
+Base class for vector index parameter configurations.
+
+Encapsulates common settings for all vector index types.
+
+Attributes:
+    type (IndexType): The specific vector index type (e.g., HNSW, FLAT).
+    metric_type (MetricType): Distance metric used for similarity search.
+    quantize_type (QuantizeType): Optional vector quantization type.
+    quantizer_param (QuantizerParam): Quantizer configuration (e.g., enable_rotate).
+)pbdoc");
+  vector_params
+      .def_property_readonly(
+          "metric_type",
+          [](const VectorIndexParams &self) -> MetricType {
+            return self.metric_type();
+          },
+          "MetricType: Distance metric (e.g., IP, COSINE, L2).")
+      .def_property_readonly(
+          "quantize_type",
+          [](const VectorIndexParams &self) -> QuantizeType {
+            return self.quantize_type();
+          },
+          "QuantizeType: Vector quantization type (e.g., FP16, INT8).")
+      .def_property_readonly(
+          "quantizer_param",
+          [](const VectorIndexParams &self) -> QuantizerParam {
+            return self.quantizer_param();
+          },
+          "QuantizerParam: Quantizer configuration including enable_rotate.")
+      .def(
+          "to_dict",
+          [](const VectorIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            py::dict qp_dict;
+            qp_dict["enable_rotate"] = self.quantizer_param().enable_rotate();
+            dict["quantizer_param"] = qp_dict;
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(py::pickle(
+          [](const VectorIndexParams &self) {  // __getstate__
+            return py::make_tuple(self.type(), self.metric_type(),
+                                  self.quantize_type());
+          },
+          [](py::tuple t) {  // __setstate__
+            if (t.size() != 3)
+              throw std::runtime_error("Invalid state for VectorIndexParams");
+            // Base class, cannot instantiate directly, used by subclasses
+            return std::shared_ptr<VectorIndexParams>();
+          }));
+
+  // binding hnsw index params
+  py::class_<HnswIndexParams, VectorIndexParams,
+             std::shared_ptr<HnswIndexParams>>
+      hnsw_params(m, "HnswIndexParam", R"pbdoc(
+Parameters for configuring an HNSW (Hierarchical Navigable Small World) index.
+
+HNSW is a graph-based approximate nearest neighbor search index. This class
+encapsulates its construction hyperparameters.
+
+Attributes:
+    metric_type (MetricType): Distance metric used for similarity computation.
+        Default is ``MetricType.IP`` (inner product).
+    m (int): Number of bi-directional links created for every new element
+        during construction. Higher values improve accuracy but increase
+        memory usage and construction time. Default is 50.
+    ef_construction (int): Size of the dynamic candidate list for nearest
+        neighbors during index construction. Larger values yield better
+        graph quality at the cost of slower build time. Default is 500.
+    quantize_type (QuantizeType): Optional quantization type for vector
+        compression (e.g., FP16, INT8). Default is `QuantizeType.UNDEFINED` to
+        disable quantization.
+    use_flat_contiguous_memory (bool): Whether the Flat reference index used
+        for refine should use contiguous vector memory.
+    flat_data_type (DataType): Physical data type stored by the Flat reference
+        index. Defaults to ``VECTOR_FP32``; ``VECTOR_FP16`` and
+        ``VECTOR_UINT8`` are also supported.
+
+Examples:
+    >>> from zvec.typing import MetricType, QuantizeType
+    >>> params = HnswIndexParam(
+    ...     metric_type=MetricType.COSINE,
+    ...     m=16,
+    ...     ef_construction=200,
+    ...     quantize_type=QuantizeType.INT8,
+    ...     use_contiguous_memory=True,
+    ... )
+    >>> print(params)
+    {'metric_type': 'IP', 'm': 16, 'ef_construction': 200, 'quantize_type': 'INT8', 'use_contiguous_memory': True}
+)pbdoc");
+  hnsw_params
+      .def(py::init([](MetricType metric_type, int m, int ef_construction,
+                       QuantizeType quantize_type, bool use_contiguous_memory,
+                       QuantizerParam quantizer_param,
+                       bool use_flat_contiguous_memory,
+                       DataType flat_data_type) {
+             return std::make_shared<HnswIndexParams>(
+                 metric_type, m, ef_construction, quantize_type,
+                 use_contiguous_memory, quantizer_param,
+                 use_flat_contiguous_memory, flat_data_type);
+           }),
+           py::arg("metric_type") = MetricType::IP,
+           py::arg("m") = core_interface::kDefaultHnswNeighborCnt,
+           py::arg("ef_construction") =
+               core_interface::kDefaultHnswEfConstruction,
+           py::arg("quantize_type") = QuantizeType::UNDEFINED,
+           py::arg("use_contiguous_memory") = false,
+           py::arg("quantizer_param") = QuantizerParam(),
+           py::arg("use_flat_contiguous_memory") = false,
+           py::arg("flat_data_type") = DataType::VECTOR_FP32)
+      .def_property_readonly(
+          "m", &HnswIndexParams::m,
+          "int: Maximum number of neighbors per node in upper layers.")
+      .def_property_readonly(
+          "ef_construction", &HnswIndexParams::ef_construction,
+          "int: Candidate list size during index construction.")
+      .def_property_readonly(
+          "use_contiguous_memory", &HnswIndexParams::use_contiguous_memory,
+          "bool: Whether to allocate a single contiguous memory arena for "
+          "all HNSW graph nodes. Improves cache locality and search "
+          "throughput at the cost of peak memory usage. Defaults to False.")
+      .def_property_readonly(
+          "use_flat_contiguous_memory",
+          &HnswIndexParams::use_flat_contiguous_memory,
+          "bool: Whether the Flat reference index uses contiguous memory for "
+          "refine.")
+      .def_property_readonly(
+          "flat_data_type", &HnswIndexParams::flat_data_type,
+          "DataType: Physical data type of the Flat reference index.")
+      .def(
+          "to_dict",
+          [](const HnswIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["m"] = self.m();
+            dict["ef_construction"] = self.ef_construction();
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            dict["use_contiguous_memory"] = self.use_contiguous_memory();
+            dict["use_flat_contiguous_memory"] =
+                self.use_flat_contiguous_memory();
+            dict["flat_data_type"] = data_type_to_string(self.flat_data_type());
+            py::dict qp_dict;
+            qp_dict["enable_rotate"] = self.quantizer_param().enable_rotate();
+            dict["quantizer_param"] = qp_dict;
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(
+          "__repr__",
+          [](const HnswIndexParams &self) -> std::string {
+            return "{"
+                   "\"metric_type\":" +
+                   metric_type_to_string(self.metric_type()) +
+                   ", \"m\":" + std::to_string(self.m()) +
+                   ", \"ef_construction\":" +
+                   std::to_string(self.ef_construction()) +
+                   ", \"quantize_type\":" +
+                   quantize_type_to_string(self.quantize_type()) +
+                   ", \"use_contiguous_memory\":" +
+                   (self.use_contiguous_memory() ? "true" : "false") +
+                   ", \"use_flat_contiguous_memory\":" +
+                   (self.use_flat_contiguous_memory() ? "true" : "false") +
+                   ", \"flat_data_type\":\"" +
+                   data_type_to_string(self.flat_data_type()) + "\"" +
+                   ", \"quantizer_param\":{" + "\"enable_rotate\":" +
+                   (self.quantizer_param().enable_rotate() ? "true" : "false") +
+                   "}}";
+          })
+      .def(py::pickle(
+          [](const HnswIndexParams &self) {
+            return py::make_tuple(
+                self.metric_type(), self.m(), self.ef_construction(),
+                self.quantize_type(), self.use_contiguous_memory(),
+                self.quantizer_param().enable_rotate(),
+                self.use_flat_contiguous_memory(), self.flat_data_type());
+          },
+          [](py::tuple t) {
+            if (t.size() < 5 || t.size() > 8)
+              throw std::runtime_error("Invalid state for HnswIndexParams");
+            QuantizerParam qp(t.size() >= 6 ? t[5].cast<bool>() : false);
+            return std::make_shared<HnswIndexParams>(
+                t[0].cast<MetricType>(), t[1].cast<int>(), t[2].cast<int>(),
+                t[3].cast<QuantizeType>(), t[4].cast<bool>(), qp,
+                t.size() >= 7 ? t[6].cast<bool>() : false,
+                t.size() >= 8 ? t[7].cast<DataType>() : DataType::VECTOR_FP32);
+          }));
+
+  // binding hnsw rabitq index params
+  py::class_<HnswRabitqIndexParams, VectorIndexParams,
+             std::shared_ptr<HnswRabitqIndexParams>>
+      hnsw_rabitq_params(m, "HnswRabitqIndexParam", R"pbdoc(
+Parameters for configuring an HNSW (Hierarchical Navigable Small World) index with RabitQ quantization.
+
+HNSW is a graph-based approximate nearest neighbor search index. RabitQ is a
+quantization method that provides high compression with minimal accuracy loss.
+
+Attributes:
+    metric_type (MetricType): Distance metric used for similarity computation.
+        Default is ``MetricType.IP`` (inner product).
+    m (int): Number of bi-directional links created for every new element
+        during construction. Higher values improve accuracy but increase
+        memory usage and construction time. Default is 50.
+    ef_construction (int): Size of the dynamic candidate list for nearest
+        neighbors during index construction. Larger values yield better
+        graph quality at the cost of slower build time. Default is 500.
+
+Examples:
+    >>> from zvec.typing import MetricType
+    >>> params = HnswRabitqIndexParam(
+    ...     metric_type=MetricType.COSINE,
+    ...     m=16,
+    ...     ef_construction=200
+    ... )
+    >>> print(params)
+    {'metric_type': 'COSINE', 'm': 16, 'ef_construction': 200}
+)pbdoc");
+  hnsw_rabitq_params
+      .def(py::init<MetricType, int, int, int, int, int>(),
+           py::arg("metric_type") = MetricType::IP,
+           py::arg("total_bits") = core_interface::kDefaultRabitqTotalBits,
+           py::arg("num_clusters") = core_interface::kDefaultRabitqNumClusters,
+           py::arg("m") = core_interface::kDefaultHnswNeighborCnt,
+           py::arg("ef_construction") =
+               core_interface::kDefaultHnswEfConstruction,
+           py::arg("sample_count") = 0)
+      .def_property_readonly("m", &HnswRabitqIndexParams::m,
+                             "int: Maximum number of neighbors per node.")
+      .def_property_readonly(
+          "ef_construction", &HnswRabitqIndexParams::ef_construction,
+          "int: Candidate list size during index construction.")
+      .def_property_readonly("total_bits", &HnswRabitqIndexParams::total_bits,
+                             "int: Total bits for RabitQ quantization.")
+      .def_property_readonly("num_clusters",
+                             &HnswRabitqIndexParams::num_clusters,
+                             "int: Number of clusters for RabitQ.")
+      .def_property_readonly("sample_count",
+                             &HnswRabitqIndexParams::sample_count,
+                             "int: Sample count for RabitQ training.")
+      .def(
+          "to_dict",
+          [](const HnswRabitqIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            dict["total_bits"] = self.total_bits();
+            dict["num_clusters"] = self.num_clusters();
+            dict["sample_count"] = self.sample_count();
+            dict["m"] = self.m();
+            dict["ef_construction"] = self.ef_construction();
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(
+          "__repr__",
+          [](const HnswRabitqIndexParams &self) -> std::string {
+            return "{"
+                   "\"type\":\"" +
+                   index_type_to_string(self.type()) +
+                   "\", \"metric_type\":\"" +
+                   metric_type_to_string(self.metric_type()) +
+                   "\", \"total_bits\":" + std::to_string(self.total_bits()) +
+                   ", \"num_clusters\":" + std::to_string(self.num_clusters()) +
+                   ", \"sample_count\":" + std::to_string(self.sample_count()) +
+                   ", \"m\":" + std::to_string(self.m()) +
+                   ", \"ef_construction\":" +
+                   std::to_string(self.ef_construction()) +
+                   ", \"quantize_type\":\"" +
+                   quantize_type_to_string(self.quantize_type()) + "\"}";
+          })
+      .def(py::pickle(
+          [](const HnswRabitqIndexParams &self) {
+            return py::make_tuple(self.metric_type(), self.total_bits(),
+                                  self.num_clusters(), self.m(),
+                                  self.ef_construction(), self.sample_count());
+          },
+          [](py::tuple t) {
+            if (t.size() != 6)
+              throw std::runtime_error(
+                  "Invalid state for HnswRabitqIndexParams");
+            return std::make_shared<HnswRabitqIndexParams>(
+                t[0].cast<MetricType>(), t[1].cast<int>(), t[2].cast<int>(),
+                t[3].cast<int>(), t[4].cast<int>(), t[5].cast<int>());
+          }));
+
+  // binding ivf rabitq index params
+  py::class_<IvfRabitqIndexParams, VectorIndexParams,
+             std::shared_ptr<IvfRabitqIndexParams>>
+      ivf_rabitq_params(m, "IvfRabitqIndexParam", R"pbdoc(
+Parameters for configuring an IVF index with RaBitQ quantization.
+
+IVF partitions the vector space into inverted lists. RaBitQ compresses vectors
+inside each list for faster scanning with lower memory usage.
+
+Attributes:
+    metric_type (MetricType): Distance metric used for similarity computation.
+        Default is ``MetricType.IP`` (inner product).
+    nlist (int): Number of IVF cluster centers. Default is 1024.
+    total_bits (int): Total bits for RaBitQ quantization. Default is 7.
+    sample_count (int): Sample count for training. 0 means use all vectors.
+
+Examples:
+    >>> from zvec.typing import MetricType
+    >>> params = IvfRabitqIndexParam(
+    ...     metric_type=MetricType.COSINE,
+    ...     nlist=1024,
+    ...     total_bits=7,
+    ...     sample_count=10000
+    ... )
+    >>> print(params.nlist)
+    1024
+)pbdoc");
+  ivf_rabitq_params
+      .def(py::init<MetricType, int, int, int>(),
+           py::arg("metric_type") = MetricType::IP,
+           py::arg("nlist") = core_interface::kDefaultIvfRabitqNlist,
+           py::arg("total_bits") = core_interface::kDefaultRabitqTotalBits,
+           py::arg("sample_count") = 0)
+      .def_property_readonly("nlist", &IvfRabitqIndexParams::nlist,
+                             "int: Number of IVF cluster centers.")
+      .def_property_readonly("total_bits", &IvfRabitqIndexParams::total_bits,
+                             "int: Total bits for RaBitQ quantization.")
+      .def_property_readonly("sample_count",
+                             &IvfRabitqIndexParams::sample_count,
+                             "int: Sample count for RaBitQ training.")
+      .def(
+          "to_dict",
+          [](const IvfRabitqIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            dict["nlist"] = self.nlist();
+            dict["total_bits"] = self.total_bits();
+            dict["sample_count"] = self.sample_count();
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(
+          "__repr__",
+          [](const IvfRabitqIndexParams &self) -> std::string {
+            return "{"
+                   "\"type\":\"" +
+                   index_type_to_string(self.type()) +
+                   "\", \"metric_type\":\"" +
+                   metric_type_to_string(self.metric_type()) +
+                   "\", \"nlist\":" + std::to_string(self.nlist()) +
+                   ", \"total_bits\":" + std::to_string(self.total_bits()) +
+                   ", \"sample_count\":" + std::to_string(self.sample_count()) +
+                   ", \"quantize_type\":\"" +
+                   quantize_type_to_string(self.quantize_type()) + "\"}";
+          })
+      .def(py::pickle(
+          [](const IvfRabitqIndexParams &self) {
+            return py::make_tuple(self.metric_type(), self.nlist(),
+                                  self.total_bits(), self.sample_count());
+          },
+          [](py::tuple t) {
+            if (t.size() != 4) {
+              throw std::runtime_error(
+                  "Invalid state for IvfRabitqIndexParams");
+            }
+            return std::make_shared<IvfRabitqIndexParams>(
+                t[0].cast<MetricType>(), t[1].cast<int>(), t[2].cast<int>(),
+                t[3].cast<int>());
+          }));
+
+  // binding vamana index params
+  py::class_<VamanaIndexParams, VectorIndexParams,
+             std::shared_ptr<VamanaIndexParams>>
+      vamana_params(m, "VamanaIndexParam", R"pbdoc(
+Parameters for configuring a Vamana (DiskANN) index.
+
+Vamana is a single-layer graph-based approximate nearest neighbor search
+index originally proposed in the DiskANN paper. This class encapsulates
+its construction hyperparameters.
+
+Attributes:
+    metric_type (MetricType): Distance metric used for similarity computation.
+        Default is ``MetricType.IP`` (inner product).
+    max_degree (int): Maximum out-degree (R) of every node in the Vamana
+        graph. Higher values improve recall but increase memory usage and
+        construction time. Default is 64.
+    search_list_size (int): Size of the dynamic candidate list during graph
+        construction (analogous to HNSW's ef_construction). Larger values
+        yield better graph quality at the cost of slower build time.
+        Default is 100.
+    alpha (float): Pruning factor used by Vamana's RobustPrune. Values > 1.0
+        keep more long-range edges and improve recall on hard datasets.
+        Default is 1.2.
+    saturate_graph (bool): If True, force every node to reach max_degree
+        neighbors during construction. Default is False.
+    use_contiguous_memory (bool): If True, allocate a single contiguous
+        memory arena for all graph nodes, improving cache locality and
+        search throughput at the cost of peak memory usage. Default is
+        False.
+    use_id_map (bool): Reserved flag for engine-level id remapping; the
+        db layer always supplies consecutive ids so this is currently
+        ignored by the engine. Default is False.
+    quantize_type (QuantizeType): Optional quantization type for vector
+        compression (e.g., FP16, INT8). Default is ``QuantizeType.UNDEFINED``
+        to disable quantization.
+    quantizer_param (QuantizerParam): Optional quantizer configuration.
+        Default is ``QuantizerParam()``.
+    two_pass_build (bool): If True, build the initial graph with alpha=1.0,
+        then run one full-graph pass with the configured alpha. Default is
+        False.
+    use_flat_contiguous_memory (bool): Whether the Flat reference index used
+        for refine should use contiguous vector memory.
+    flat_data_type (DataType): Physical data type stored by the Flat reference
+        index. Defaults to ``VECTOR_FP32``; ``VECTOR_FP16`` and
+        ``VECTOR_UINT8`` are also supported.
+
+Examples:
+    >>> from zvec.typing import MetricType, QuantizeType
+    >>> params = VamanaIndexParam(
+    ...     metric_type=MetricType.COSINE,
+    ...     max_degree=64,
+    ...     search_list_size=128,
+    ...     alpha=1.2,
+    ...     quantize_type=QuantizeType.INT8,
+    ... )
+)pbdoc");
+  vamana_params
+      .def(py::init(
+               [](MetricType metric_type, int max_degree, int search_list_size,
+                  float alpha, bool saturate_graph, bool use_contiguous_memory,
+                  bool use_id_map, QuantizeType quantize_type,
+                  QuantizerParam quantizer_param, bool two_pass_build,
+                  bool use_flat_contiguous_memory, DataType flat_data_type) {
+                 return std::make_shared<VamanaIndexParams>(
+                     metric_type, max_degree, search_list_size, alpha,
+                     saturate_graph, use_contiguous_memory, use_id_map,
+                     quantize_type, quantizer_param, two_pass_build,
+                     use_flat_contiguous_memory, flat_data_type);
+               }),
+           py::arg("metric_type") = MetricType::IP,
+           py::arg("max_degree") = core_interface::kDefaultVamanaMaxDegree,
+           py::arg("search_list_size") =
+               core_interface::kDefaultVamanaSearchListSize,
+           py::arg("alpha") = core_interface::kDefaultVamanaAlpha,
+           py::arg("saturate_graph") =
+               core_interface::kDefaultVamanaSaturateGraph,
+           py::arg("use_contiguous_memory") = false,
+           py::arg("use_id_map") = false,
+           py::arg("quantize_type") = QuantizeType::UNDEFINED,
+           py::arg("quantizer_param") = QuantizerParam(),
+           py::arg("two_pass_build") = false,
+           py::arg("use_flat_contiguous_memory") = false,
+           py::arg("flat_data_type") = DataType::VECTOR_FP32)
+      .def_property_readonly(
+          "max_degree", &VamanaIndexParams::max_degree,
+          "int: Maximum out-degree (R) of every node in the Vamana graph.")
+      .def_property_readonly(
+          "search_list_size", &VamanaIndexParams::search_list_size,
+          "int: Candidate list size during Vamana graph construction.")
+      .def_property_readonly("alpha", &VamanaIndexParams::alpha,
+                             "float: Vamana RobustPrune alpha factor.")
+      .def_property_readonly(
+          "saturate_graph", &VamanaIndexParams::saturate_graph,
+          "bool: Whether to saturate every node to max_degree neighbors.")
+      .def_property_readonly(
+          "use_contiguous_memory", &VamanaIndexParams::use_contiguous_memory,
+          "bool: Whether to allocate a single contiguous memory arena for "
+          "all Vamana graph nodes. Improves cache locality and search "
+          "throughput at the cost of peak memory usage. Defaults to False.")
+      .def_property_readonly(
+          "use_id_map", &VamanaIndexParams::use_id_map,
+          "bool: Reserved flag for engine-level id remapping. Currently "
+          "ignored by the engine because the db layer always supplies "
+          "consecutive ids.")
+      .def_property_readonly(
+          "two_pass_build", &VamanaIndexParams::two_pass_build,
+          "bool: Whether to run the full-graph second Vamana construction "
+          "pass.")
+      .def_property_readonly(
+          "use_flat_contiguous_memory",
+          &VamanaIndexParams::use_flat_contiguous_memory,
+          "bool: Whether the Flat reference index uses contiguous memory for "
+          "refine.")
+      .def_property_readonly(
+          "flat_data_type", &VamanaIndexParams::flat_data_type,
+          "DataType: Physical data type of the Flat reference index.")
+      .def(
+          "to_dict",
+          [](const VamanaIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["max_degree"] = self.max_degree();
+            dict["search_list_size"] = self.search_list_size();
+            dict["alpha"] = self.alpha();
+            dict["saturate_graph"] = self.saturate_graph();
+            dict["use_contiguous_memory"] = self.use_contiguous_memory();
+            dict["use_id_map"] = self.use_id_map();
+            dict["two_pass_build"] = self.two_pass_build();
+            dict["use_flat_contiguous_memory"] =
+                self.use_flat_contiguous_memory();
+            dict["flat_data_type"] = data_type_to_string(self.flat_data_type());
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            py::dict qp_dict;
+            qp_dict["enable_rotate"] = self.quantizer_param().enable_rotate();
+            dict["quantizer_param"] = qp_dict;
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(
+          "__repr__",
+          [](const VamanaIndexParams &self) -> std::string {
+            return "{"
+                   "\"type\":\"" +
+                   index_type_to_string(self.type()) +
+                   "\", \"metric_type\":\"" +
+                   metric_type_to_string(self.metric_type()) +
+                   "\", \"max_degree\":" + std::to_string(self.max_degree()) +
+                   ", \"search_list_size\":" +
+                   std::to_string(self.search_list_size()) +
+                   ", \"alpha\":" + std::to_string(self.alpha()) +
+                   ", \"saturate_graph\":" +
+                   std::string(self.saturate_graph() ? "true" : "false") +
+                   ", \"use_contiguous_memory\":" +
+                   std::string(self.use_contiguous_memory() ? "true"
+                                                            : "false") +
+                   ", \"use_id_map\":" +
+                   std::string(self.use_id_map() ? "true" : "false") +
+                   ", \"two_pass_build\":" +
+                   std::string(self.two_pass_build() ? "true" : "false") +
+                   ", \"use_flat_contiguous_memory\":" +
+                   std::string(self.use_flat_contiguous_memory() ? "true"
+                                                                 : "false") +
+                   ", \"flat_data_type\":\"" +
+                   data_type_to_string(self.flat_data_type()) + "\"" +
+                   ", \"quantize_type\":\"" +
+                   quantize_type_to_string(self.quantize_type()) +
+                   "\", \"quantizer_param\":{" + "\"enable_rotate\":" +
+                   (self.quantizer_param().enable_rotate() ? "true" : "false") +
+                   "}}";
+          })
+      .def(py::pickle(
+          [](const VamanaIndexParams &self) {
+            return py::make_tuple(
+                self.metric_type(), self.max_degree(), self.search_list_size(),
+                self.alpha(), self.saturate_graph(),
+                self.use_contiguous_memory(), self.use_id_map(),
+                self.quantize_type(), self.quantizer_param().enable_rotate(),
+                self.two_pass_build(), self.use_flat_contiguous_memory(),
+                self.flat_data_type());
+          },
+          [](py::tuple t) {
+            if (t.size() < 8 || t.size() > 12)
+              throw std::runtime_error("Invalid state for VamanaIndexParams");
+            QuantizerParam qp(t.size() >= 9 ? t[8].cast<bool>() : false);
+            bool two_pass_build = t.size() >= 10 ? t[9].cast<bool>() : false;
+            return std::make_shared<VamanaIndexParams>(
+                t[0].cast<MetricType>(), t[1].cast<int>(), t[2].cast<int>(),
+                t[3].cast<float>(), t[4].cast<bool>(), t[5].cast<bool>(),
+                t[6].cast<bool>(), t[7].cast<QuantizeType>(), qp,
+                two_pass_build, t.size() >= 11 ? t[10].cast<bool>() : false,
+                t.size() >= 12 ? t[11].cast<DataType>()
+                               : DataType::VECTOR_FP32);
+          }));
+
+  // FlatIndexParams
+  py::class_<FlatIndexParams, VectorIndexParams,
+             std::shared_ptr<FlatIndexParams>>
+      flat_params(m, "FlatIndexParam", R"pbdoc(
+Parameters for configuring a flat (brute-force) index.
+
+A flat index performs exact nearest neighbor search by comparing the query
+vector against all vectors in the collection. It is simple, accurate, and
+suitable for small to medium datasets or as a baseline.
+
+Attributes:
+    metric_type (MetricType): Distance metric used for similarity computation.
+        Default is ``MetricType.IP`` (inner product).
+    quantize_type (QuantizeType): Optional quantization type for vector
+        compression (e.g., FP16, INT8). Use ``QuantizeType.UNDEFINED`` to
+        disable quantization. Default is ``QuantizeType.UNDEFINED``.
+
+Examples:
+    >>> from zvec.typing import MetricType, QuantizeType
+    >>> params = FlatIndexParam(
+    ...     metric_type=MetricType.L2,
+    ...     quantize_type=QuantizeType.FP16
+    ... )
+    >>> print(params)
+    {'metric_type': 'L2', 'quantize_type': 'FP16'}
+)pbdoc");
+  flat_params
+      .def(py::init([](MetricType metric_type, QuantizeType quantize_type,
+                       QuantizerParam quantizer_param,
+                       bool use_contiguous_memory) {
+             return std::make_shared<FlatIndexParams>(
+                 metric_type, quantize_type, quantizer_param,
+                 use_contiguous_memory);
+           }),
+           py::arg("metric_type") = MetricType::IP,
+           py::arg("quantize_type") = QuantizeType::UNDEFINED,
+           py::arg("quantizer_param") = QuantizerParam(),
+           py::arg("use_contiguous_memory") = false,
+           R"pbdoc(
+Constructs a FlatIndexParam instance.
+
+Args:
+    metric_type (MetricType, optional): Distance metric. Defaults to MetricType.IP.
+    quantize_type (QuantizeType, optional): Vector quantization type.
+        Defaults to QuantizeType.UNDEFINED (no quantization).
+    quantizer_param (QuantizerParam, optional): Quantizer configuration.
+        Defaults to QuantizerParam().
+)pbdoc")
+      .def_property_readonly(
+          "use_contiguous_memory", &FlatIndexParams::use_contiguous_memory,
+          "bool: Whether Flat uses contiguous vector memory.")
+      .def(
+          "to_dict",
+          [](const FlatIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            py::dict qp_dict;
+            qp_dict["enable_rotate"] = self.quantizer_param().enable_rotate();
+            dict["quantizer_param"] = qp_dict;
+            dict["use_contiguous_memory"] = self.use_contiguous_memory();
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(
+          "__repr__",
+          [](const FlatIndexParams &self) -> std::string {
+            return "{"
+                   "\"metric_type\":" +
+                   metric_type_to_string(self.metric_type()) +
+                   ", \"quantize_type\":" +
+                   quantize_type_to_string(self.quantize_type()) +
+                   ", \"quantizer_param\":{" + "\"enable_rotate\":" +
+                   (self.quantizer_param().enable_rotate() ? "true" : "false") +
+                   "}, \"use_contiguous_memory\":" +
+                   (self.use_contiguous_memory() ? "true" : "false") + "}";
+          })
+      .def(py::pickle(
+          [](const FlatIndexParams &self) {
+            return py::make_tuple(self.metric_type(), self.quantize_type(),
+                                  self.quantizer_param().enable_rotate(),
+                                  self.use_contiguous_memory());
+          },
+          [](py::tuple t) {
+            if (t.size() < 2 || t.size() > 4)
+              throw std::runtime_error("Invalid state for FlatIndexParams");
+            QuantizerParam qp(t.size() >= 3 ? t[2].cast<bool>() : false);
+            return std::make_shared<FlatIndexParams>(
+                t[0].cast<MetricType>(), t[1].cast<QuantizeType>(), qp,
+                t.size() >= 4 ? t[3].cast<bool>() : false);
+          }));
+
+  // IVFIndexParams
+  py::class_<IVFIndexParams, VectorIndexParams, std::shared_ptr<IVFIndexParams>>
+      ivf_params(m, "IVFIndexParam", R"pbdoc(
+Parameters for configuring an IVF (Inverted File Index) index.
+
+IVF partitions the vector space into clusters (inverted lists). At query time,
+only a subset of clusters is searched, providing a trade-off between speed
+and accuracy.
+
+Attributes:
+    metric_type (MetricType): Distance metric used for similarity computation.
+        Default is ``MetricType.IP`` (inner product).
+    n_list (int): Number of clusters (inverted lists) to partition the dataset into.
+        Default is 10.
+    n_iters (int): Number of iterations for k-means clustering during index training.
+        Higher values yield more stable centroids. Default is 10.
+    use_soar (bool): Whether to enable SOAR (Scalable Optimized Adaptive Routing)
+        for improved IVF search performance. Default is False.
+    quantize_type (QuantizeType): Optional quantization type for vector
+        compression (e.g., FP16, INT8). Default is ``QuantizeType.UNDEFINED``.
+
+Examples:
+    >>> from zvec.typing import MetricType, QuantizeType
+    >>> params = IVFIndexParam(
+    ...     metric_type=MetricType.COSINE,
+    ...     n_list=100,
+    ...     n_iters=15,
+    ...     use_soar=True,
+    ...     quantize_type=QuantizeType.INT8
+    ... )
+    >>> print(params.n_list)
+    100
+)pbdoc");
+  ivf_params
+      .def(py::init([](MetricType metric_type, int n_list, int n_iters,
+                       bool use_soar, QuantizeType quantize_type,
+                       QuantizerParam quantizer_param) {
+             return std::make_shared<IVFIndexParams>(
+                 metric_type, n_list, n_iters, use_soar, quantize_type,
+                 quantizer_param);
+           }),
+           py::arg("metric_type") = MetricType::IP, py::arg("n_list") = 10,
+           py::arg("n_iters") = 10, py::arg("use_soar") = false,
+           py::arg("quantize_type") = QuantizeType::UNDEFINED,
+           py::arg("quantizer_param") = QuantizerParam(),
+           R"pbdoc(
+Constructs an IVFIndexParam instance.
+
+Args:
+    metric_type (MetricType, optional): Distance metric. Defaults to MetricType.IP.
+    n_list (int, optional): Number of inverted lists (clusters).
+        Defaults to 10.
+    n_iters (int, optional): Number of k-means iterations during training.
+        Defaults to 10.
+    use_soar (bool, optional): Enable SOAR optimization. Defaults to False.
+    quantize_type (QuantizeType, optional): Vector quantization type.
+        Defaults to QuantizeType.UNDEFINED.
+    quantizer_param (QuantizerParam, optional): Quantizer configuration.
+        Defaults to QuantizerParam().
+)pbdoc")
+      .def_property_readonly("n_list", &IVFIndexParams::n_list,
+                             "int: Number of inverted lists.")
+      .def_property_readonly(
+          "n_iters", &IVFIndexParams::n_iters,
+          "int: Number of k-means iterations during training.")
+      .def_property_readonly("use_soar", &IVFIndexParams::use_soar,
+                             "bool: Whether SOAR optimization is enabled.")
+      .def(
+          "to_dict",
+          [](const IVFIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["n_list"] = self.n_list();
+            dict["n_iters"] = self.n_iters();
+            dict["use_soar"] = self.use_soar();
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            py::dict qp_dict;
+            qp_dict["enable_rotate"] = self.quantizer_param().enable_rotate();
+            dict["quantizer_param"] = qp_dict;
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(
+          "__repr__",
+          [](const IVFIndexParams &self) {
+            return "{"
+                   "\"metric_type\":" +
+                   metric_type_to_string(self.metric_type()) +
+                   ", \"n_list\":" + std::to_string(self.n_list()) +
+                   ", \"n_iters\":" + std::to_string(self.n_iters()) +
+                   ", \"use_soar\":" + std::to_string(self.use_soar()) +
+                   ", \"quantize_type\":" +
+                   quantize_type_to_string(self.quantize_type()) +
+                   ", \"quantizer_param\":{" + "\"enable_rotate\":" +
+                   (self.quantizer_param().enable_rotate() ? "true" : "false") +
+                   "}}";
+          })
+      .def(py::pickle(
+          [](const IVFIndexParams &self) {
+            return py::make_tuple(self.metric_type(), self.n_list(),
+                                  self.n_iters(), self.use_soar(),
+                                  self.quantize_type(),
+                                  self.quantizer_param().enable_rotate());
+          },
+          [](py::tuple t) {
+            if (t.size() != 5 && t.size() != 6)
+              throw std::runtime_error("Invalid state for IVFIndexParams");
+            QuantizerParam qp(t.size() >= 6 ? t[5].cast<bool>() : false);
+            return std::make_shared<IVFIndexParams>(
+                t[0].cast<MetricType>(), t[1].cast<int>(), t[2].cast<int>(),
+                t[3].cast<bool>(), t[4].cast<QuantizeType>(), qp);
+          }));
+
+  // DiskAnnIndexParams
+  py::class_<DiskAnnIndexParams, VectorIndexParams,
+             std::shared_ptr<DiskAnnIndexParams>>
+      diskann_params(m, "DiskAnnIndexParam", R"pbdoc(
+Parameters for configuring an DiskAnn index.
+
+DiskAnn stores compressed vector in memory and high-definition vector on disk. At query time,
+only compressed vector will be loaded into memory. By this way, search memory at runtime is diminished. 
+
+Attributes:
+    metric_type (MetricType): Distance metric used for similarity computation.
+        Default is ``MetricType.IP`` (inner product).
+    max_degree (int): Maximum out-degree of each node in the Vamana graph.
+        Larger values improve recall at the cost of build time and index size.
+        Clamped to the range [1, 100]. Default is 100.
+    list_size (int): Candidate list size used during graph construction.
+        Larger values improve graph quality and recall at the cost of build time.
+        Clamped to the range [10, 100]. Default is 50.
+    pq_chunk_num (int): Number of PQ chunks used for product-quantizing the
+        in-memory compressed vectors. ``0`` means auto-pick based on dimension.
+        Clamped to the range [1, 1024]. Default is 0.
+    quantize_type (QuantizeType): Optional quantization type for vector
+        compression (e.g., FP16, INT8). Default is ``QuantizeType.UNDEFINED``.
+
+Examples:
+    >>> from zvec.typing import MetricType, QuantizeType
+    >>> params = DiskAnnIndexParam(
+    ...     metric_type=MetricType.COSINE,
+    ...     max_degree=100,
+    ...     list_size=50,
+    ...     pq_chunk_num=8,
+    ...     quantize_type=QuantizeType.FP16
+    ... )
+    >>> print(params.max_degree)
+    100
+)pbdoc");
+  diskann_params
+      .def(py::init([](MetricType metric_type, int max_degree, int list_size,
+                       int pq_chunk_num, QuantizeType quantize_type,
+                       QuantizerParam quantizer_param) {
+             return std::make_shared<DiskAnnIndexParams>(
+                 metric_type, max_degree, list_size, pq_chunk_num,
+                 quantize_type, quantizer_param);
+           }),
+           py::arg("metric_type") = MetricType::IP, py::arg("max_degree") = 100,
+           py::arg("list_size") = 50, py::arg("pq_chunk_num") = 0,
+           py::arg("quantize_type") = QuantizeType::UNDEFINED,
+           py::arg("quantizer_param") = QuantizerParam(),
+           R"pbdoc(
+Constructs an DiskAnnIndexParams instance.
+
+Args:
+    metric_type (MetricType, optional): Distance metric. Defaults to MetricType.IP.
+    max_degree (int, optional): Maximum out-degree of each node in the Vamana
+        graph. Clamped to [1, 100]. Defaults to 100.
+    list_size (int, optional): Candidate list size used during graph
+        construction. Clamped to [10, 100]. Defaults to 50.
+    pq_chunk_num (int, optional): Number of PQ chunks for product
+        quantization. ``0`` means auto-pick based on dimension.
+        Clamped to [1, 1024]. Defaults to 0.
+    quantize_type (QuantizeType, optional): Vector quantization type.
+        Defaults to QuantizeType.UNDEFINED.
+    quantizer_param (QuantizerParam, optional): Quantizer configuration.
+        Defaults to QuantizerParam().
+)pbdoc")
+      .def_property_readonly("max_degree", &DiskAnnIndexParams::max_degree,
+                             "int: max node degree.")
+      .def_property_readonly("list_size", &DiskAnnIndexParams::list_size,
+                             "int: list size of graph construction")
+      .def_property_readonly(
+          "pq_chunk_num",
+          [](const DiskAnnIndexParams &self) -> int {
+            return self.pq_chunk_num();
+          },
+          "int: chunk num of production quantization.")
+      .def(
+          "to_dict",
+          [](const DiskAnnIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["type"] = index_type_to_string(self.type());
+            dict["metric_type"] = metric_type_to_string(self.metric_type());
+            dict["max_degree"] = self.max_degree();
+            dict["list_size"] = self.list_size();
+            dict["pq_chunk_num"] = self.pq_chunk_num();
+            dict["quantize_type"] =
+                quantize_type_to_string(self.quantize_type());
+            py::dict qp_dict;
+            qp_dict["enable_rotate"] = self.quantizer_param().enable_rotate();
+            dict["quantizer_param"] = qp_dict;
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def(
+          "__repr__",
+          [](const DiskAnnIndexParams &self) {
+            return "{"
+                   "\"metric_type\":" +
+                   metric_type_to_string(self.metric_type()) +
+                   ", \"max_degree\":" + std::to_string(self.max_degree()) +
+                   ", \"list_size\":" + std::to_string(self.list_size()) +
+                   ", \"pq_chunk_num\":" + std::to_string(self.pq_chunk_num()) +
+                   ", \"quantize_type\":" +
+                   quantize_type_to_string(self.quantize_type()) +
+                   ", \"quantizer_param\":{" + "\"enable_rotate\":" +
+                   (self.quantizer_param().enable_rotate() ? "true" : "false") +
+                   "}}";
+          })
+      .def(py::pickle(
+          [](const DiskAnnIndexParams &self) {
+            return py::make_tuple(self.metric_type(), self.max_degree(),
+                                  self.list_size(), self.pq_chunk_num(),
+                                  self.quantize_type(),
+                                  self.quantizer_param().enable_rotate());
+          },
+          [](py::tuple t) {
+            if (t.size() != 5 && t.size() != 6)
+              throw std::runtime_error("Invalid state for DiskAnnIndexParams");
+            QuantizerParam qp(t.size() >= 6 ? t[5].cast<bool>() : false);
+            return std::make_shared<DiskAnnIndexParams>(
+                t[0].cast<MetricType>(), t[1].cast<int>(), t[2].cast<int>(),
+                t[3].cast<int>(), t[4].cast<QuantizeType>(), qp);
+          }));
+}
+
+void ZVecPyParams::bind_query_params(py::module_ &m) {
+  // binding base query params
+  py::class_<QueryParams, std::shared_ptr<QueryParams>> query_params(
+      m, "QueryParam", R"pbdoc(
+Base class for all query parameter configurations.
+
+This abstract base class defines common query settings such as search radius
+and whether to force linear (brute-force) search. It should not be instantiated
+directly; use derived classes like `HnswQueryParam` or `IVFQueryParam`.
+
+Attributes:
+    type (IndexType): The index type this query is configured for.
+    radius (float): Search radius for range queries. Used in combination with
+        top-k to filter results. Default is 0.0 (disabled).
+    is_linear (bool): If True, forces brute-force linear search instead of
+        using the index. Useful for debugging or small datasets. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query. Default is False.
+    scale_factor (float): Coarse candidate multiplier when refining. Zero selects
+        the index-specific default; graph indexes use max(topk, ef) candidates.
+        Positive values are rounded down with a minimum of topk candidates.
+        Must be finite and nonnegative. Ignored when is_using_refiner is False.
+)pbdoc");
+  query_params
+      .def_property_readonly(
+          "type",
+          [](const QueryParams &self) -> IndexType { return self.type(); },
+          "IndexType: The type of index this query targets.")
+      .def_property_readonly(
+          "radius",
+          [](const QueryParams &self) -> float { return self.radius(); },
+          "IndexType: The type of index this query targets.")
+      .def_property_readonly(
+          "is_linear",
+          [](const QueryParams &self) -> bool { return self.is_linear(); },
+          "bool: Whether to bypass the index and use brute-force linear "
+          "search.")
+      .def_property_readonly(
+          "is_using_refiner",
+          [](const QueryParams &self) -> bool {
+            return self.is_using_refiner();
+          },
+          "bool: Whether to use refiner for the query.")
+      .def_property_readonly(
+          "scale_factor", &QueryParams::scale_factor,
+          "float: Coarse candidate multiplier used when refinement is enabled.")
+      .def(py::pickle(
+          [](const QueryParams &self) {  // __getstate__
+            return py::make_tuple(self.type(), self.radius(), self.is_linear());
+          },
+          [](py::tuple t) {  // __setstate__
+            if (t.size() != 3)
+              throw std::runtime_error("Invalid state for QueryParams");
+            return std::shared_ptr<QueryParams>();
+          }));
+
+  // binding hnsw query params
+  py::class_<HnswQueryParams, QueryParams, std::shared_ptr<HnswQueryParams>>
+      hnsw_params(m, "HnswQueryParam", R"pbdoc(
+Query parameters for HNSW (Hierarchical Navigable Small World) index.
+
+Controls the trade-off between search speed and accuracy via the `ef` parameter.
+
+Attributes:
+    type (IndexType): Always ``IndexType.HNSW``.
+    ef (int): Size of the dynamic candidate list during search.
+        Larger values improve recall but slow down search.
+        Default is 300.
+    radius (float): Search radius for range queries. Default is 0.0.
+    is_linear (bool): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query. Default is False.
+    scale_factor (float): Refine candidate multiplier. Default is 0 (max(topk, ef) candidates).
+
+Examples:
+    >>> params = HnswQueryParam(ef=300)
+    >>> print(params.ef)
+    300
+    >>> print(params.to_dict() if hasattr(params, 'to_dict') else params)
+    {"type":"HNSW", "ef":300}
+)pbdoc");
+  hnsw_params
+      .def(py::init([](int ef, float radius, bool is_linear,
+                       bool is_using_refiner, py::dict extra_params,
+                       float scale_factor) {
+             auto obj = std::make_shared<HnswQueryParams>(ef, radius, is_linear,
+                                                          is_using_refiner);
+             obj->set_scale_factor(scale_factor);
+             if (extra_params.contains("prefetch_offset")) {
+               obj->set_prefetch_offset(
+                   extra_params["prefetch_offset"].cast<uint32_t>());
+             }
+             if (extra_params.contains("prefetch_lines")) {
+               obj->set_prefetch_lines(
+                   extra_params["prefetch_lines"].cast<uint32_t>());
+             }
+             return obj;
+           }),
+           py::arg("ef") = core_interface::kDefaultHnswEfSearch,
+           py::arg("radius") = 0.0f, py::arg("is_linear") = false,
+           py::arg("is_using_refiner") = false,
+           py::arg("extra_params") = py::dict(), py::arg("scale_factor") = 0.0f,
+           R"pbdoc(
+Constructs an HnswQueryParam instance.
+
+Args:
+    ef (int, optional): Search-time candidate list size.
+        Higher values improve accuracy. Defaults to 100.
+    radius (float, optional): Search radius for range queries. Default is 0.0.
+    is_linear (bool, optional): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query. Default is False.
+    scale_factor (float, optional): Refine candidate multiplier; defaults to 0 (max(topk, ef) candidates).
+        Ignored when is_using_refiner is False.
+    extra_params (dict, optional): Additional search parameters. Supported keys:
+        - ``prefetch_offset`` (int): Graph prefetch offset (PO).
+          ``0`` disables prefetching. Default is ``8``.
+          Values are clamped to ``256``.
+        - ``prefetch_lines`` (int): Number of 64B cache lines to prefetch
+          per neighbour vector (PL). ``0`` (default) uses the auto-derived
+          value ``ceil(vector_size/64)``. Values are clamped to ``256``.
+)pbdoc")
+      .def_property_readonly(
+          "ef", [](const HnswQueryParams &self) -> int { return self.ef(); },
+          "int: Size of the dynamic candidate list during HNSW search.")
+      .def_property_readonly(
+          "prefetch_offset",
+          [](const HnswQueryParams &self) -> uint32_t {
+            return self.prefetch_offset();
+          },
+          "int: Graph prefetch offset used by the HNSW fast path.")
+      .def_property_readonly(
+          "prefetch_lines",
+          [](const HnswQueryParams &self) -> uint32_t {
+            return self.prefetch_lines();
+          },
+          "int: Override of prefetch cache lines per vector (0=auto).")
+      .def("__repr__",
+           [](const HnswQueryParams &self) -> std::string {
+             return "{"
+                    "\"type\":" +
+                    index_type_to_string(self.type()) +
+                    ", \"ef\":" + std::to_string(self.ef()) +
+                    ", \"radius\":" + std::to_string(self.radius()) +
+                    ", \"is_linear\":" + std::to_string(self.is_linear()) +
+                    ", \"is_using_refiner\":" +
+                    std::to_string(self.is_using_refiner()) +
+                    ", \"prefetch_offset\":" +
+                    std::to_string(self.prefetch_offset()) +
+                    ", \"prefetch_lines\":" +
+                    std::to_string(self.prefetch_lines()) +
+                    ", \"scale_factor\":" +
+                    std::to_string(self.scale_factor()) + "}";
+           })
+      .def(py::pickle(
+          [](const HnswQueryParams &self) {
+            return py::make_tuple(self.ef(), self.radius(), self.is_linear(),
+                                  self.is_using_refiner(),
+                                  self.prefetch_offset(), self.prefetch_lines(),
+                                  self.scale_factor());
+          },
+          [](py::tuple t) {
+            if (t.size() != 4 && t.size() != 5 && t.size() != 6 &&
+                t.size() != 7)
+              throw std::runtime_error("Invalid state for HnswQueryParams");
+            auto obj = std::make_shared<HnswQueryParams>(t[0].cast<int>());
+            obj->set_radius(t[1].cast<float>());
+            obj->set_is_linear(t[2].cast<bool>());
+            obj->set_is_using_refiner(t[3].cast<bool>());
+            if (t.size() >= 5) {
+              obj->set_prefetch_offset(t[4].cast<uint32_t>());
+            }
+            if (t.size() >= 6) {
+              obj->set_prefetch_lines(t[5].cast<uint32_t>());
+            }
+            if (t.size() >= 7) obj->set_scale_factor(t[6].cast<float>());
+            return obj;
+          }));
+
+  // binding ivf query params
+  py::class_<IVFQueryParams, QueryParams, std::shared_ptr<IVFQueryParams>>
+      ivf_params(m, "IVFQueryParam", R"pbdoc(
+Query parameters for IVF (Inverted File Index) index.
+
+Controls how many inverted lists (`nprobe`) to visit during search.
+
+Attributes:
+    type (IndexType): Always ``IndexType.IVF``.
+    nprobe (int): Number of closest clusters (inverted lists) to search.
+        Higher values improve recall but increase latency.
+        Default is 10.
+    radius (float): Search radius for range queries. Default is 0.0.
+    is_linear (bool): Force linear search. Default is False.
+    is_using_refiner (bool): Whether to refine candidates. Default is False.
+    scale_factor (float): Refine candidate multiplier. Default is 10.
+
+Examples:
+    >>> params = IVFQueryParam(nprobe=20)
+    >>> print(params.nprobe)
+    20
+)pbdoc");
+  ivf_params
+      .def(py::init<int, bool, float>(), py::arg("nprobe") = 10,
+           py::arg("is_using_refiner") = false, py::arg("scale_factor") = 10.0f,
+           R"pbdoc(
+Constructs an IVFQueryParam instance.
+
+Args:
+    nprobe (int, optional): Number of inverted lists to probe during search.
+        Higher values improve accuracy. Defaults to 10.
+    is_using_refiner (bool, optional): Whether to refine candidates. Default is False.
+    scale_factor (float, optional): Refine candidate multiplier. Default is 10.
+)pbdoc")
+      .def_property_readonly(
+          "nprobe",
+          [](const IVFQueryParams &self) -> int { return self.nprobe(); },
+          "int: Number of inverted lists to search during IVF query.")
+      .def("__repr__",
+           [](const IVFQueryParams &self) -> std::string {
+             return "{"
+                    "\"type\":" +
+                    index_type_to_string(self.type()) +
+                    ", \"nprobe\":" + std::to_string(self.nprobe()) +
+                    ", \"is_using_refiner\":" +
+                    std::to_string(self.is_using_refiner()) +
+                    ", \"scale_factor\":" +
+                    std::to_string(self.scale_factor()) + "}";
+           })
+      .def(py::pickle(
+          [](const IVFQueryParams &self) {
+            return py::make_tuple(self.nprobe(), self.radius(),
+                                  self.is_linear(), self.is_using_refiner(),
+                                  self.scale_factor());
+          },
+          [](py::tuple t) {
+            if (t.size() != 3 && t.size() != 5)
+              throw std::runtime_error("Invalid state for IVFQueryParams");
+            auto obj = std::make_shared<IVFQueryParams>(t[0].cast<int>());
+            obj->set_radius(t[1].cast<float>());
+            obj->set_is_linear(t[2].cast<bool>());
+            if (t.size() >= 5) {
+              obj->set_is_using_refiner(t[3].cast<bool>());
+              obj->set_scale_factor(t[4].cast<float>());
+            }
+            return obj;
+          }));
+
+  // binding hnsw rabitq query params
+  py::class_<HnswRabitqQueryParams, QueryParams,
+             std::shared_ptr<HnswRabitqQueryParams>>
+      hnsw_rabitq_query_params(m, "HnswRabitqQueryParam", R"pbdoc(
+Query parameters for HNSW RaBitQ (Hierarchical Navigable Small World with RaBitQ quantization) index.
+
+Controls the trade-off between search speed and accuracy via the `ef` parameter.
+RaBitQ provides efficient quantization while maintaining high search quality.
+
+Attributes:
+    type (IndexType): Always ``IndexType.HNSW_RABITQ``.
+    ef (int): Size of the dynamic candidate list during search.
+        Larger values improve recall but slow down search.
+        Default is 300.
+    radius (float): Search radius for range queries. Default is 0.0.
+    is_linear (bool): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query. Default is False.
+    scale_factor (float, optional): Refine candidate multiplier. Default is 0 (max(topk, ef) candidates).
+
+Examples:
+    >>> params = HnswRabitqQueryParam(ef=300)
+    >>> print(params.ef)
+    300
+    >>> print(params.to_dict() if hasattr(params, 'to_dict') else params)
+    {"type":"HNSW_RABITQ", "ef":300}
+)pbdoc");
+  hnsw_rabitq_query_params
+      .def(py::init<int, float, bool, bool, float>(),
+           py::arg("ef") = core_interface::kDefaultHnswEfSearch,
+           py::arg("radius") = 0.0f, py::arg("is_linear") = false,
+           py::arg("is_using_refiner") = false, py::arg("scale_factor") = 0.0f,
+           R"pbdoc(
+Constructs an HnswRabitqQueryParam instance.
+
+Args:
+    ef (int, optional): Search-time candidate list size.
+        Higher values improve accuracy. Defaults to 300.
+    radius (float, optional): Search radius for range queries. Default is 0.0.
+    is_linear (bool, optional): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query. Default is False.
+    scale_factor (float, optional): Refine candidate multiplier. Default is 0 (max(topk, ef) candidates).
+)pbdoc")
+      .def_property_readonly(
+          "ef",
+          [](const HnswRabitqQueryParams &self) -> int { return self.ef(); },
+          "int: Size of the dynamic candidate list during HNSW RaBitQ search.")
+      .def("__repr__",
+           [](const HnswRabitqQueryParams &self) -> std::string {
+             return "{"
+                    "\"type\":\"" +
+                    index_type_to_string(self.type()) +
+                    "\", \"ef\":" + std::to_string(self.ef()) +
+                    ", \"radius\":" + std::to_string(self.radius()) +
+                    ", \"is_linear\":" + std::to_string(self.is_linear()) +
+                    ", \"is_using_refiner\":" +
+                    std::to_string(self.is_using_refiner()) +
+                    ", \"scale_factor\":" +
+                    std::to_string(self.scale_factor()) + "}";
+           })
+      .def(py::pickle(
+          [](const HnswRabitqQueryParams &self) {
+            return py::make_tuple(self.ef(), self.radius(), self.is_linear(),
+                                  self.is_using_refiner(), self.scale_factor());
+          },
+          [](py::tuple t) {
+            if (t.size() != 4 && t.size() != 5)
+              throw std::runtime_error(
+                  "Invalid state for HnswRabitqQueryParams");
+            auto obj =
+                std::make_shared<HnswRabitqQueryParams>(t[0].cast<int>());
+            obj->set_radius(t[1].cast<float>());
+            obj->set_is_linear(t[2].cast<bool>());
+            obj->set_is_using_refiner(t[3].cast<bool>());
+            if (t.size() >= 5) obj->set_scale_factor(t[4].cast<float>());
+            return obj;
+          }));
+
+  // binding ivf rabitq query params
+  py::class_<IvfRabitqQueryParams, QueryParams,
+             std::shared_ptr<IvfRabitqQueryParams>>
+      ivf_rabitq_query_params(m, "IvfRabitqQueryParam", R"pbdoc(
+Query parameters for IVF RaBitQ index.
+
+Controls how many IVF clusters (`nprobe`) to visit during search.
+
+Attributes:
+    type (IndexType): Always ``IndexType.IVF_RABITQ``.
+    nprobe (int): Number of closest clusters to search.
+        Higher values improve recall but increase latency.
+        Default is 10.
+    radius (float): Search radius for range queries. Default is 0.0.
+    is_linear (bool): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query. Default is False.
+    scale_factor (float): Candidate expansion factor used by the refiner.
+        Default is 10.0.
+
+Examples:
+    >>> params = IvfRabitqQueryParam(nprobe=20)
+    >>> print(params.nprobe)
+    20
+)pbdoc");
+  ivf_rabitq_query_params
+      .def(py::init<int, float, bool, bool, float>(),
+           py::arg("nprobe") = core_interface::kDefaultIvfRabitqNprobe,
+           py::arg("radius") = 0.0f, py::arg("is_linear") = false,
+           py::arg("is_using_refiner") = false, py::arg("scale_factor") = 10.0f,
+           R"pbdoc(
+Constructs an IvfRabitqQueryParam instance.
+
+Args:
+    nprobe (int, optional): Number of inverted lists to probe during search.
+        Higher values improve accuracy. Defaults to 10.
+    radius (float, optional): Search radius for range queries. Default is 0.0.
+    is_linear (bool, optional): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query. Default is False.
+    scale_factor (float, optional): Candidate expansion factor used by the
+        refiner. Default is 10.0.
+)pbdoc")
+      .def_property_readonly(
+          "nprobe",
+          [](const IvfRabitqQueryParams &self) -> int { return self.nprobe(); },
+          "int: Number of inverted lists to search during IVF RaBitQ query.")
+      .def_property_readonly(
+          "scale_factor",
+          [](const IvfRabitqQueryParams &self) -> float {
+            return self.scale_factor();
+          },
+          "float: Candidate expansion factor used by the refiner.")
+      .def("__repr__",
+           [](const IvfRabitqQueryParams &self) -> std::string {
+             return "{"
+                    "\"type\":\"" +
+                    index_type_to_string(self.type()) +
+                    "\", \"nprobe\":" + std::to_string(self.nprobe()) +
+                    ", \"radius\":" + std::to_string(self.radius()) +
+                    ", \"is_linear\":" + std::to_string(self.is_linear()) +
+                    ", \"is_using_refiner\":" +
+                    std::to_string(self.is_using_refiner()) +
+                    ", \"scale_factor\":" +
+                    std::to_string(self.scale_factor()) + "}";
+           })
+      .def(py::pickle(
+          [](const IvfRabitqQueryParams &self) {
+            return py::make_tuple(self.nprobe(), self.radius(),
+                                  self.is_linear(), self.is_using_refiner(),
+                                  self.scale_factor());
+          },
+          [](py::tuple t) {
+            if (t.size() != 4 && t.size() != 5) {
+              throw std::runtime_error(
+                  "Invalid state for IvfRabitqQueryParams");
+            }
+            auto obj = std::make_shared<IvfRabitqQueryParams>(t[0].cast<int>());
+            obj->set_radius(t[1].cast<float>());
+            obj->set_is_linear(t[2].cast<bool>());
+            obj->set_is_using_refiner(t[3].cast<bool>());
+            if (t.size() == 5) {
+              obj->set_scale_factor(t[4].cast<float>());
+            }
+            return obj;
+          }));
+
+  // binding diskann query params
+  py::class_<DiskAnnQueryParams, QueryParams,
+             std::shared_ptr<DiskAnnQueryParams>>
+      diskann_params(m, "DiskAnnQueryParam", R"pbdoc(
+Query parameters for DiskAnn index.
+
+Attributes:
+    type (IndexType): Always ``IndexType.DISKANN``.
+    list_size (int): Beam-search candidate list size used at query time.
+        Higher values improve recall but increase latency. Default is 10.
+
+Examples:
+    >>> params = DiskAnnQueryParam(list_size=20)
+    >>> print(params.list_size)
+    20
+)pbdoc");
+  diskann_params
+      .def(py::init<int>(), py::arg("list_size") = 300, R"pbdoc(
+Constructs an DiskAnnQueryParams instance.
+
+Args:
+    list_size (int, optional): Beam-search candidate list size during
+        graph search. Higher values improve recall at the cost of latency.
+        Defaults to 300.
+)pbdoc")
+      .def_property_readonly(
+          "list_size",
+          [](const DiskAnnQueryParams &self) -> int {
+            return self.list_size();
+          },
+          "int: Beam-search candidate list size during DiskAnn query.")
+      .def("__repr__",
+           [](const DiskAnnQueryParams &self) -> std::string {
+             return "{"
+                    "\"type\":" +
+                    index_type_to_string(self.type()) +
+                    ", \"list_size\":" + std::to_string(self.list_size()) + "}";
+           })
+      .def(py::pickle(
+          [](const DiskAnnQueryParams &self) {
+            return py::make_tuple(self.list_size());
+          },
+          [](py::tuple t) {
+            if (t.size() != 1)
+              throw std::runtime_error("Invalid state for DiskAnnQueryParams");
+            return std::make_shared<DiskAnnQueryParams>(t[0].cast<int>());
+          }));
+
+  // binding vamana query params
+  py::class_<VamanaQueryParams, QueryParams, std::shared_ptr<VamanaQueryParams>>
+      vamana_query_params(m, "VamanaQueryParam", R"pbdoc(
+Query parameters for the Vamana (DiskANN) index.
+
+Controls the trade-off between search speed and accuracy via the
+``ef_search`` parameter, which sets the size of the dynamic candidate list
+explored during search.
+
+Attributes:
+    type (IndexType): Always ``IndexType.VAMANA``.
+    ef_search (int): Size of the dynamic candidate list during Vamana
+        search. Larger values improve recall but slow down search.
+        Default is 200.
+    radius (float): Search radius for range queries. Default is 0.0.
+    is_linear (bool): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query.
+        Default is False.
+    scale_factor (float): Refine candidate multiplier. Default is 0 (max(topk, ef) candidates).
+
+Examples:
+    >>> params = VamanaQueryParam(ef_search=200)
+    >>> print(params.ef_search)
+    200
+)pbdoc");
+  vamana_query_params
+      .def(py::init([](int ef_search, float radius, bool is_linear,
+                       bool is_using_refiner, py::dict extra_params,
+                       float scale_factor) {
+             auto obj = std::make_shared<VamanaQueryParams>(
+                 ef_search, radius, is_linear, is_using_refiner);
+             obj->set_scale_factor(scale_factor);
+             if (extra_params.contains("prefetch_offset")) {
+               obj->set_prefetch_offset(
+                   extra_params["prefetch_offset"].cast<uint32_t>());
+             }
+             if (extra_params.contains("prefetch_lines")) {
+               obj->set_prefetch_lines(
+                   extra_params["prefetch_lines"].cast<uint32_t>());
+             }
+             return obj;
+           }),
+           py::arg("ef_search") = core_interface::kDefaultVamanaEfSearch,
+           py::arg("radius") = 0.0f, py::arg("is_linear") = false,
+           py::arg("is_using_refiner") = false,
+           py::arg("extra_params") = py::dict(), py::arg("scale_factor") = 0.0f,
+           R"pbdoc(
+Constructs a VamanaQueryParam instance.
+
+Args:
+    ef_search (int, optional): Search-time candidate list size.
+        Higher values improve accuracy. Defaults to 200.
+    radius (float, optional): Search radius for range queries. Default is 0.0.
+    is_linear (bool, optional): Force linear search. Default is False.
+    is_using_refiner (bool, optional): Whether to use refiner for the query.
+        Default is False.
+    scale_factor (float, optional): Refine candidate multiplier; defaults to 0 (max(topk, ef) candidates).
+        Ignored when is_using_refiner is False.
+    extra_params (dict, optional): Additional search parameters. Supported keys:
+        - ``prefetch_offset`` (int): Vector-prefetch prefix size (PO) during
+          pool expansion.
+          The shared default ``8`` is resolved by Vamana from the stored vector
+          size, graph degree, effective line count, and a 6 KiB nominal budget
+          for this phase only. ``0`` disables this prefix, not local-descent,
+          graph-row, or distance-kernel prefetching.
+          Values are clamped to ``256``.
+        - ``prefetch_lines`` (int): Number of 64B cache lines to prefetch
+          per neighbour vector (PL). The shared default ``0`` makes Vamana use
+          at most two lines, further clamped to the stored vector size. Values
+          are clamped to ``256`` and to the stored vector size.
+)pbdoc")
+      .def_property_readonly(
+          "ef_search",
+          [](const VamanaQueryParams &self) -> int { return self.ef_search(); },
+          "int: Size of the dynamic candidate list during Vamana search.")
+      .def_property_readonly(
+          "prefetch_offset",
+          [](const VamanaQueryParams &self) -> uint32_t {
+            return self.prefetch_offset();
+          },
+          "int: Requested pool-phase vector-prefetch prefix; the default is "
+          "resolved by Vamana.")
+      .def_property_readonly(
+          "prefetch_lines",
+          [](const VamanaQueryParams &self) -> uint32_t {
+            return self.prefetch_lines();
+          },
+          "int: Requested cache-line count; zero selects Vamana's default.")
+      .def("__repr__",
+           [](const VamanaQueryParams &self) -> std::string {
+             return "{"
+                    "\"type\":\"" +
+                    index_type_to_string(self.type()) +
+                    "\", \"ef_search\":" + std::to_string(self.ef_search()) +
+                    ", \"radius\":" + std::to_string(self.radius()) +
+                    ", \"is_linear\":" + std::to_string(self.is_linear()) +
+                    ", \"is_using_refiner\":" +
+                    std::to_string(self.is_using_refiner()) +
+                    ", \"prefetch_offset\":" +
+                    std::to_string(self.prefetch_offset()) +
+                    ", \"prefetch_lines\":" +
+                    std::to_string(self.prefetch_lines()) +
+                    ", \"scale_factor\":" +
+                    std::to_string(self.scale_factor()) + "}";
+           })
+      .def(py::pickle(
+          [](const VamanaQueryParams &self) {
+            return py::make_tuple(self.ef_search(), self.radius(),
+                                  self.is_linear(), self.is_using_refiner(),
+                                  self.prefetch_offset(), self.prefetch_lines(),
+                                  self.scale_factor());
+          },
+          [](py::tuple t) {
+            if (t.size() != 4 && t.size() != 5 && t.size() != 6 &&
+                t.size() != 7)
+              throw std::runtime_error("Invalid state for VamanaQueryParams");
+            auto obj = std::make_shared<VamanaQueryParams>(t[0].cast<int>());
+            obj->set_radius(t[1].cast<float>());
+            obj->set_is_linear(t[2].cast<bool>());
+            obj->set_is_using_refiner(t[3].cast<bool>());
+            if (t.size() >= 5) {
+              obj->set_prefetch_offset(t[4].cast<uint32_t>());
+            }
+            if (t.size() >= 6) {
+              obj->set_prefetch_lines(t[5].cast<uint32_t>());
+            }
+            if (t.size() >= 7) obj->set_scale_factor(t[6].cast<float>());
+            return obj;
+          }));
+
+  // binding fts query params
+  py::class_<FtsQueryParams, QueryParams, std::shared_ptr<FtsQueryParams>>
+      fts_query_params(m, "FtsQueryParam", R"pbdoc(
+Query parameters for full-text search (FTS) index.
+
+Controls the default boolean operator used to combine adjacent bare terms
+in a query string.
+
+Attributes:
+    type (IndexType): Always ``IndexType.FTS``.
+    default_operator (str): Default boolean operator for adjacent bare terms.
+        Supported values (case-insensitive): "OR" (default), "AND".
+
+Examples:
+    >>> params = FtsQueryParam(default_operator="AND")
+    >>> print(params.default_operator)
+    AND
+)pbdoc");
+  fts_query_params
+      .def(py::init([](const std::string &default_operator) {
+             auto params = std::make_shared<FtsQueryParams>();
+             if (!default_operator.empty()) {
+               params->set_default_operator(default_operator);
+             }
+             return params;
+           }),
+           py::arg("default_operator") = "",
+           R"pbdoc(
+Constructs an FtsQueryParam instance.
+
+Args:
+    default_operator (str, optional): Default boolean operator for adjacent
+        bare terms. Supported: "OR", "AND". Defaults to "" (uses engine default).
+)pbdoc")
+      .def_property_readonly("default_operator",
+                             &FtsQueryParams::default_operator,
+                             "str: Default boolean operator for bare terms.")
+      .def("__repr__",
+           [](const FtsQueryParams &self) -> std::string {
+             return "{"
+                    "\"type\":\"" +
+                    index_type_to_string(self.type()) +
+                    "\", \"default_operator\":\"" + self.default_operator() +
+                    "\"}";
+           })
+      .def(py::pickle(
+          [](const FtsQueryParams &self) {
+            return py::make_tuple(self.default_operator());
+          },
+          [](py::tuple t) {
+            if (t.size() != 1) {
+              throw std::runtime_error("Invalid state for FtsQueryParams");
+            }
+            auto obj = std::make_shared<FtsQueryParams>();
+            obj->set_default_operator(t[0].cast<std::string>());
+            return obj;
+          }));
+}
+
+void ZVecPyParams::bind_options(py::module_ &m) {  // binding collection options
+  py::class_<CollectionOptions>(m, "CollectionOption", R"pbdoc(
+Options for opening or creating a collection.
+
+Attributes:
+    read_only (bool): Whether the collection is opened in read-only mode.
+        Default is False.
+    enable_mmap (bool): Whether to use memory-mapped I/O for data files.
+        Default is True.
+
+Examples:
+    >>> opt = CollectionOption(read_only=True, enable_mmap=False)
+    >>> print(opt.read_only)
+    True
+)pbdoc")
+      .def(py::init<bool, bool>(), py::arg("read_only") = false,
+           py::arg("enable_mmap") = true,
+           R"pbdoc(
+Constructs a CollectionOption instance.
+
+Args:
+    read_only (bool, optional): Open collection in read-only mode.
+        Defaults to False.
+    enable_mmap (bool, optional): Enable memory-mapped I/O.
+        Defaults to True.
+)pbdoc")
+      .def_property_readonly(
+          "enable_mmap",
+          [](const CollectionOptions &self) { return self.enable_mmap_; })
+      .def_property_readonly(
+          "read_only",
+          [](const CollectionOptions &self) { return self.read_only_; })
+      .def("__repr__",
+           [](const CollectionOptions &self) -> std::string {
+             return "{"
+                    "\"enable_mmap\":" +
+                    std::to_string(self.enable_mmap_) +
+                    ", \"read_only\":" + std::to_string(self.read_only_) + "}";
+           })
+      .def(py::pickle(
+          [](const CollectionOptions &self) {
+            return py::make_tuple(self.read_only_, self.enable_mmap_,
+                                  self.max_buffer_size_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 3)
+              throw std::runtime_error(
+                  "Invalid pickle data for CollectionOptions");
+            CollectionOptions obj{};
+            obj.read_only_ = t[0].cast<bool>();
+            obj.enable_mmap_ = t[1].cast<bool>();
+            obj.max_buffer_size_ = t[2].cast<uint32_t>();
+            return obj;
+          }));
+
+  // SegmentOptions
+  py::class_<SegmentOptions>(m, "SegmentOption", R"pbdoc(
+Options for segment-level operations.
+
+Currently, this class mirrors CollectionOption and is used internally.
+It supports read-only mode, memory mapping, and buffer configuration.
+
+Note:
+    This class is primarily for internal use. Most users should use
+    CollectionOption instead.
+
+Examples:
+    >>> opt = SegmentOption()
+    >>> print(opt.enable_mmap)
+    True
+)pbdoc")
+      .def(py::init<>(), "Constructs a SegmentOption with default settings.")
+      .def_property_readonly(
+          "enable_mmap",
+          [](const SegmentOptions &self) { return self.enable_mmap_; },
+          "bool: Whether memory-mapped I/O is enabled.")
+      .def_property_readonly(
+          "read_only",
+          [](const SegmentOptions &self) { return self.read_only_; },
+          "bool: Whether the segment is read-only.")
+      .def_property_readonly(
+          "max_buffer_size",
+          [](const SegmentOptions &self) { return self.max_buffer_size_; },
+          "int: Maximum buffer size in bytes (internal use).")
+      .def("__repr__",
+           [](const SegmentOptions &self) -> std::string {
+             return "{"
+                    "\"enable_mmap\":" +
+                    std::to_string(self.enable_mmap_) +
+                    ", \"read_only\":" + std::to_string(self.read_only_) +
+                    ", \"max_buffer_size\":" +
+                    std::to_string(self.max_buffer_size_) + "}";
+           })
+      .def(py::pickle(
+          [](const SegmentOptions &self) {
+            return py::make_tuple(self.read_only_, self.enable_mmap_,
+                                  self.max_buffer_size_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 3)
+              throw std::runtime_error(
+                  "Invalid pickle data for SegmentOptions");
+            SegmentOptions obj{};
+            obj.read_only_ = t[0].cast<bool>();
+            obj.enable_mmap_ = t[1].cast<bool>();
+            obj.max_buffer_size_ = t[2].cast<uint32_t>();
+            return obj;
+          }));
+
+  // CreateIndexOptions
+  py::class_<CreateIndexOptions>(m, "IndexOption",
+                                 R"pbdoc(
+Options for creating an index.
+
+Attributes:
+    concurrency (int): Number of threads to use during index creation.
+        If 0, the system will choose an optimal value automatically.
+        Default is 0.
+
+Examples:
+    >>> opt = IndexOption(concurrency=4)
+    >>> print(opt.concurrency)
+    4
+)pbdoc")
+      .def(py::init<int>(), py::arg("concurrency") = 0,
+           R"pbdoc(
+Constructs an IndexOption instance.
+
+Args:
+    concurrency (int, optional): Number of concurrent threads.
+        0 means auto-detect. Defaults to 0.
+)pbdoc")
+      .def_property_readonly(
+          "concurrency",
+          [](const CreateIndexOptions &self) { return self.concurrency_; },
+          "int: Number of threads used for index creation (0 = auto).")
+      .def(py::pickle(
+          [](const CreateIndexOptions &self) {
+            return py::make_tuple(self.concurrency_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 1)
+              throw std::runtime_error(
+                  "Invalid pickle data for CreateIndexOptions");
+            CreateIndexOptions obj{};
+            obj.concurrency_ = t[0].cast<int>();
+            return obj;
+          }));
+
+  // OptimizeOptions
+  py::class_<OptimizeOptions>(m, "OptimizeOption", R"pbdoc(
+Options for optimizing a collection (e.g., merging segments).
+
+Attributes:
+    concurrency (int): Number of threads to use during optimization.
+        If 0, the system will choose an optimal value automatically.
+        Default is 0.
+
+Examples:
+    >>> opt = OptimizeOption(concurrency=2)
+    >>> print(opt.concurrency)
+    2
+)pbdoc")
+      .def(py::init<int>(), py::arg("concurrency") = 0,
+           R"pbdoc(
+Constructs an OptimizeOption instance.
+
+Args:
+    concurrency (int, optional): Number of concurrent threads.
+        0 means auto-detect. Defaults to 0.
+)pbdoc")
+      .def_property_readonly(
+          "concurrency",
+          [](const OptimizeOptions &self) { return self.concurrency_; },
+          "int: Number of threads used for optimization (0 = auto).")
+      .def(py::pickle(
+          [](const OptimizeOptions &self) {
+            return py::make_tuple(self.concurrency_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 1)
+              throw std::runtime_error(
+                  "Invalid pickle data for OptimizeOptions");
+            OptimizeOptions obj{};
+            obj.concurrency_ = t[0].cast<int>();
+            return obj;
+          }));
+
+  // AddColumnOptions
+  py::class_<AddColumnOptions>(m, "AddColumnOption",
+                               R"pbdoc(
+Options for adding a new column to a collection.
+
+Attributes:
+    concurrency (int): Number of threads to use when backfilling data
+        for the new column. If 0, auto-detect is used. Default is 0.
+
+Examples:
+    >>> opt = AddColumnOption(concurrency=1)
+    >>> print(opt.concurrency)
+    1
+)pbdoc")
+      .def(py::init<int>(), py::arg("concurrency") = 0,
+           R"pbdoc(
+Constructs an AddColumnOption instance.
+
+Args:
+    concurrency (int, optional): Number of threads for data backfill.
+        0 means auto-detect. Defaults to 0.
+)pbdoc")
+      .def_property_readonly(
+          "concurrency",
+          [](const AddColumnOptions &self) { return self.concurrency_; },
+          "int: Number of threads used when adding a column (0 = auto).")
+      .def(py::pickle(
+          [](const AddColumnOptions &self) {
+            return py::make_tuple(self.concurrency_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 1)
+              throw std::runtime_error(
+                  "Invalid pickle data for AddColumnOptions");
+            AddColumnOptions obj{};
+            obj.concurrency_ = t[0].cast<int>();
+            return obj;
+          }));
+
+  // AlterColumnOptions
+  py::class_<AlterColumnOptions>(m, "AlterColumnOption", R"pbdoc(
+Options for altering an existing column (e.g., changing index settings).
+
+Attributes:
+    concurrency (int): Number of threads to use during the alteration process.
+        If 0, the system will choose an optimal value automatically.
+        Default is 0.
+
+Examples:
+    >>> opt = AlterColumnOption(concurrency=1)
+    >>> print(opt.concurrency)
+    1
+)pbdoc")
+      .def(py::init<int>(), py::arg("concurrency") = 0,
+           R"pbdoc(
+Constructs an AlterColumnOption instance.
+
+Args:
+    concurrency (int, optional): Number of threads for column alteration.
+        0 means auto-detect. Defaults to 0.
+)pbdoc")
+      .def_property_readonly(
+          "concurrency",
+          [](const AlterColumnOptions &self) { return self.concurrency_; },
+          "int: Number of threads used when altering a column (0 = auto).")
+      .def(py::pickle(
+          [](const AlterColumnOptions &self) {
+            return py::make_tuple(self.concurrency_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 1)
+              throw std::runtime_error(
+                  "Invalid pickle data for AlterColumnOptions");
+            AlterColumnOptions obj{};
+            obj.concurrency_ = t[0].cast<int>();
+            return obj;
+          }));
+}
+
+void set_query_vector(QueryTarget &target, const FieldSchema &field_schema,
+                      const py::object &obj) {
+  const DataType data_type = field_schema.data_type();
+
+  // Dense vector data is referenced by the query object. Callers
+  // must not modify the source data until the query returns.
+  if (FieldSchema::is_dense_vector_field(data_type)) {
+    if (!py::isinstance<py::array>(obj)) {
+      throw py::type_error("Dense vector[" + field_schema.name() +
+                           "] expects a ndarray, got " +
+                           std::string(py::str(py::type::of(obj))));
+    }
+    const auto arr = obj.cast<py::array>();
+    if (arr.ndim() != 1) {
+      throw py::type_error("Dense vector expects 1D array, got " +
+                           std::to_string(arr.ndim()) + "D");
+    }
+    const auto buf = arr.request();
+    target.clause_ = VectorViewClause{
+        std::string_view(static_cast<const char *>(buf.ptr),
+                         static_cast<size_t>(buf.size) * buf.itemsize),
+        {},
+        {}};
+    return;
+  }
+  // sparse vector
+  if (FieldSchema::is_sparse_vector_field(data_type)) {
+    if (!py::isinstance<py::dict>(obj)) {
+      throw py::type_error("Sparse vector[" + field_schema.name() +
+                           "] expects a Python dict, got " +
+                           std::string(py::str(py::type::of(obj))));
+    }
+    const auto sparse = obj.cast<py::dict>();
+
+    switch (data_type) {
+      case DataType::SPARSE_VECTOR_FP16: {
+        auto [indices, values] = serialize_sparse_vector<ailego::Float16>(
+            sparse, [](const py::handle &h, size_t idx) {
+              float f = checked_cast<float>(
+                  h, "Sparse value[" + std::to_string(idx) + "]", "FLOAT");
+              return ailego::Float16(f);
+            });
+        target.set_sparse_vector(std::move(indices), std::move(values));
+        break;
+      }
+      case DataType::SPARSE_VECTOR_FP32: {
+        auto [indices, values] = serialize_sparse_vector<float>(
+            sparse, [](const py::handle &h, size_t idx) {
+              return checked_cast<float>(
+                  h, "Sparse value[" + std::to_string(idx) + "]", "FLOAT");
+            });
+        target.set_sparse_vector(std::move(indices), std::move(values));
+        break;
+      }
+      default:
+        throw py::type_error("Unsupported sparse vector type: " +
+                             std::to_string(static_cast<int>(data_type)));
+    }
+    return;
+  }
+
+  throw py::type_error("Unsupported vector field type for field: " +
+                       field_schema.name());
+}
+
+void ZVecPyParams::bind_vector_query(py::module_ &m) {
+  // bind Fts
+  py::class_<FtsClause>(m, "_Fts")
+      .def(py::init<>())
+      .def_readwrite("query_string", &FtsClause::query_string_)
+      .def_readwrite("match_string", &FtsClause::match_string_)
+      .def(py::pickle(
+          [](const FtsClause &self) {
+            return py::make_tuple(self.query_string_, self.match_string_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 2)
+              throw std::runtime_error("Invalid pickle data for Fts");
+            FtsClause obj{};
+            obj.query_string_ = t[0].cast<std::string>();
+            obj.match_string_ = t[1].cast<std::string>();
+            return obj;
+          }));
+
+  // Bind SubQuery (used by MultiQuery)
+  py::class_<SubQuery>(m, "_SubQuery")
+      .def(py::init<>())
+      .def_readwrite("num_candidates", &SubQuery::num_candidates_)
+      .def_static(
+          "from_search_query",
+          [](const SearchQuery &sq) {
+            SubQuery sub;
+            sub.num_candidates_ = sq.topk_;
+            sub.target_ = sq.target_;
+            // SubQuery is copied by value into MultiQuery.  Materialize
+            // non-owning vector views so the copied SubQuery does not depend on
+            // the original _SearchQuery keep-alive relationship.
+            if (auto *vvc = sub.target_.get_vector_view_clause()) {
+              VectorClause vc{std::string(vvc->query_vector_),
+                              std::string(vvc->sparse_indices_),
+                              std::string(vvc->sparse_values_)};
+              sub.target_.clause_ = std::move(vc);
+            }
+            return sub;
+          },
+          py::arg("search_query"),
+          "Create a SubQuery from a single-target search query.");
+
+  // _SearchQuery is the Python class name; it wraps the
+  // single-target SearchQuery so external Python code keeps working unchanged.
+  py::class_<SearchQuery>(m, "_SearchQuery")
+      .def(py::init<>())
+      // properties
+      .def_readwrite("topk", &SearchQuery::topk_)
+      .def_property(
+          "field_name",
+          [](const SearchQuery &s) { return s.target_.field_name_; },
+          [](SearchQuery &s, std::string v) {
+            s.target_.field_name_ = std::move(v);
+          })
+      .def_readwrite("filter", &SearchQuery::filter_)
+      .def_readwrite("include_vector", &SearchQuery::include_vector_)
+      .def_property(
+          "query_params",
+          [](const SearchQuery &s) { return s.target_.query_params_; },
+          [](SearchQuery &s, QueryParams::Ptr p) {
+            s.target_.query_params_ = std::move(p);
+          })
+      .def_readwrite("output_fields", &SearchQuery::output_fields_)
+      .def_property(
+          "fts",
+          [](const SearchQuery &self) -> py::object {
+            const auto *fc = self.target_.get_fts_clause();
+            if (fc != nullptr) {
+              return py::cast(*fc);
+            }
+            return py::none();
+          },
+          [](SearchQuery &self, const py::object &obj) {
+            if (obj.is_none()) {
+              // Clearing FTS resets the target to an empty vector clause.
+              self.target_.clause_ = VectorClause{};
+            } else {
+              self.target_.clause_ = obj.cast<FtsClause>();
+            }
+          })
+      // vector
+      .def(
+          "set_vector",
+          [](SearchQuery &self, const FieldSchema &field_schema,
+             const py::object &obj) {
+            set_query_vector(self.target_, field_schema, obj);
+          },
+          py::arg("field_schema"), py::arg("obj"), py::keep_alive<1, 3>(),
+          "Set query vector. Dense vector source data must not be modified "
+          "until the query finishes.")
+      .def(
+          "get_vector",
+          [](const SearchQuery &self,
+             const FieldSchema &field_schema) -> py::object {
+            DataType data_type = field_schema.data_type();
+            // get_vector_view() works for both VectorClause and
+            // VectorViewClause.
+            auto vv = self.target_.get_vector_view();
+            if (FieldSchema::is_dense_vector_field(data_type)) {
+              if (!vv || vv->query_vector_.empty()) {
+                throw std::runtime_error("No dense vector has been set");
+              }
+
+              size_t byte_size = vv->query_vector_.size();
+              const void *data = vv->query_vector_.data();
+
+              switch (data_type) {
+                case DataType::VECTOR_FP32: {
+                  if (byte_size % sizeof(float) != 0) {
+                    throw std::runtime_error(
+                        "Invalid buffer size for VECTOR_FP32");
+                  }
+                  size_t dim = byte_size / sizeof(float);
+                  return py::array_t<float>({dim}, {sizeof(float)},
+                                            static_cast<const float *>(data));
+                }
+                case DataType::VECTOR_FP64: {
+                  if (byte_size % sizeof(double) != 0) {
+                    throw std::runtime_error(
+                        "Invalid buffer size for VECTOR_FP64");
+                  }
+                  size_t dim = byte_size / sizeof(double);
+                  return py::array_t<double>({dim}, {sizeof(double)},
+                                             static_cast<const double *>(data));
+                }
+                case DataType::VECTOR_INT8: {
+                  if (byte_size % sizeof(int8_t) != 0) {
+                    throw std::runtime_error(
+                        "Invalid buffer size for VECTOR_INT8");
+                  }
+                  size_t dim = byte_size / sizeof(int8_t);
+                  return py::array_t<int8_t>({dim}, {sizeof(int8_t)},
+                                             static_cast<const int8_t *>(data));
+                }
+                case DataType::VECTOR_FP16: {
+                  if (byte_size % 2 != 0) {
+                    throw std::runtime_error(
+                        "Invalid buffer size for VECTOR_FP16");
+                  }
+                  size_t dim = byte_size / 2;
+                  return py::array(py::dtype("float16"), {dim}, {2}, data);
+                }
+
+                default:
+                  throw py::type_error(
+                      "Unsupported dense vector type for get_vector: " +
+                      std::to_string(static_cast<int>(data_type)));
+              }
+            }
+            if (FieldSchema::is_sparse_vector_field(data_type)) {
+              if (!vv || vv->sparse_indices_.empty()) {
+                return py::dict();
+              }
+
+              // Deserialize indices: stored as uint32_t[]
+              size_t indices_byte_size = vv->sparse_indices_.size();
+              if (indices_byte_size % sizeof(uint32_t) != 0) {
+                throw std::runtime_error(
+                    "Sparse indices buffer size not aligned to uint32_t");
+              }
+              size_t n = indices_byte_size / sizeof(uint32_t);
+              const uint32_t *indices = reinterpret_cast<const uint32_t *>(
+                  vv->sparse_indices_.data());
+
+              // Deserialize values
+              switch (data_type) {
+                case DataType::SPARSE_VECTOR_FP32: {
+                  if (vv->sparse_values_.size() != n * sizeof(float)) {
+                    throw std::runtime_error(
+                        "Sparse FP32 values buffer size mismatch");
+                  }
+                  const float *values = reinterpret_cast<const float *>(
+                      vv->sparse_values_.data());
+                  py::dict result;
+                  for (size_t i = 0; i < n; ++i) {
+                    result[py::int_(indices[i])] = py::float_(values[i]);
+                  }
+                  return result;
+                }
+                case DataType::SPARSE_VECTOR_FP16: {
+                  if (vv->sparse_values_.size() != n * sizeof(uint16_t)) {
+                    throw std::runtime_error(
+                        "Sparse FP16 values buffer size mismatch");
+                  }
+                  const uint16_t *raw_bits = reinterpret_cast<const uint16_t *>(
+                      vv->sparse_values_.data());
+                  py::dict result;
+                  for (size_t i = 0; i < n; ++i) {
+                    float f = ailego::FloatHelper::ToFP32(raw_bits[i]);
+                    result[py::int_(indices[i])] = py::float_(f);
+                  }
+                  return result;
+                }
+                default:
+                  throw py::type_error("Unsupported sparse vector type...");
+              }
+            }
+
+
+            throw py::type_error("Unsupported vector field type: " +
+                                 field_schema.name());
+          },
+          py::arg("field_schema"))
+      .def(py::pickle(
+          [](const SearchQuery &self) {
+            auto vv = self.target_.get_vector_view();
+            const auto *fc = self.target_.get_fts_clause();
+            return py::make_tuple(
+                self.topk_, self.target_.field_name_,
+                vv ? std::string(vv->query_vector_) : std::string(),
+                vv ? std::string(vv->sparse_indices_) : std::string(),
+                vv ? std::string(vv->sparse_values_) : std::string(),
+                self.filter_, self.include_vector_, self.output_fields_,
+                self.target_.query_params_
+                    ? py::cast(self.target_.query_params_)
+                    : py::none(),
+                fc ? py::cast(*fc) : py::none());
+          },
+          [](py::tuple t) {
+            if (t.size() != 10)
+              throw std::runtime_error("Invalid pickle data for _SearchQuery");
+
+            SearchQuery obj{};
+            obj.topk_ = t[0].cast<int>();
+            obj.target_.field_name_ = t[1].cast<std::string>();
+            // A vector clause and an FTS clause are mutually exclusive in the
+            // variant target; restore whichever the pickle carried.
+            if (!t[9].is_none()) {
+              obj.target_.clause_ = t[9].cast<FtsClause>();
+            } else {
+              obj.target_.clause_ = VectorClause{t[2].cast<std::string>(),
+                                                 t[3].cast<std::string>(),
+                                                 t[4].cast<std::string>()};
+            }
+            obj.filter_ = t[5].cast<std::string>();
+            obj.include_vector_ = t[6].cast<bool>();
+
+            if (!t[7].is_none()) {
+              obj.output_fields_ = t[7].cast<std::vector<std::string>>();
+            }
+            if (!t[8].is_none()) {
+              obj.target_.query_params_ = t[8].cast<QueryParams::Ptr>();
+            }
+            return obj;
+          }));
+
+  // _GroupByVectorQuery
+  py::class_<GroupByVectorQuery>(m, "_GroupByVectorQuery")
+      .def(py::init<>())
+      .def_property(
+          "field_name",
+          [](const GroupByVectorQuery &q) { return q.target_.field_name_; },
+          [](GroupByVectorQuery &q, std::string v) {
+            q.target_.field_name_ = std::move(v);
+          })
+      .def_readwrite("filter", &GroupByVectorQuery::filter_)
+      .def_readwrite("include_vector", &GroupByVectorQuery::include_vector_)
+      .def_readwrite("output_fields", &GroupByVectorQuery::output_fields_)
+      .def_readwrite("group_by_field_name",
+                     &GroupByVectorQuery::group_by_field_name_)
+      .def_readwrite("group_count", &GroupByVectorQuery::group_count_)
+      .def_readwrite("topk_per_group", &GroupByVectorQuery::topk_per_group_)
+      .def_property(
+          "query_params",
+          [](const GroupByVectorQuery &q) { return q.target_.query_params_; },
+          [](GroupByVectorQuery &q, QueryParams::Ptr p) {
+            q.target_.query_params_ = std::move(p);
+          })
+      .def(
+          "set_vector",
+          [](GroupByVectorQuery &self, const FieldSchema &field_schema,
+             const py::object &obj) {
+            set_query_vector(self.target_, field_schema, obj);
+          },
+          py::arg("field_schema"), py::arg("obj"), py::keep_alive<1, 3>(),
+          "Set query vector. Dense vector source data must not be modified "
+          "until the query finishes.");
+}
+}  // namespace zvec

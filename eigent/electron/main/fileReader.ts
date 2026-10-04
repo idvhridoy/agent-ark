@@ -1,0 +1,1492 @@
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
+
+import csvParser from 'csv-parser';
+import { app, BrowserWindow } from 'electron';
+import mammoth from 'mammoth';
+import mime from 'mime';
+import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
+import path from 'node:path';
+import { URL } from 'node:url';
+import * as unzipper from 'unzipper';
+import { parseStringPromise } from 'xml2js';
+import { normalizeWorkspaceRelativePath } from '../../src/lib/workspaceRelativePath';
+import {
+  decideFilePreview,
+  decodePreviewText,
+  FILE_PREVIEW_LIMITS,
+  normalizePreviewFileType,
+  type CsvFilePreview,
+  type FilePreviewMetadata,
+} from '../../src/shared/filePreviewContract';
+import { normalizeLegacySandboxPath } from './utils/filePath';
+import { findDirectoriesByName } from './utils/log';
+import { resolveProjectStoragePath } from './utils/projectStoragePath';
+
+interface FileInfo {
+  path: string;
+  name: string;
+  type: string;
+  isFolder: boolean;
+  relativePath: string;
+  task_id?: string;
+  project_id?: string;
+  source?: 'project_output' | 'camel_log';
+  size?: number;
+  modifiedAt?: number;
+  mimeType?: string;
+}
+
+export class FileReader {
+  private win: BrowserWindow | null = null;
+  constructor(window: BrowserWindow) {
+    this.win = window;
+  }
+
+  // Remove automatic IPC handler registration from constructor
+  // IPC handlers should be registered once in the main process
+
+  private async parseDocx(source: string | Buffer): Promise<string> {
+    try {
+      const result = await mammoth.convertToHtml(
+        typeof source === 'string' ? { path: source } : { buffer: source }
+      );
+      return result.value; // The generated HTML
+    } catch (error) {
+      console.error('DOCX parsing error:', error);
+      throw error;
+    }
+  }
+
+  private async parseDoc(filePath: string): Promise<string> {
+    try {
+      const result = await mammoth.convertToHtml({ path: filePath });
+      return result.value; // The generated HTML
+    } catch (error) {
+      console.error('DOC parsing error:', error);
+      throw error;
+    }
+  }
+
+  private async parseXlsx(source: string | Buffer): Promise<string> {
+    try {
+      const directory =
+        typeof source === 'string'
+          ? await unzipper.Open.file(source)
+          : await unzipper.Open.buffer(source);
+
+      // Find the shared strings file and worksheets
+      const sharedStringsFile = directory.files.find(
+        (f: any) => f.path === 'xl/sharedStrings.xml'
+      );
+      const worksheetFiles = directory.files.filter((f: any) =>
+        f.path.match(/^xl\/worksheets\/sheet\d+\.xml$/)
+      );
+
+      // Parse shared strings if exists
+      let sharedStrings: string[] = [];
+      if (sharedStringsFile) {
+        const sharedStringsBuffer = await sharedStringsFile.buffer();
+        const sharedStringsContent = sharedStringsBuffer.toString('utf-8');
+        const parsedSharedStrings =
+          await parseStringPromise(sharedStringsContent);
+
+        if (parsedSharedStrings.sst && parsedSharedStrings.sst.si) {
+          sharedStrings = parsedSharedStrings.sst.si.map((si: any) => {
+            // Handle simple text nodes
+            if (si.t && si.t[0]) {
+              return typeof si.t[0] === 'string' ? si.t[0] : String(si.t[0]);
+            }
+            // Handle rich text nodes
+            if (si.r) {
+              return si.r
+                .map((r: any) => {
+                  if (r.t && r.t[0]) {
+                    return typeof r.t[0] === 'string' ? r.t[0] : String(r.t[0]);
+                  }
+                  return '';
+                })
+                .join('');
+            }
+            // Handle direct string values
+            if (typeof si === 'string') {
+              return si;
+            }
+            return '';
+          });
+          console.log(`Parsed ${sharedStrings.length} shared strings`);
+        }
+      }
+
+      let html = `
+				<style>
+					.xlsx-container {
+						font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+						padding: 20px;
+					}
+					.xlsx-table {
+						border-collapse: collapse;
+						width: 100%;
+						margin: 10px 0;
+						font-size: 14px;
+						box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+					}
+					.xlsx-table th {
+						background-color: #f8f9fa;
+						border: 1px solid #dee2e6;
+						padding: 12px 8px;
+						text-align: left;
+						font-weight: 600;
+						color: #495057;
+						position: sticky;
+						top: 0;
+						z-index: 10;
+					}
+					.xlsx-table td {
+						border: 1px solid #dee2e6;
+						padding: 8px;
+						color: #212529;
+					}
+					.xlsx-table tr:nth-child(even) {
+						background-color: #f8f9fa;
+					}
+					.xlsx-table tr:hover {
+						background-color: #e9ecef;
+					}
+					.sheet-title {
+						font-size: 18px;
+						font-weight: 600;
+						margin: 20px 0 10px 0;
+						color: #212529;
+					}
+				</style>
+				<div class="xlsx-container">
+			`;
+
+      // Process each worksheet
+      for (let i = 0; i < worksheetFiles.length && i < 5; i++) {
+        // Limit to first 5 sheets
+        const file = worksheetFiles[i];
+        const contentBuffer = await file.buffer();
+        const content = contentBuffer.toString('utf-8');
+        const parsed = await parseStringPromise(content);
+
+        if (worksheetFiles.length > 1) {
+          html += `<h3 class="sheet-title">Sheet ${i + 1}</h3>`;
+        }
+
+        // Create table
+        html += '<table class="xlsx-table">';
+
+        // Get all rows
+        const rows = parsed.worksheet?.sheetData?.[0]?.row || [];
+
+        // Find the maximum column to create column headers
+        let maxCol = 0;
+        for (const row of rows) {
+          const cells = row.c || [];
+          for (const cell of cells) {
+            if (cell.$ && cell.$.r) {
+              const colMatch = cell.$.r.match(/^([A-Z]+)/);
+              if (colMatch) {
+                const colIndex = this.columnToNumber(colMatch[1]);
+                maxCol = Math.max(maxCol, colIndex);
+              }
+            }
+          }
+        }
+
+        // Add column headers row (A, B, C, ...)
+        html += '<thead><tr>';
+        html += '<th style="background-color: #e9ecef; width: 50px;"></th>'; // Empty cell for row numbers
+        for (let i = 0; i < maxCol; i++) {
+          html += `<th>${this.numberToColumn(i + 1)}</th>`;
+        }
+        html += '</tr></thead>';
+
+        // Add data rows
+        html += '<tbody>';
+        for (const row of rows) {
+          html += '<tr>';
+
+          // Add row number
+          const rowNum = row.$ && row.$.r ? row.$.r : '';
+          html += `<th style="background-color: #e9ecef; text-align: center;">${rowNum}</th>`;
+
+          // Create cells array with proper indexing
+          const cells = row.c || [];
+          const cellMap = new Map();
+
+          // Map cells by column index
+          for (const cell of cells) {
+            if (cell.$ && cell.$.r) {
+              const colMatch = cell.$.r.match(/^([A-Z]+)/);
+              if (colMatch) {
+                const colIndex = this.columnToNumber(colMatch[1]);
+                cellMap.set(colIndex, cell);
+              }
+            }
+          }
+
+          // Add cells in order, including empty cells
+          for (let i = 1; i <= maxCol; i++) {
+            const cell = cellMap.get(i);
+            const cellValue = cell
+              ? this.getCellValue(cell, sharedStrings)
+              : '';
+            html += `<td>${cellValue}</td>`;
+          }
+
+          html += '</tr>';
+        }
+        html += '</tbody>';
+
+        html += '</table>';
+      }
+
+      html += '</div></div>';
+      return html;
+    } catch (error) {
+      console.error('XLSX parsing error:', error);
+      throw error;
+    }
+  }
+
+  private columnToNumber(column: string): number {
+    let result = 0;
+    for (let i = 0; i < column.length; i++) {
+      result = result * 26 + (column.charCodeAt(i) - 'A'.charCodeAt(0) + 1);
+    }
+    return result;
+  }
+
+  private numberToColumn(num: number): string {
+    let column = '';
+    while (num > 0) {
+      num--;
+      column = String.fromCharCode((num % 26) + 'A'.charCodeAt(0)) + column;
+      num = Math.floor(num / 26);
+    }
+    return column;
+  }
+
+  private getCellValue(cell: any, sharedStrings: string[]): string {
+    try {
+      // If cell has a value
+      if (cell.v && cell.v[0] !== undefined) {
+        const value = cell.v[0];
+
+        // Check cell type
+        if (cell.$ && cell.$.t === 's') {
+          // Shared string
+          const index = parseInt(value);
+          if (!isNaN(index) && index >= 0 && index < sharedStrings.length) {
+            return sharedStrings[index] || '';
+          }
+          console.warn(
+            `Shared string index ${index} out of bounds (array length: ${sharedStrings.length})`
+          );
+          return value; // Return raw value as fallback
+        } else if (cell.$ && cell.$.t === 'inlineStr') {
+          // Inline string
+          return cell.is?.[0]?.t?.[0] || '';
+        } else if (cell.$ && cell.$.t === 'str') {
+          // Formula result string
+          return value;
+        } else {
+          // Number or other value
+          // Format numbers to avoid long decimals
+          const numValue = parseFloat(value);
+          if (!isNaN(numValue) && numValue % 1 !== 0) {
+            return numValue.toFixed(2);
+          }
+          return value;
+        }
+      }
+
+      // Check for inline string without type attribute
+      if (cell.is && cell.is[0] && cell.is[0].t && cell.is[0].t[0]) {
+        return cell.is[0].t[0];
+      }
+
+      // Check for formula cells
+      if (cell.f && cell.f[0] && cell.v && cell.v[0]) {
+        return cell.v[0];
+      }
+
+      return '';
+    } catch (error) {
+      console.error(
+        'Error getting cell value:',
+        error,
+        'Cell:',
+        JSON.stringify(cell)
+      );
+      return '';
+    }
+  }
+
+  private async parsePptx(source: string | Buffer): Promise<string> {
+    try {
+      const directory =
+        typeof source === 'string'
+          ? await unzipper.Open.file(source)
+          : await unzipper.Open.buffer(source);
+      const slideFiles = directory.files.filter((f: any) =>
+        f.path.match(/^ppt\/slides\/slide\d+\.xml$/)
+      );
+
+      let html = '<div style="font-family: sans-serif;">';
+
+      for (let i = 0; i < slideFiles.length; i++) {
+        const file = slideFiles[i];
+        const contentBuffer = await file.buffer();
+        const content = contentBuffer.toString('utf-8');
+        const parsed = await parseStringPromise(content);
+
+        html += `<h3>Slide ${i + 1}</h3><ul>`;
+
+        const texts = parsed['p:sld']['p:cSld'][0]['p:spTree'][0]['p:sp'] || [];
+
+        for (const textNode of texts) {
+          const paras = textNode?.['p:txBody']?.[0]?.['a:p'] || [];
+          for (const para of paras) {
+            const runs = para?.['a:r'] || [];
+            for (const run of runs) {
+              const text = run?.['a:t']?.[0];
+              if (text) {
+                html += `<li>${text}</li>`;
+              }
+            }
+          }
+        }
+
+        html += '</ul><hr/>';
+      }
+
+      html += '</div>';
+      return html;
+    } catch (error) {
+      console.error('PPTX unzip parse error:', error);
+      throw error;
+    }
+  }
+
+  // add download file method
+  private async downloadFile(
+    url: string,
+    localPath: string,
+    maxBytes: number
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url);
+      const protocol = urlObj.protocol === 'https:' ? https : http;
+
+      const request = protocol.get(url, (response) => {
+        if (response.statusCode !== 200) {
+          reject(
+            new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`)
+          );
+          return;
+        }
+
+        const contentLength = Number(response.headers['content-length']);
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+          response.resume();
+          reject(
+            new Error(`FILE_PREVIEW_TOO_LARGE:${contentLength}:${maxBytes}`)
+          );
+          return;
+        }
+
+        const fileStream = fs.createWriteStream(localPath);
+        let receivedBytes = 0;
+        response.on('data', (chunk: Buffer) => {
+          receivedBytes += chunk.length;
+          if (receivedBytes > maxBytes) {
+            request.destroy(
+              new Error(`FILE_PREVIEW_TOO_LARGE:${receivedBytes}:${maxBytes}`)
+            );
+            fileStream.destroy();
+          }
+        });
+        response.pipe(fileStream);
+
+        fileStream.on('finish', () => {
+          fileStream.close();
+          resolve();
+        });
+
+        fileStream.on('error', (err) => {
+          fs.unlink(localPath, (unlinkErr) => {
+            if (unlinkErr)
+              console.error('Failed to delete incomplete file:', unlinkErr);
+          }); // delete incomplete file
+          reject(err);
+        });
+      });
+
+      request.on('error', (err) => {
+        reject(err);
+      });
+
+      request.setTimeout(30000, () => {
+        request.destroy();
+        reject(new Error('Download timeout'));
+      });
+    });
+  }
+
+  // check if it is a local file path
+  private isLocalFile(filePath: string): boolean {
+    return (
+      filePath.startsWith('localfile://') ||
+      filePath.startsWith('file://') ||
+      (!filePath.startsWith('http://') &&
+        !filePath.startsWith('https://') &&
+        !filePath.includes('://'))
+    );
+  }
+
+  // get temporary file path
+  private getTempFilePath(originalPath: string, type: string): string {
+    const userData = app.getPath('userData');
+    const tempDir = path.join(userData, 'temp');
+
+    // ensure temporary directory exists
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    const fileName =
+      path.basename(originalPath) || `temp_${Date.now()}.${type}`;
+    return path.join(tempDir, fileName);
+  }
+
+  private previewDownloadLimit(type: string): number {
+    const normalized = normalizePreviewFileType(type);
+    if (normalized === 'pdf') return FILE_PREVIEW_LIMITS.pdfBytes;
+    if (normalized === 'csv' || normalized === 'tsv') {
+      return FILE_PREVIEW_LIMITS.csvScanBytes;
+    }
+    if (normalized === 'html') return FILE_PREVIEW_LIMITS.richHtmlBytes;
+    if (['doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx'].includes(normalized)) {
+      return FILE_PREVIEW_LIMITS.officeBytes;
+    }
+    return FILE_PREVIEW_LIMITS.defaultBytes;
+  }
+
+  private normalizeLocalPreviewPath(filePath: string): string {
+    const normalized = normalizeLegacySandboxPath(filePath);
+    if (!this.isLocalFile(normalized)) {
+      throw new Error('Preview metadata requires a local file');
+    }
+    return normalized.replace(/^localfile:\/\//, '').replace(/^file:\/\//, '');
+  }
+
+  public async getPreviewMetadata(
+    filePath: string
+  ): Promise<FilePreviewMetadata> {
+    const localPath = this.normalizeLocalPreviewPath(filePath);
+    const stats = await fs.promises.stat(localPath);
+    if (!stats.isFile()) throw new Error('Preview target is not a file');
+    return {
+      size: stats.size,
+      modifiedAt: stats.mtimeMs,
+      mimeType: mime.getType(localPath) || 'application/octet-stream',
+      supportsRanges: true,
+    };
+  }
+
+  public async previewTextFile(filePath: string, requestedLimit?: number) {
+    const localPath = this.normalizeLocalPreviewPath(filePath);
+    const stats = await fs.promises.stat(localPath);
+    if (!stats.isFile()) throw new Error('Preview target is not a file');
+    const limit = Math.max(
+      1,
+      Math.min(
+        Number(requestedLimit) || FILE_PREVIEW_LIMITS.textBytes,
+        FILE_PREVIEW_LIMITS.textBytes
+      )
+    );
+    const bytesRead = Math.min(stats.size, limit);
+    const handle = await fs.promises.open(localPath, 'r');
+    try {
+      const buffer = Buffer.alloc(bytesRead);
+      const result = await handle.read(buffer, 0, bytesRead, 0);
+      const content = decodePreviewText(
+        buffer.subarray(0, result.bytesRead),
+        result.bytesRead < stats.size
+      );
+      return {
+        content: content ?? '',
+        binary: content === null,
+        bytesRead: result.bytesRead,
+        totalBytes: stats.size,
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  public async previewCsvFile(filePath: string): Promise<CsvFilePreview> {
+    const localPath = this.normalizeLocalPreviewPath(filePath);
+    const stats = await fs.promises.stat(localPath);
+    if (!stats.isFile()) throw new Error('Preview target is not a file');
+    if (stats.size === 0) {
+      return {
+        kind: 'csv',
+        columns: [],
+        rows: [],
+        truncated: false,
+        rowLimit: FILE_PREVIEW_LIMITS.csvRows,
+        columnLimit: FILE_PREVIEW_LIMITS.csvColumns,
+        bytesRead: 0,
+        totalBytes: 0,
+      };
+    }
+
+    const source = fs.createReadStream(localPath, {
+      start: 0,
+      end: Math.min(stats.size, FILE_PREVIEW_LIMITS.csvScanBytes) - 1,
+    });
+    const parser = source.pipe(
+      csvParser({ maxRowBytes: FILE_PREVIEW_LIMITS.csvScanBytes })
+    );
+    let allColumns: string[] = [];
+    parser.once('headers', (headers: string[]) => {
+      allColumns = headers;
+    });
+    const rawRows: Record<string, unknown>[] = [];
+    for await (const row of parser) {
+      rawRows.push(row as Record<string, unknown>);
+      if (rawRows.length > FILE_PREVIEW_LIMITS.csvRows) break;
+    }
+    const columns = allColumns.slice(0, FILE_PREVIEW_LIMITS.csvColumns);
+    const rows = rawRows.slice(0, FILE_PREVIEW_LIMITS.csvRows).map((row) =>
+      columns.map((column) => {
+        const value = row[column] == null ? '' : String(row[column]);
+        return value.length > FILE_PREVIEW_LIMITS.csvCellCharacters
+          ? `${value.slice(0, FILE_PREVIEW_LIMITS.csvCellCharacters)}…`
+          : value;
+      })
+    );
+
+    return {
+      kind: 'csv',
+      columns,
+      rows,
+      truncated:
+        stats.size > FILE_PREVIEW_LIMITS.csvScanBytes ||
+        rawRows.length > FILE_PREVIEW_LIMITS.csvRows ||
+        allColumns.length > FILE_PREVIEW_LIMITS.csvColumns,
+      rowLimit: FILE_PREVIEW_LIMITS.csvRows,
+      columnLimit: FILE_PREVIEW_LIMITS.csvColumns,
+      bytesRead: Math.min(
+        stats.size,
+        source.bytesRead || FILE_PREVIEW_LIMITS.csvScanBytes
+      ),
+      totalBytes: stats.size,
+    };
+  }
+
+  public openFile(type: string, filePath: string, _isShowSourceCode: boolean) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        filePath = normalizeLegacySandboxPath(filePath);
+
+        // check if it is a remote file
+        if (!this.isLocalFile(filePath)) {
+          console.log('detect remote file, start downloading:', filePath);
+
+          // download file to temporary directory
+          const tempPath = this.getTempFilePath(filePath, type);
+          try {
+            await this.downloadFile(
+              filePath,
+              tempPath,
+              this.previewDownloadLimit(type)
+            );
+            console.log('file download completed:', tempPath);
+
+            // use temporary file path to continue processing
+            filePath = tempPath;
+          } catch (downloadError) {
+            console.error('file download failed:', downloadError);
+            reject(downloadError);
+            return;
+          }
+        }
+
+        const stats = await fs.promises.stat(filePath);
+        const decision = decideFilePreview(type, { size: stats.size });
+        if (decision.mode === 'blocked') {
+          throw new Error(
+            `FILE_PREVIEW_BLOCKED:${decision.reason}:${stats.size}:${decision.limit}`
+          );
+        }
+        if (
+          decision.mode === 'bounded-csv' ||
+          decision.mode === 'bounded-text'
+        ) {
+          throw new Error(
+            `FILE_PREVIEW_REQUIRES_BOUNDED_READER:${decision.mode}`
+          );
+        }
+
+        // original file processing logic
+        if (type === 'md') {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          resolve(content);
+        } else if (type === 'html') {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          resolve(content);
+        } else if (['pdf'].includes(type)) {
+          resolve(filePath);
+        } else if (type === 'csv') {
+          throw new Error('FILE_PREVIEW_REQUIRES_BOUNDED_READER:bounded-csv');
+        } else if (type === 'docx') {
+          try {
+            const htmlContent = await this.parseDocx(filePath);
+            resolve(htmlContent);
+          } catch (error) {
+            console.warn('DOCX parsing failed, reading as text:', error);
+            const content = fs.readFileSync(filePath, 'utf-8');
+            resolve(content);
+          }
+        } else if (type === 'doc') {
+          try {
+            const htmlContent = await this.parseDoc(filePath);
+            resolve(htmlContent);
+          } catch (error) {
+            console.warn('DOC parsing failed, reading as text:', error);
+            const content = fs.readFileSync(filePath, 'utf-8');
+            resolve(content);
+          }
+        } else if (type === 'pptx') {
+          try {
+            const htmlContent = await this.parsePptx(filePath);
+            resolve(htmlContent);
+          } catch (error) {
+            console.warn(
+              'PPTX parsing failed, reading as binary string:',
+              error
+            );
+            const content = fs.readFileSync(filePath, 'base64'); //  backup processing
+            resolve(`<pre>${content}</pre>`);
+          }
+        } else if (type === 'xlsx') {
+          try {
+            const htmlContent = await this.parseXlsx(filePath);
+            resolve(htmlContent);
+          } catch (error) {
+            console.warn('XLSX parsing failed, reading as text:', error);
+            const content = fs.readFileSync(filePath, 'utf-8');
+            resolve(content);
+          }
+        } else {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          resolve(content);
+        }
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  public async previewOfficeBuffer(
+    type: string,
+    bytes: Uint8Array
+  ): Promise<string> {
+    const normalized = normalizePreviewFileType(type);
+    if (!['docx', 'pptx', 'xlsx'].includes(normalized)) {
+      throw new Error('Unsupported remote Office preview type');
+    }
+    if (bytes.byteLength > FILE_PREVIEW_LIMITS.officeBytes) {
+      throw new Error(
+        `FILE_PREVIEW_TOO_LARGE:${bytes.byteLength}:${FILE_PREVIEW_LIMITS.officeBytes}`
+      );
+    }
+
+    const buffer = Buffer.from(bytes);
+    if (normalized === 'docx') return this.parseDocx(buffer);
+    if (normalized === 'pptx') return this.parsePptx(buffer);
+    return this.parseXlsx(buffer);
+  }
+
+  // Folders to hide in the Agent Folder view
+  private readonly hiddenFolders = [
+    'browser_agent',
+    'camel_logs',
+    'developer_agent',
+    'document_agent',
+    'multi_modal_agent',
+    'terminal_logs',
+  ];
+
+  private getFilesRecursive(
+    dirPath: string,
+    basePath: string,
+    baseReal?: string
+  ): FileInfo[] {
+    try {
+      const resolvedBase = baseReal ?? fs.realpathSync(basePath);
+      const files = fs.readdirSync(dirPath);
+      const result: FileInfo[] = [];
+
+      for (const file of files) {
+        if (file.startsWith('.')) continue;
+        // Skip hidden folders
+        if (this.hiddenFolders.includes(file)) continue;
+
+        const filePath = path.join(dirPath, file);
+        try {
+          const stats = fs.lstatSync(filePath);
+          if (stats.isSymbolicLink()) continue;
+          const realPath = fs.realpathSync(filePath);
+          const relativeToBase = path.relative(resolvedBase, realPath);
+          if (
+            relativeToBase.startsWith('..') ||
+            path.isAbsolute(relativeToBase)
+          ) {
+            continue;
+          }
+          const isFolder = stats.isDirectory();
+          const relativePath = path.relative(basePath, dirPath);
+
+          const fileInfo: FileInfo = {
+            path: filePath,
+            name: file,
+            type: isFolder
+              ? 'folder'
+              : file.split('.').pop()?.toLowerCase() || '',
+            isFolder: isFolder,
+            relativePath: relativePath === '' ? '' : relativePath,
+            size: isFolder ? undefined : stats.size,
+            modifiedAt: stats.mtimeMs,
+            mimeType: isFolder
+              ? undefined
+              : mime.getType(filePath) || 'application/octet-stream',
+          };
+
+          result.push(fileInfo);
+
+          if (isFolder) {
+            const subFiles = this.getFilesRecursive(
+              filePath,
+              basePath,
+              resolvedBase
+            );
+            result.push(...subFiles);
+          }
+        } catch (fileErr) {
+          console.warn('Skipping inaccessible file:', filePath, fileErr);
+          continue;
+        }
+      }
+
+      return result;
+    } catch (err) {
+      console.error('Error reading directory:', dirPath, err);
+      return [];
+    }
+  }
+
+  private sanitizeIdentity(identity: string): string {
+    return identity
+      .split('@')[0]
+      .replace(/[\\/*?:"<>|\s]/g, '_')
+      .replace(/^\.+|\.+$/g, '');
+  }
+
+  private normalizeTaskId(taskId: string): string {
+    return String(taskId).replace(/^task_/, '');
+  }
+
+  private taskDirName(taskId: string): string {
+    return `task_${this.normalizeTaskId(taskId)}`;
+  }
+
+  private taskDirNameCandidates(taskId: string): string[] {
+    return [...new Set([this.taskDirName(taskId), `task_${taskId}`])];
+  }
+
+  private getStorageIdentityCandidates(
+    email: string,
+    userId?: string | number | null
+  ): string[] {
+    const candidates = [this.sanitizeIdentity(email)];
+    if (userId !== undefined && userId !== null && userId !== '') {
+      const rawUserId = String(userId);
+      candidates.push(
+        this.sanitizeIdentity(
+          rawUserId.startsWith('user_') ? rawUserId : `user_${rawUserId}`
+        )
+      );
+    }
+    return [...new Set(candidates.filter(Boolean))];
+  }
+
+  private resolveProjectPath(
+    email: string,
+    projectId: string,
+    userId?: string | number | null
+  ): string {
+    return resolveProjectStoragePath({
+      homeDir: app.getPath('home'),
+      email,
+      projectId,
+      userId,
+      existsSync: fs.existsSync,
+    });
+  }
+
+  private findProjectTaskPath(
+    userHome: string,
+    rootDir: 'eigent' | '.eigent',
+    identities: string[],
+    projectId: string,
+    taskId: string
+  ): string | null {
+    for (const identity of identities) {
+      for (const taskDirName of this.taskDirNameCandidates(taskId)) {
+        const taskPath = path.join(
+          userHome,
+          rootDir,
+          identity,
+          `project_${projectId}`,
+          taskDirName
+        );
+        if (fs.existsSync(taskPath)) {
+          return taskPath;
+        }
+      }
+    }
+    return null;
+  }
+
+  private findTaskInProjects(userDir: string, taskId: string): string | null {
+    try {
+      if (!fs.existsSync(userDir)) {
+        return null;
+      }
+
+      const entries = fs.readdirSync(userDir);
+
+      // Look for project directories
+      for (const entry of entries) {
+        if (entry.startsWith('project_')) {
+          const projectDir = path.join(userDir, entry);
+          for (const taskDirName of this.taskDirNameCandidates(taskId)) {
+            const taskDir = path.join(projectDir, taskDirName);
+
+            if (fs.existsSync(taskDir)) {
+              return taskDir;
+            }
+          }
+        }
+      }
+
+      return null;
+    } catch (err) {
+      console.error('Error finding task in projects:', err);
+      return null;
+    }
+  }
+
+  private resolveTaskPaths(
+    email: string,
+    taskId: string,
+    projectId?: string,
+    userId?: string | number | null
+  ): {
+    dirPath: string;
+    logPath: string;
+  } {
+    const identities = this.getStorageIdentityCandidates(email, userId);
+    const safeEmail = identities[0] || this.sanitizeIdentity(email);
+    const userHome = app.getPath('home');
+
+    let dirPath: string;
+    let logPath: string;
+
+    if (projectId) {
+      dirPath =
+        this.findProjectTaskPath(
+          userHome,
+          'eigent',
+          identities,
+          projectId,
+          taskId
+        ) ||
+        path.join(
+          userHome,
+          'eigent',
+          safeEmail,
+          `project_${projectId}`,
+          this.taskDirName(taskId)
+        );
+      logPath =
+        this.findProjectTaskPath(
+          userHome,
+          '.eigent',
+          identities,
+          projectId,
+          taskId
+        ) ||
+        path.join(
+          userHome,
+          '.eigent',
+          safeEmail,
+          `project_${projectId}`,
+          this.taskDirName(taskId)
+        );
+      return { dirPath, logPath };
+    }
+
+    const userDir = path.join(userHome, 'eigent', safeEmail);
+    const projectBasedPath = this.findTaskInProjects(userDir, taskId);
+
+    if (projectBasedPath) {
+      dirPath = projectBasedPath;
+      const projectMatch = projectBasedPath.match(/project_([^\\\/]+)/);
+      if (projectMatch) {
+        logPath = path.join(
+          userHome,
+          '.eigent',
+          safeEmail,
+          projectMatch[0],
+          this.taskDirName(taskId)
+        );
+      } else {
+        logPath = path.join(
+          userHome,
+          '.eigent',
+          safeEmail,
+          this.taskDirName(taskId)
+        );
+      }
+      return { dirPath, logPath };
+    }
+
+    dirPath = path.join(
+      userHome,
+      'eigent',
+      safeEmail,
+      this.taskDirName(taskId)
+    );
+    logPath = path.join(
+      userHome,
+      '.eigent',
+      safeEmail,
+      this.taskDirName(taskId)
+    );
+    return { dirPath, logPath };
+  }
+
+  public getFileList(
+    email: string,
+    taskId: string,
+    projectId?: string,
+    userId?: string | number | null
+  ): FileInfo[] {
+    const { dirPath, logPath } = this.resolveTaskPaths(
+      email,
+      taskId,
+      projectId,
+      userId
+    );
+    const camelLogPath = path.join(logPath, 'camel_logs');
+
+    try {
+      const projectFiles = fs.existsSync(dirPath)
+        ? this.getFilesRecursive(dirPath, dirPath).map((file) => ({
+            ...file,
+            source: 'project_output' as const,
+          }))
+        : [];
+      const camelLogFiles = fs.existsSync(camelLogPath)
+        ? this.getFilesRecursive(camelLogPath, camelLogPath).map((file) => ({
+            ...file,
+            source: 'camel_log' as const,
+          }))
+        : [];
+
+      if (projectFiles.length === 0 && camelLogFiles.length === 0) {
+        return [];
+      }
+
+      return [...projectFiles, ...camelLogFiles];
+    } catch (err) {
+      console.error('Load file failed:', err);
+      return [];
+    }
+  }
+
+  /**
+   * Return diagnostic logs only. This intentionally does not traverse the
+   * selected project folder: collecting logs must never discover or imply
+   * upload consent for files that already existed in a user's workspace.
+   */
+  public getCamelLogFileList(
+    email: string,
+    taskId: string,
+    projectId?: string,
+    userId?: string | number | null
+  ): FileInfo[] {
+    const { logPath } = this.resolveTaskPaths(email, taskId, projectId, userId);
+    const camelLogPath = path.join(logPath, 'camel_logs');
+    if (!fs.existsSync(camelLogPath)) return [];
+    try {
+      return this.getFilesRecursive(camelLogPath, camelLogPath).map((file) => ({
+        ...file,
+        source: 'camel_log' as const,
+      }));
+    } catch (err) {
+      console.error('Load camel logs failed:', err);
+      return [];
+    }
+  }
+
+  /**
+   * Resolves the `camel_logs` directories to export as `{ src, destName }`
+   * entries (destName is the path inside `~/.eigent`, so the zip stays readable).
+   *
+   * Prefers the specific task the user last ran (via {@link resolveTaskPaths},
+   * the same resolution `get-file-list` uses). Falls back to every `camel_logs`
+   * folder under the user's identity roots when no task is supplied or its
+   * folder is missing.
+   */
+  public getCamelLogEntries(
+    email: string,
+    taskId?: string,
+    projectId?: string,
+    userId?: string | number | null
+  ): { src: string; destName: string }[] {
+    const userHome = app.getPath('home');
+    const eigentRoot = path.join(userHome, '.eigent');
+    const toEntry = (dir: string) => ({
+      src: dir,
+      destName: path.relative(eigentRoot, dir) || path.basename(dir),
+    });
+
+    if (taskId) {
+      const { logPath } = this.resolveTaskPaths(
+        email,
+        taskId,
+        projectId,
+        userId
+      );
+      const camelLogPath = path.join(logPath, 'camel_logs');
+      if (fs.existsSync(camelLogPath)) {
+        return [toEntry(camelLogPath)];
+      }
+      return [];
+    }
+
+    const identities = this.getStorageIdentityCandidates(email, userId);
+    const seen = new Set<string>();
+    const entries: { src: string; destName: string }[] = [];
+    for (const identity of identities) {
+      const identityRoot = path.join(eigentRoot, identity);
+      for (const dir of findDirectoriesByName(identityRoot, 'camel_logs', 4)) {
+        if (seen.has(dir)) continue;
+        seen.add(dir);
+        entries.push(toEntry(dir));
+      }
+    }
+    return entries;
+  }
+
+  public deleteTaskFiles(
+    email: string,
+    taskId: string,
+    projectId?: string
+  ): {
+    success: boolean;
+    path: { dirPath: string; logPath: string };
+  } {
+    const { dirPath, logPath } = this.resolveTaskPaths(
+      email,
+      taskId,
+      projectId
+    );
+
+    try {
+      let success = false;
+      if (fs.existsSync(dirPath)) {
+        fs.rmSync(dirPath, { recursive: true, force: true });
+        success = true;
+      }
+      if (fs.existsSync(logPath)) {
+        fs.rmSync(logPath, { recursive: true, force: true });
+        success = true;
+      }
+      return { success, path: { dirPath, logPath } };
+    } catch (err) {
+      console.error('Delete task files failed:', dirPath, err);
+      return { success: false, path: { dirPath, logPath } };
+    }
+  }
+
+  public getLogFolder(email: string): string {
+    const safeEmail = email
+      .split('@')[0]
+      .replace(/[\\/*?:"<>|\s]/g, '_')
+      .replace(/^\.+|\.+$/g, '');
+    const userHome = app.getPath('home');
+    const dirPath = path.join(userHome, 'eigent', safeEmail);
+
+    try {
+      if (!fs.existsSync(dirPath)) {
+        return '';
+      }
+
+      return dirPath;
+    } catch (err) {
+      console.error('Load file failed:', err);
+      return '';
+    }
+  }
+
+  public createProjectStructure(
+    email: string,
+    projectId: string,
+    userId?: string | number | null
+  ): { success: boolean; path: string } {
+    const projectPath = this.resolveProjectPath(email, projectId, userId);
+
+    try {
+      if (!fs.existsSync(projectPath)) {
+        fs.mkdirSync(projectPath, { recursive: true });
+      }
+      return { success: true, path: projectPath };
+    } catch (err) {
+      console.error('Create project structure failed:', err);
+      return { success: false, path: projectPath };
+    }
+  }
+
+  public getProjectList(email: string): Array<{
+    id: string;
+    name: string;
+    path: string;
+    taskCount: number;
+    createdAt: Date;
+  }> {
+    const safeEmail = email
+      .split('@')[0]
+      .replace(/[\\/*?:"<>|\s]/g, '_')
+      .replace(/^\.+|\.+$/g, '');
+    const userHome = app.getPath('home');
+    const userDir = path.join(userHome, 'eigent', safeEmail);
+
+    try {
+      if (!fs.existsSync(userDir)) {
+        return [];
+      }
+
+      const entries = fs.readdirSync(userDir);
+      const projects: Array<{
+        id: string;
+        name: string;
+        path: string;
+        taskCount: number;
+        createdAt: Date;
+      }> = [];
+
+      for (const entry of entries) {
+        if (entry.startsWith('project_')) {
+          const projectPath = path.join(userDir, entry);
+          const stats = fs.statSync(projectPath);
+
+          if (stats.isDirectory()) {
+            const projectId = entry.replace('project_', '');
+
+            // Count tasks in this project
+            const taskCount = this.countTasksInProject(projectPath);
+
+            projects.push({
+              id: projectId,
+              name: `Project ${projectId}`,
+              path: projectPath,
+              taskCount,
+              createdAt: stats.birthtime,
+            });
+          }
+        }
+      }
+
+      return projects.sort(
+        (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+      );
+    } catch (err) {
+      console.error('Get project list failed:', err);
+      return [];
+    }
+  }
+
+  public getTasksInProject(
+    email: string,
+    projectId: string
+  ): Array<{ id: string; name: string; path: string; createdAt: Date }> {
+    const safeEmail = email
+      .split('@')[0]
+      .replace(/[\\/*?:"<>|\s]/g, '_')
+      .replace(/^\.+|\.+$/g, '');
+    const userHome = app.getPath('home');
+    const projectPath = path.join(
+      userHome,
+      'eigent',
+      safeEmail,
+      `project_${projectId}`
+    );
+
+    try {
+      if (!fs.existsSync(projectPath)) {
+        return [];
+      }
+
+      const entries = fs.readdirSync(projectPath);
+      const tasks: Array<{
+        id: string;
+        name: string;
+        path: string;
+        createdAt: Date;
+      }> = [];
+
+      for (const entry of entries) {
+        if (entry.startsWith('task_')) {
+          const taskPath = path.join(projectPath, entry);
+          const stats = fs.statSync(taskPath);
+
+          if (stats.isDirectory()) {
+            const taskId = entry.replace(/^task_/, '');
+
+            tasks.push({
+              id: taskId,
+              name: `Task ${taskId}`,
+              path: taskPath,
+              createdAt: stats.birthtime,
+            });
+          }
+        }
+      }
+
+      return tasks.sort(
+        (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+      );
+    } catch (err) {
+      console.error('Get tasks in project failed:', err);
+      return [];
+    }
+  }
+
+  public moveTaskToProject(
+    email: string,
+    taskId: string,
+    projectId: string
+  ): { success: boolean; message: string } {
+    const safeEmail = email
+      .split('@')[0]
+      .replace(/[\\/*?:"<>|\s]/g, '_')
+      .replace(/^\.+|\.+$/g, '');
+    const userHome = app.getPath('home');
+
+    // Source path (legacy structure)
+    const sourcePath =
+      this.taskDirNameCandidates(taskId)
+        .map((taskDirName) =>
+          path.join(userHome, 'eigent', safeEmail, taskDirName)
+        )
+        .find((candidate) => fs.existsSync(candidate)) ||
+      path.join(userHome, 'eigent', safeEmail, this.taskDirName(taskId));
+    const sourceLogPath =
+      this.taskDirNameCandidates(taskId)
+        .map((taskDirName) =>
+          path.join(userHome, '.eigent', safeEmail, taskDirName)
+        )
+        .find((candidate) => fs.existsSync(candidate)) ||
+      path.join(userHome, '.eigent', safeEmail, this.taskDirName(taskId));
+
+    // Destination paths (project structure)
+    const projectPath = path.join(
+      userHome,
+      'eigent',
+      safeEmail,
+      `project_${projectId}`
+    );
+    const destPath = path.join(projectPath, this.taskDirName(taskId));
+    const destLogPath = path.join(
+      userHome,
+      '.eigent',
+      safeEmail,
+      `project_${projectId}`,
+      this.taskDirName(taskId)
+    );
+
+    try {
+      // Create project structure if it doesn't exist
+      if (!fs.existsSync(projectPath)) {
+        fs.mkdirSync(projectPath, { recursive: true });
+      }
+
+      // Create destination log directory
+      const destLogDir = path.dirname(destLogPath);
+      if (!fs.existsSync(destLogDir)) {
+        fs.mkdirSync(destLogDir, { recursive: true });
+      }
+
+      // Move task files
+      if (fs.existsSync(sourcePath)) {
+        fs.renameSync(sourcePath, destPath);
+      }
+
+      // Move log files
+      if (fs.existsSync(sourceLogPath)) {
+        fs.renameSync(sourceLogPath, destLogPath);
+      }
+
+      return {
+        success: true,
+        message: `Task ${taskId} moved to project ${projectId}`,
+      };
+    } catch (err) {
+      console.error('Move task to project failed:', err);
+      return { success: false, message: `Failed to move task: ${err}` };
+    }
+  }
+
+  public getProjectFileList(
+    email: string,
+    projectId: string,
+    userId?: string | number | null
+  ): FileInfo[] {
+    const projectPath = this.resolveProjectPath(email, projectId, userId);
+
+    return this.getWorkspaceFileList(projectPath).map((file) => {
+      const taskMatch = file.relativePath.match(/^task_([^/\\]+)/);
+
+      return {
+        ...file,
+        task_id: taskMatch?.[1],
+        project_id: projectId,
+      };
+    });
+  }
+
+  /**
+   * Enumerate files from an already-authorized Space workspace root.
+   *
+   * The IPC boundary is responsible for authorizing the root against the
+   * renderer's active Space before this method is called.
+   */
+  public getWorkspaceFileList(
+    workspacePath: string,
+    requestedRelativePaths?: readonly string[]
+  ): FileInfo[] {
+    const rootPath = path.resolve(workspacePath);
+
+    try {
+      if (!fs.existsSync(rootPath) || !fs.statSync(rootPath).isDirectory()) {
+        return [];
+      }
+
+      if (requestedRelativePaths) {
+        const rootRealPath = fs.realpathSync(rootPath);
+        const files: FileInfo[] = [];
+        for (const relativePath of new Set(requestedRelativePaths)) {
+          if (!relativePath || path.isAbsolute(relativePath)) continue;
+          const requestedIdentity =
+            normalizeWorkspaceRelativePath(relativePath);
+          if (!requestedIdentity) continue;
+          const candidatePath = path.resolve(rootRealPath, relativePath);
+          const relativeToRoot = path.relative(rootRealPath, candidatePath);
+          if (
+            relativeToRoot.startsWith('..') ||
+            path.isAbsolute(relativeToRoot)
+          ) {
+            continue;
+          }
+
+          try {
+            const stats = fs.lstatSync(candidatePath);
+            if (!stats.isFile() || stats.isSymbolicLink()) continue;
+            const realPath = fs.realpathSync(candidatePath);
+            const realRelativePath = path.relative(rootRealPath, realPath);
+            if (
+              realRelativePath.startsWith('..') ||
+              path.isAbsolute(realRelativePath)
+            ) {
+              continue;
+            }
+            // A directory symlink can point at a different in-root identity.
+            // Omit that alias instead of returning an unrequested real path
+            // that would invalidate the renderer's entire batch.
+            if (
+              normalizeWorkspaceRelativePath(realRelativePath) !==
+              requestedIdentity
+            ) {
+              continue;
+            }
+            const name = path.basename(realPath);
+            files.push({
+              path: realPath,
+              name,
+              type: name.split('.').pop()?.toLowerCase() || '',
+              isFolder: false,
+              relativePath: realRelativePath,
+              size: stats.size,
+              modifiedAt: stats.mtimeMs,
+              mimeType: mime.getType(realPath) || 'application/octet-stream',
+            });
+          } catch {
+            // A deleted, inaccessible or escaped candidate is not resolvable.
+          }
+        }
+        return files.sort((a, b) => a.path.localeCompare(b.path));
+      }
+
+      const allFiles = this.getFilesRecursive(rootPath, rootPath)
+        .filter((file) => !file.isFolder)
+        .map((file) => {
+          const relativePath = path.relative(rootPath, file.path);
+
+          return {
+            ...file,
+            relativePath: relativePath === '.' ? '' : relativePath,
+          };
+        });
+
+      return allFiles.sort((a, b) => {
+        return a.path.localeCompare(b.path);
+      });
+    } catch (err) {
+      console.error('Get workspace file list failed:', err);
+      return [];
+    }
+  }
+
+  private countTasksInProject(projectPath: string): number {
+    try {
+      const entries = fs.readdirSync(projectPath);
+      return entries.filter((entry) => entry.startsWith('task_')).length;
+    } catch (err) {
+      console.error('Count tasks in project failed:', err);
+      return 0;
+    }
+  }
+}
